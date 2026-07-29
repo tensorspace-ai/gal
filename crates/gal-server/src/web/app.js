@@ -19,6 +19,44 @@ import {
 // The cursor layer positions carets via the editor's index mapping.
 window.__galEditorHelpers = { indexToDom };
 
+/// Mirrors WaveMode in gal-core. The server is the authority; these are used to
+/// choose a layout and to hide affordances that would only be refused.
+const MODES = [
+  { id: 'document', label: 'Document', hint: 'Everyone can edit every message. Replies nest.' },
+  { id: 'chat', label: 'Chat', hint: 'A channel. Only you can edit your own messages.' },
+  { id: 'announcement', label: 'Announcement', hint: 'Only you can post; anyone can reply.' },
+  { id: 'notepad', label: 'Notepad', hint: 'One shared page that everyone edits.' },
+  { id: 'frozen', label: 'Frozen', hint: 'Read-only. Nothing can change until you unfreeze it.' },
+];
+
+const mode = {
+  current: () => (state.wave && state.wave.mode) || 'document',
+  is: (...names) => names.includes(mode.current()),
+  isFlat: () => mode.is('chat', 'notepad'),
+  allowsReplies: () => mode.is('document', 'announcement'),
+  allowsNewMessage: () =>
+    mode.is('document', 'chat') || (mode.is('announcement') && isCreator()),
+  allowsDelete: () => mode.is('document', 'chat', 'announcement'),
+  allowsPrivateReply: () => mode.is('document', 'chat', 'announcement'),
+  /// Can this user edit this blip? Mirrors WaveMode::allows_edit.
+  allowsEdit: (blip) => {
+    switch (mode.current()) {
+      case 'document':
+      case 'notepad':
+        return true;
+      case 'chat':
+      case 'announcement':
+        return blip.author === state.me.id;
+      default:
+        return false;
+    }
+  },
+};
+
+function isCreator() {
+  return Boolean(state.wave && state.wave.creator === state.me.id);
+}
+
 const state = {
   me: null,
   users: [],
@@ -29,6 +67,9 @@ const state = {
   editors: new Map(), // blipId -> Editor
   blipNodes: new Map(), // blipId -> element
   presence: [],
+  /// The chat composer, when the mode has one. Deliberately separate from
+  /// `editors`, which renderThread() rebuilds wholesale.
+  composer: null,
   remoteCursors: new Map(),
   cursorLayer: null,
   activeEditor: null,
@@ -322,6 +363,7 @@ function teardownWave() {
   state.wave = null;
   state.activeEditor = null;
   state.cursorLayer = null;
+  state.composer = null;
 }
 
 function rootWavelet() {
@@ -365,6 +407,7 @@ function renderWave() {
     ]),
     el('div', { class: 'wave-actions' }, [
       formatToolbar(),
+      modeControl(),
       el('button', {
         class: 'btn ghost',
         text: 'Playback',
@@ -386,15 +429,7 @@ function renderWave() {
   const thread = el('div', { class: 'thread', id: 'thread' });
   const scroller = el('div', { class: 'thread-scroll' }, [
     thread,
-    el('div', { class: 'thread-foot' }, [
-      el('button', {
-        class: 'btn primary',
-        text: 'Add message',
-        onClick: () => {
-          if (root) conn.send({ type: 'createBlip', waveletId: root.id });
-        },
-      }),
-    ]),
+    el('div', { class: 'thread-foot', id: 'thread-foot' }),
   ]);
 
   pane.appendChild(header);
@@ -404,6 +439,123 @@ function renderWave() {
   renderParticipants();
   renderPresence();
   renderThread();
+  renderComposer();
+}
+
+/// What sits below the thread: a chat composer, an "add message" button, or an
+/// explanation of why neither is offered.
+///
+/// Deliberately outside `#thread`. renderThread() clears and rebuilds that
+/// element on every incoming message, so a composer inside it would lose its
+/// caret each time anyone else typed.
+function renderComposer() {
+  const host = document.getElementById('thread-foot');
+  if (!host) return;
+  clear(host);
+  const root = rootWavelet();
+  if (!root || state.playback) return;
+
+  if (!mode.allowsNewMessage()) {
+    const why = mode.is('frozen')
+      ? 'This wave is frozen.'
+      : mode.is('notepad')
+        ? 'This wave is a single shared page — edit it directly above.'
+        : 'Only the person who started this wave can post here.';
+    host.appendChild(el('p', { class: 'compose-note', text: why }));
+    return;
+  }
+
+  // Outside chat, a message is created empty and typed into in place.
+  if (!mode.is('chat')) {
+    host.appendChild(
+      el('button', {
+        class: 'btn primary',
+        text: 'Add message',
+        onClick: () => conn.send({ type: 'createBlip', waveletId: root.id }),
+      }),
+    );
+    return;
+  }
+
+  const field = el('div', { class: 'composer-input' });
+  const box = el('div', { class: 'composer' }, [
+    field,
+    el('button', {
+      class: 'btn primary composer-send',
+      text: 'Send',
+      title: 'Enter',
+      onMousedown: (e) => e.preventDefault(),
+      onClick: () => send(),
+    }),
+  ]);
+  host.appendChild(box);
+
+  // A standalone editor over a local draft. It is never registered in
+  // state.docs or state.editors, so nothing that re-renders the thread can
+  // touch it.
+  const composer = new Editor(field, new Delta(), {
+    onChange: () => {},
+  });
+  state.composer = composer;
+
+  const send = () => {
+    const text = composer.doc.toPlainText().trim();
+    if (!text) return;
+    conn.send({ type: 'createBlip', waveletId: root.id, content: composer.doc });
+    composer.reset(new Delta());
+    composer.root.focus();
+  };
+
+  // Enter sends; Shift+Enter is a newline. Returning false tells the editor the
+  // key was handled — and preventDefault is ours to call, or the browser still
+  // inserts its own line break behind our back.
+  composer.onEnter = (event) => {
+    event.preventDefault();
+    send();
+    return false;
+  };
+  composer.root.setAttribute('data-placeholder', 'Write a message…');
+}
+
+/// The mode indicator. Only the creator can change it, so everyone else sees a
+/// plain label explaining why the wave behaves as it does.
+function modeControl() {
+  const current = MODES.find((m) => m.id === mode.current()) || MODES[0];
+
+  if (!isCreator()) {
+    return el('span', {
+      class: `mode-badge mode-${current.id}`,
+      text: current.label,
+      title: current.hint,
+    });
+  }
+
+  const select = el('select', {
+    class: `mode-select mode-${current.id}`,
+    title: current.hint,
+    onChange: async (e) => {
+      const next = e.target.value;
+      if (next === mode.current()) return;
+      const chosen = MODES.find((m) => m.id === next);
+      const ok = await confirmAction(
+        `Switch to ${chosen.label}?`,
+        `${chosen.hint}\n\nThis changes what everyone in the wave can do. Nothing is ` +
+          `deleted, and you can switch back at any time.`,
+        { confirmLabel: `Switch to ${chosen.label}` },
+      );
+      if (!ok) {
+        e.target.value = mode.current();
+        return;
+      }
+      conn.send({ type: 'setMode', waveId: state.waveId, mode: next });
+    },
+  });
+  for (const m of MODES) {
+    select.appendChild(
+      el('option', { value: m.id, text: m.label, selected: m.id === current.id }),
+    );
+  }
+  return select;
 }
 
 function renderParticipants() {
@@ -477,7 +629,9 @@ function renderThread() {
   const blips = allBlips();
   const byParent = new Map();
   for (const blip of blips) {
-    const key = blip.parent || `root:${blip.waveletId}`;
+    // Flat modes ignore `parent` when laying out. The server still stores it, so
+    // switching back to a threaded mode restores the tree exactly.
+    const key = (!mode.isFlat() && blip.parent) || `root:${blip.waveletId}`;
     if (!byParent.has(key)) byParent.set(key, []);
     byParent.get(key).push(blip);
   }
@@ -523,12 +677,7 @@ function renderThread() {
 }
 
 function blipElement(blip, depth) {
-  const author = state.users.find((u) => u.id === blip.author) || {
-    id: blip.author,
-    name: '?',
-    displayName: 'Unknown',
-    color: 0,
-  };
+  const author = lookupUser(blip.author);
 
   const doc = state.docs.get(blip.id) || new BlipDoc(blip.id, blip.content, blip.revision);
   state.docs.set(blip.id, doc);
@@ -556,10 +705,12 @@ function blipElement(blip, depth) {
         })
       : null,
     el('div', { class: 'blip-actions' }, [
-      actionButton('Reply', 'Reply below this message', () => {
+      mode.allowsReplies() &&
+        actionButton('Reply', 'Reply below this message', () => {
         conn.send({ type: 'createBlip', waveletId: blip.waveletId, parent: blip.id });
       }),
-      actionButton('Privately', 'Start a private side conversation', async () => {
+      mode.allowsPrivateReply() &&
+        actionButton('Privately', 'Start a private side conversation', async () => {
         const name = await askFor('Private reply', {
           placeholder: 'username',
           description: 'Only you and the people you name will see this thread.',
@@ -574,7 +725,7 @@ function blipElement(blip, depth) {
           });
         }
       }),
-      blip.author === state.me.id
+      blip.author === state.me.id && mode.allowsDelete()
         ? actionButton('Delete', 'Delete this message', async () => {
             const ok = await confirmAction('Delete message', 'This cannot be undone.', {
               confirmLabel: 'Delete',
@@ -593,8 +744,12 @@ function blipElement(blip, depth) {
   const editorRoot = el('div', { class: 'editor' });
   body.appendChild(editorRoot);
 
-  if (state.playback) {
+  const editable = !state.playback && mode.allowsEdit(blip);
+  if (!editable) {
+    // Rendered rather than edited. The server refuses the op regardless; this
+    // just avoids offering a caret that would go nowhere.
     editorRoot.contentEditable = 'false';
+    editorRoot.classList.add('read-only');
     renderDelta(editorRoot, doc.doc);
   } else {
     const editor = new Editor(editorRoot, doc.doc, {
@@ -620,6 +775,31 @@ function blipElement(blip, depth) {
   return article;
 }
 
+/// Resolve a user id to a profile for display.
+///
+/// The wave's own participant lists are the primary source: they always contain
+/// everyone who could have written something here. `state.users` is only a
+/// fallback, and cannot be relied on alone — it is fetched once at startup, and
+/// a user who shared no waves at that moment gets an empty list, which used to
+/// render their own messages as "Unknown".
+function lookupUser(userId) {
+  if (state.me && state.me.id === userId) return state.me;
+  if (state.wave) {
+    for (const wavelet of state.wave.wavelets) {
+      const found = wavelet.participants.find((p) => p.id === userId);
+      if (found) return found;
+    }
+  }
+  return (
+    state.users.find((u) => u.id === userId) || {
+      id: userId,
+      name: '?',
+      displayName: 'Unknown',
+      color: 0,
+    }
+  );
+}
+
 function actionButton(label, title, handler) {
   return el('button', { class: 'blip-action', text: label, title, onClick: handler });
 }
@@ -643,6 +823,13 @@ function replayUnsentEdits(unsent) {
       continue;
     }
     if (work.baseLength() > doc.doc.length) {
+      dropped += 1;
+      continue;
+    }
+    // Would be refused on arrival, and resubmitting on every reconnect would
+    // loop forever.
+    const blip = allBlips().find((b) => b.id === blipId);
+    if (blip && !mode.allowsEdit(blip)) {
       dropped += 1;
       continue;
     }
@@ -952,6 +1139,42 @@ conn.on('blipRemoved', (message) => {
   renderThread();
 });
 
+conn.on('modeChanged', (message) => {
+  if (!state.wave || message.waveId !== state.waveId) return;
+  state.wave.mode = message.mode;
+
+  // Count unsent edits the new mode will no longer accept. Keeping them would
+  // mean retrying an op the server refuses for as long as the mode lasts.
+  let abandoned = 0;
+  for (const wavelet of state.wave.wavelets) {
+    for (const blip of wavelet.blips) {
+      const doc = state.docs.get(blip.id);
+      if (!doc || mode.allowsEdit(blip)) continue;
+      const pending = doc.pendingWork();
+      if (pending && !pending.isEmpty()) abandoned += 1;
+    }
+  }
+
+  renderWave();
+
+  if (abandoned > 0) {
+    toast(
+      `This wave is now ${message.mode}. ${abandoned} unsent ` +
+        `${abandoned === 1 ? 'change was' : 'changes were'} discarded.`,
+      'error',
+    );
+    // Reopen for authoritative content. Note what we must NOT do: reset from
+    // the copy of the blip held in `state.wave`. That is the snapshot taken when
+    // the wave was opened, and every edit since has arrived as an operation, so
+    // adopting it would silently discard everything typed in this session.
+    // replayUnsentEdits skips blips the mode forbids, so the doomed work is
+    // dropped and everything else is replayed.
+    conn.openWave(state.waveId);
+  } else {
+    toast(`This wave is now ${message.mode}.`);
+  }
+});
+
 conn.on('titleChanged', (message) => {
   if (state.wave && message.waveId === state.waveId) {
     const wavelet = state.wave.wavelets.find((w) => w.id === message.waveletId);
@@ -963,6 +1186,7 @@ conn.on('titleChanged', (message) => {
 
 conn.on('participantAdded', (message) => {
   if (!state.users.some((u) => u.id === message.user.id)) state.users.push(message.user);
+  // Keeps the picker's suggestions current without another round trip.
   if (state.wave && message.waveId === state.waveId) {
     const wavelet = state.wave.wavelets.find((w) => w.id === message.waveletId);
     if (wavelet && !wavelet.participants.some((p) => p.id === message.user.id)) {
@@ -1049,6 +1273,18 @@ conn.on('searchResults', (message) => {
 });
 
 conn.on('error', (message) => {
+  // A refused edit names the message it applies to. Reset that document to the
+  // server's version: retrying is pointless while the rule stands, and holding
+  // the op would block everything typed afterwards.
+  if (message.code === 'forbidden' && message.blipId) {
+    toast(message.message, 'error');
+    // Reopen rather than reconstructing locally: the client's copy of the blip
+    // is the snapshot from when the wave was opened, so it is not a safe source
+    // of truth. The reopen drops the pending op (replayUnsentEdits skips blips
+    // the mode forbids) and restores the server's version of everything else.
+    if (state.docs.get(message.blipId)?.pendingWork()) conn.openWave(state.waveId);
+    return;
+  }
   if (message.code === 'resync' && message.blipId) {
     // Our op could not be transformed; reopen the wave for a clean snapshot.
     toast('Reconnecting this wave…');

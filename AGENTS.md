@@ -106,25 +106,46 @@ is never sent.
 
 `Ack` and `WaveState` in particular must never be dropped.
 
-### 6. Schema changes need a version bump and a migration
+### 6. Mode rules go through `LiveWave::permit`, and only there
 
-`CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, so a new
-column would simply never be added. Bump `SCHEMA_VERSION` in
-`crates/gal-server/src/db.rs` and add the corresponding step to `migrate()`,
-bumping `user_version` inside the same transaction as the DDL.
+A wave's mode decides what participants may do. Every content mutation must ask
+`permit` rather than matching on the mode at the call site — adding the checks by
+hand was already enough to miss one.
+
+Two orderings are load-bearing:
+
+- In `apply_op` the mode check runs **after** the idempotency lookup. A
+  reconnecting client replays work it never saw acknowledged; checking first
+  would refuse an op the server already holds, the acknowledgement would never
+  arrive, and everything typed afterwards would pile up locally and never be
+  sent.
+- A refusal must carry the blip id, so the client knows which document to drop.
+  A bare refusal leaves it retrying forever.
+
+Never reconstruct a document from `state.wave...blips[].content` in the client.
+That is the snapshot from when the wave was opened; every edit since arrived as
+an operation. Reopen the wave for authoritative content instead.
+
+### 7. Schema changes need a version bump and a migration
+
+`schema.sql` is a **frozen v1 baseline** — do not add columns to it. Every change
+since is a migration step: bump `SCHEMA_VERSION` in `crates/gal-server/src/db.rs`
+and add a step to `migrate()`, bumping `user_version` inside the same transaction
+as the DDL. Fresh databases run every migration too, so they end up identical to
+upgraded ones.
 
 The server refuses to start against a schema it does not recognise. That is
 deliberate: starting cleanly and then serving empty inboxes looks like data loss
 to the user.
 
-### 7. Nothing reaches the wire in snake_case
+### 8. Nothing reaches the wire in snake_case
 
 Serde's container-level `rename_all` renames *variants*, not fields. Each variant
 needs its own `#[serde(rename_all = "camelCase")]`. Forgetting it is invisible to
 a Rust round-trip test — both sides agree on the wrong name — and fatal to the
 browser client. `no_message_field_is_snake_case` guards this.
 
-### 8. Keep expensive work off the async reactor
+### 9. Keep expensive work off the async reactor
 
 Password hashing runs in `spawn_blocking`. Argon2 costs ~19 MiB and tens of
 milliseconds; running it inline lets a handful of concurrent logins stall every

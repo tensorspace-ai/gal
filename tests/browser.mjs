@@ -144,6 +144,18 @@ async function createWave(page, title) {
   await page.waitForSelector('.blip .editor', { timeout: 15000 });
 }
 
+// isEditable() throws when an element is not editable at all, which is exactly
+// the state some modes should produce. Read the attribute instead.
+const editable = async (page, selector) =>
+  (await page.getAttribute(selector, 'contenteditable')) === 'true';
+
+async function setMode(page, id) {
+  await page.selectOption('.mode-select', id);
+  await page.waitForSelector('.dialog .btn.primary', { timeout: 5000 });
+  await page.click('.dialog .btn.primary');
+  await page.waitForTimeout(900);
+}
+
 async function addParticipant(page, name) {
   await page.click('.add-participant');
   await page.waitForSelector('.dialog input');
@@ -338,6 +350,82 @@ try {
   await phone.click('.back-to-inbox');
   await phone.waitForTimeout(300);
   check('and it returns to the inbox', await phone.isVisible('.sidebar'));
+
+
+  // --- wave modes -------------------------------------------------------
+
+  section('Wave modes');
+  const mAlice = await signUp('mode_alice');
+  const mBob = await signUp('mode_bob');
+  await createWave(mAlice, 'Modes');
+  await mAlice.click('.editor');
+  await mAlice.keyboard.type('First message');
+  await mAlice.waitForTimeout(400);
+  await addParticipant(mAlice, 'mode_bob');
+  await mBob.waitForSelector('.inbox-row', { timeout: 15000 });
+  await mBob.click('.inbox-row:has-text("Modes")');
+  await mBob.waitForSelector('.blip .editor', { timeout: 15000 });
+  await mBob.waitForTimeout(500);
+
+  check('the creator gets a mode picker', await mAlice.isVisible('.mode-select'));
+  check('everyone else sees a read-only badge', await mBob.isVisible('.mode-badge'));
+  check('document mode lets anyone edit anything', await editable(mBob, '.blip .editor'));
+
+  await setMode(mAlice, 'chat');
+  await mBob.waitForTimeout(900);
+  check('a mode change reaches other participants live',
+    (await mBob.textContent('.mode-badge')) === 'Chat');
+  check('chat offers a composer', await mAlice.isVisible('.composer-input'));
+  check("chat protects other people's messages", !(await editable(mBob, '.blip .editor')));
+  check('chat hides threading', !(await mAlice.isVisible('.blip-action:has-text("Reply")')));
+
+  await mAlice.click('.composer-input');
+  await mAlice.keyboard.type('sent with enter');
+  await mAlice.keyboard.press('Enter');
+  await mAlice.waitForTimeout(900);
+  check('Enter sends', (await mAlice.locator('.blip').count()) === 2);
+  check('the composer clears', (await mAlice.textContent('.composer-input')).trim() === '');
+  check('no stray newline is inserted',
+    !(await mAlice.locator('.blip .editor').last().textContent()).includes('\n'));
+
+  await mAlice.click('.composer-input');
+  await mAlice.keyboard.type('draft kept');
+  await mBob.click('.composer-input');
+  await mBob.keyboard.type('from bob');
+  await mBob.keyboard.press('Enter');
+  await mAlice.waitForTimeout(1200);
+  check('an incoming message does not destroy your draft',
+    (await mAlice.textContent('.composer-input')).includes('draft kept'));
+
+  const authors = await mAlice.locator('.blip-author').allTextContents();
+  check('messages show real author names, including your own',
+    authors.includes('Mode_alice') || authors.includes('mode_alice'), authors.join(', '));
+  check('no message is attributed to Unknown', !authors.some((a) => a === 'Unknown'));
+
+  await setMode(mAlice, 'frozen');
+  await mBob.waitForTimeout(900);
+  check('frozen makes everything read-only', !(await editable(mAlice, '.blip .editor')));
+  check('frozen offers no composer', !(await mAlice.isVisible('.composer-input')));
+  check('frozen explains itself', (await mAlice.textContent('.compose-note')).includes('frozen'));
+
+  await setMode(mAlice, 'document');
+  await mBob.waitForTimeout(900);
+  check('unfreezing restores editing', await editable(mAlice, '.blip .editor'));
+  check('threading returns', await mAlice.isVisible('.blip-action:has-text("Reply")'));
+  const restored = await mAlice.textContent('.thread');
+  check('a mode round trip loses nothing',
+    restored.includes('First message') && restored.includes('from bob'), restored.slice(0, 90));
+
+  await setMode(mAlice, 'announcement');
+  await mBob.waitForTimeout(900);
+  check('announcement stops others posting', await mBob.isVisible('.compose-note'));
+  check('but the creator can post', await mAlice.isVisible('.thread-foot .btn'));
+  check('and anyone may reply', await mBob.isVisible('.blip-action:has-text("Reply")'));
+
+  await setMode(mAlice, 'notepad');
+  await mAlice.waitForTimeout(500);
+  check('notepad stays editable by everyone', await editable(mAlice, '.blip .editor'));
+  check('notepad adds no new messages', !(await mAlice.isVisible('.thread-foot .btn')));
 
   // --- surviving an outage ----------------------------------------------
 

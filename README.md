@@ -113,6 +113,21 @@ upgrading.
   no last-write-wins.
 - **Threaded conversations.** Reply under a message, or reply beside it. Threads
   nest arbitrarily.
+- **Modes.** A wave has a mode that decides what people can do in it, and its
+  creator can change it at any time:
+
+  | Mode | Who posts | Who edits | Shape |
+  |---|---|---|---|
+  | **Document** *(default)* | anyone | anyone edits anything | threaded |
+  | **Chat** | anyone | only your own messages | flat, composer at the bottom |
+  | **Announcement** | the creator | only the author | a notice with replies |
+  | **Notepad** | nobody | anyone edits everything | one shared page |
+  | **Frozen** | nobody | nobody | read-only |
+
+  Switching is non-destructive and reversible: moving a threaded wave to Chat
+  hides the nesting rather than flattening it in storage, and switching back
+  restores the thread exactly. Every rule is enforced by the server, so hiding a
+  button is a convenience and never the actual protection.
 - **Private replies.** Branch a side conversation off any message with a subset
   of the wave's participants. The server never sends it to anyone else — not in
   live updates, not in snapshots, not in search results, not in the inbox

@@ -17,6 +17,9 @@ will bump the minor version and be listed here.
 
 - Waves, wavelets, and threaded blips, with live collaborative editing backed by
   operational transformation.
+- Wave modes — Document, Chat, Announcement, Notepad and Frozen — changing both
+  what participants may do and how the wave is presented. Only the creator can
+  switch, and switching never alters stored content.
 - Private replies: side conversations scoped to a subset of a wave's
   participants, enforced server-side.
 - Playback of a wave's entire edit history, replayed from the op log.

@@ -618,6 +618,84 @@ input {
   text-decoration: line-through;
 }
 
+/* --- mode --- */
+
+.mode-select,
+.mode-badge {
+  font-size: 12.5px;
+  padding: 4px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.mode-badge {
+  cursor: default;
+}
+
+/* A mode that restricts what people can do should look like it does. */
+.mode-frozen {
+  border-color: color-mix(in srgb, var(--text-faint) 60%, transparent);
+  background: var(--surface-2);
+}
+
+.mode-announcement {
+  border-color: color-mix(in srgb, #d08a30 55%, transparent);
+}
+
+/* --- composer --- */
+
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 8px 8px 8px 12px;
+  box-shadow: var(--shadow-1);
+}
+
+.composer-input {
+  flex: 1;
+  outline: none;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  max-height: 40vh;
+  overflow-y: auto;
+  min-height: 1.55em;
+  caret-color: var(--accent);
+}
+
+.composer-input:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+
+.composer-send {
+  flex-shrink: 0;
+}
+
+.compose-note {
+  margin: 0;
+  padding: 10px 2px;
+  color: var(--text-faint);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* A message nobody may edit should not look like an input. */
+.editor.read-only {
+  caret-color: transparent;
+}
+
+.editor.read-only:empty::before {
+  content: '';
+}
+
 /* --- thread --- */
 
 .thread-scroll {
