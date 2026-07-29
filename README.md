@@ -8,23 +8,14 @@ character by character — and the history of how it got written is part of the
 document. Gal rebuilds that on modern foundations: WebSockets instead of long
 polling, one static binary instead of a Java stack, and no plugins in the browser.
 
-```
-┌─ Gal ─────────────────┬────────────────────────────────────────────┐
-│  Search waves         │  Launch plan                    B I U ␣ 🔗 │
-│  ─────────────────    │  HERE NOW ●●  (AL)(BO)(CA) +               │
-│  ▸ Launch plan     3  │  ┌──────────────────────────────────────┐  │
-│    Between us: the…   │  │ (AL) Alice  now  +1                  │  │
-│                       │  │ Heads up: We ship on Friday.         │  │
-│                       │  │  ┌────────────────────────────────┐  │  │
-│                       │  │  │ (AL) Alice  now                │  │  │
-│                       │  │  │ Replying in a thread.          │  │  │
-│                       │  │  └────────────────────────────────┘  │  │
-│                       │  │  ┌ PRIVATE REPLY (AL)(BO) ─────────┐  │  │
-│                       │  │  │ Between us: the date may slip. │  │  │
-│                       │  │  └────────────────────────────────┘  │  │
-│                       │  └──────────────────────────────────────┘  │
-└───────────────────────┴────────────────────────────────────────────┘
-```
+![A Gal wave: three participants, one message being co-edited, a threaded reply,
+and a private reply visible only to two of
+them](docs/screenshots/wave.png)
+
+Alice's view of a wave she shares with Bob and Carol. The top message has been
+edited by both Alice and Bob; Bob's caret is visible inside the reply he is
+typing. The dashed block is a private reply — Carol is a full participant in this
+wave and never receives it.
 
 ## Running it
 
@@ -128,6 +119,21 @@ upgrading.
   hides the nesting rather than flattening it in storage, and switching back
   restores the thread exactly. Every rule is enforced by the server, so hiding a
   button is a convenience and never the actual protection.
+
+  ![The same wave in Chat mode: flat messages and a composer at the
+  bottom](docs/screenshots/mode-chat.png)
+
+  The same wave in **Chat**, seen by a participant who did not create it. The
+  nesting is gone, there is a composer at the bottom, and the other people's
+  messages are no longer editable — the mode shows as a badge rather than a
+  picker, because only the creator may change it.
+
+  ![The same wave in Frozen mode: read-only, with a note explaining
+  why](docs/screenshots/mode-frozen.png)
+
+  And in **Frozen**, seen by the creator: no composer, nothing editable, and a
+  line saying why. Every message written in Chat is still there, and switching
+  back to Document restores the threading it was hiding.
 - **Private replies.** Branch a side conversation off any message with a subset
   of the wave's participants. The server never sends it to anyone else — not in
   live updates, not in snapshots, not in search results, not in the inbox
@@ -137,6 +143,13 @@ upgrading.
   hidden. There is a test for it.
 - **Playback.** Scrub through a wave's entire edit history and watch it get
   written. This is a real replay of the op log, not a diff of saved versions.
+
+  ![Playback scrubbed to frame 96 of 275, showing the wave mid-sentence with
+  later replies not yet written](docs/screenshots/playback.png)
+
+  Frame 96 of 275 for the wave above. The first message stops mid-word, and the
+  replies that had not been written yet are empty — this is the op log replayed,
+  so the granularity is a keystroke, not a save.
 - **Presence and remote cursors.** See who is in a wave and where their caret is.
 - **Rich text** — bold, italic, underline, strikethrough, code, links — carried
   as attributes on the document, so formatting transforms correctly against
