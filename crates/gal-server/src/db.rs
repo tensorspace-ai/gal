@@ -34,6 +34,14 @@ pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// to the user.
 pub const SCHEMA_VERSION: i64 = 2;
 
+/// The version `schema.sql` describes.
+///
+/// `schema.sql` is a frozen baseline, not the current schema. Every change after
+/// it is a migration step, so a fresh database and an upgraded one end up
+/// identical, and a statement can never reference a column that an older
+/// database has not been given yet.
+const BASELINE_VERSION: i64 = 1;
+
 impl Storage {
     /// Open (creating if needed) the database at `path`, and bring its schema up
     /// to [`SCHEMA_VERSION`].
@@ -1039,7 +1047,6 @@ impl Storage {
 /// users as "my conversations are gone". Failing at startup with an actionable
 /// message is far better than failing silently at query time.
 fn migrate(conn: &mut Connection) -> Result<()> {
-    #[allow(unused_assignments)]
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap_or(0);
@@ -1053,15 +1060,18 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             |r| r.get::<_, i64>(0).map(|n| n > 0),
         )?;
 
-        conn.execute_batch(include_str!("schema.sql"))
-            .context("failed to apply schema")?;
-        // A pre-versioning database has exactly the version 1 layout, so it is
-        // adopted rather than migrated.
-        version = if initialised {
-            adopt_legacy(conn)?
+        if initialised {
+            // A pre-versioning database has the v1 layout. Verify that, then let
+            // the steps below bring it forward exactly as they would any other
+            // v1 database. Applying the *current* schema here would be wrong:
+            // `CREATE TABLE IF NOT EXISTS` skips existing tables, so later
+            // columns would never appear, and statements referencing them fail.
+            adopt_legacy(conn)?;
         } else {
-            SCHEMA_VERSION
-        };
+            conn.execute_batch(include_str!("schema.sql"))
+                .context("failed to apply schema")?;
+        }
+        version = BASELINE_VERSION;
         conn.pragma_update(None, "user_version", version)?;
     }
 
@@ -1074,7 +1084,8 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
 
     // Each step bumps `user_version` inside the same transaction as its DDL, so
-    // an interrupted upgrade cannot half-apply.
+    // an interrupted upgrade cannot half-apply. Fresh databases run these too —
+    // that is what keeps a new database and an upgraded one byte-identical.
     if version == 1 {
         let tx = conn.transaction()?;
         tx.execute_batch(
@@ -1085,12 +1096,13 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.pragma_update(None, "user_version", 2)?;
         tx.commit()?;
         version = 2;
-        tracing::info!("migrated database schema to v2");
+        tracing::debug!("migrated database schema to v2");
     }
 
     if version < SCHEMA_VERSION {
         anyhow::bail!(
-            "no migration available from schema v{version} to v{SCHEMA_VERSION};              this build cannot upgrade this database"
+            "no migration available from schema v{version} to v{SCHEMA_VERSION}; \
+             this build cannot upgrade this database"
         );
     }
 
@@ -1100,7 +1112,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 
 /// Verify that an unversioned database really does match the v1 layout before
 /// stamping it, so a corrupt or foreign file is rejected rather than adopted.
-fn adopt_legacy(conn: &Connection) -> Result<i64> {
+fn adopt_legacy(conn: &Connection) -> Result<()> {
     for (table, column) in [
         ("blips", "deleted"),
         ("blips", "revision"),
@@ -1122,7 +1134,7 @@ fn adopt_legacy(conn: &Connection) -> Result<i64> {
             );
         }
     }
-    Ok(SCHEMA_VERSION)
+    Ok(())
 }
 
 // --- row mapping --------------------------------------------------------
@@ -1309,6 +1321,156 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// Build a database shaped like the pre-versioning release: the v1 layout
+    /// with no `user_version` stamp.
+    fn write_legacy_database(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL, email TEXT NOT NULL, password_hash TEXT NOT NULL,
+                color INTEGER NOT NULL, created_at INTEGER NOT NULL);
+             CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+             CREATE TABLE waves (id TEXT PRIMARY KEY, creator TEXT NOT NULL, created_at INTEGER NOT NULL);
+             CREATE TABLE wavelets (id TEXT PRIMARY KEY, wave_id TEXT NOT NULL, kind TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '', anchor_blip TEXT, created_at INTEGER NOT NULL,
+                last_modified INTEGER NOT NULL);
+             CREATE TABLE participants (wavelet_id TEXT NOT NULL, user_id TEXT NOT NULL,
+                added_at INTEGER NOT NULL, PRIMARY KEY (wavelet_id, user_id));
+             CREATE TABLE blips (id TEXT PRIMARY KEY, wavelet_id TEXT NOT NULL, wave_id TEXT NOT NULL,
+                parent TEXT, seq INTEGER NOT NULL, author TEXT NOT NULL, contributors TEXT NOT NULL,
+                created_at INTEGER NOT NULL, last_modified INTEGER NOT NULL, content TEXT NOT NULL,
+                revision INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE wave_flags (user_id TEXT NOT NULL, wave_id TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0, muted INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, wave_id));
+             CREATE TABLE read_marks (user_id TEXT NOT NULL, blip_id TEXT NOT NULL,
+                revision INTEGER NOT NULL, PRIMARY KEY (user_id, blip_id));
+             CREATE TABLE ops (blip_id TEXT NOT NULL, revision INTEGER NOT NULL, wave_id TEXT NOT NULL,
+                author TEXT NOT NULL, timestamp INTEGER NOT NULL, delta TEXT NOT NULL,
+                PRIMARY KEY (blip_id, revision));
+             CREATE VIRTUAL TABLE blip_search USING fts5(blip_id UNINDEXED, wave_id UNINDEXED, body);
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+    }
+
+    fn schema_version(path: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn has_column(path: &std::path::Path, table: &str, column: &str) -> bool {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        cols.iter().any(|c| c == column)
+    }
+
+    #[tokio::test]
+    async fn a_pre_versioning_database_is_migrated_not_mis_stamped() {
+        // Regression: adopt_legacy used to stamp such a database with the
+        // *current* version, so every migration step was skipped. Since
+        // `CREATE TABLE IF NOT EXISTS` cannot add a column to an existing table,
+        // the database ended up claiming to be current while missing `ops.op_id`
+        // — and the server failed at the first edit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        write_legacy_database(&path);
+        assert_eq!(schema_version(&path), 0);
+        assert!(!has_column(&path, "ops", "op_id"));
+
+        let storage = Storage::open(&path).unwrap();
+
+        assert_eq!(
+            schema_version(&path),
+            SCHEMA_VERSION,
+            "should be brought fully forward"
+        );
+        assert!(
+            has_column(&path, "ops", "op_id"),
+            "the v1->v2 step must have run"
+        );
+
+        // And it actually works: a full create-and-edit round trip.
+        let alice = make_user(&storage, "alice").await;
+        let (wave, wavelet) = storage
+            .create_wave(
+                alice.id.clone(),
+                "After upgrade".into(),
+                vec![alice.id.clone()],
+            )
+            .await
+            .unwrap();
+        let mut blip = Blip::new(
+            wave.id.clone(),
+            wavelet.id.clone(),
+            alice.id.clone(),
+            None,
+            0,
+        );
+        blip.content = Delta::document("still works");
+        blip.revision = 1;
+        storage.insert_blip(blip.clone()).await.unwrap();
+        storage
+            .commit_op(
+                blip,
+                Delta::new(),
+                alice.id.clone(),
+                now(),
+                Some("op-1".into()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fresh_database_and_an_upgraded_one_agree() {
+        // schema.sql is a frozen v1 baseline and every later change is a
+        // migration, so both paths must converge on the same layout.
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.db");
+        let upgraded = dir.path().join("upgraded.db");
+        let _ = Storage::open(&fresh).unwrap();
+        write_legacy_database(&upgraded);
+        let _ = Storage::open(&upgraded).unwrap();
+
+        assert_eq!(schema_version(&fresh), schema_version(&upgraded));
+        for (table, column) in [("ops", "op_id"), ("blips", "deleted")] {
+            assert_eq!(
+                has_column(&fresh, table, column),
+                has_column(&upgraded, table, column),
+                "{table}.{column} differs between a fresh and an upgraded database"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_database_that_is_not_recognisably_gal_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foreign.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let err = match Storage::open(&path) {
+            Ok(_) => panic!("a foreign database was adopted instead of refused"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("unrecognised schema"),
+            "expected a clear refusal, got: {err:#}"
+        );
     }
 
     #[tokio::test]

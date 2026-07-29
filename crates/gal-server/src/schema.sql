@@ -1,4 +1,10 @@
--- Gal storage schema.
+-- Gal storage schema — the v1 BASELINE.
+--
+-- Do not add columns here. This file describes the schema as it was at v1 and is
+-- frozen; every change since is a migration step in db.rs::migrate. Fresh
+-- databases apply this and then run every migration, so they end up identical to
+-- an upgraded one. Editing this file instead would silently skip the change on
+-- existing databases, because `CREATE TABLE IF NOT EXISTS` is a no-op.
 --
 -- Durability model: every accepted op is appended to `ops` before it is
 -- acknowledged, and `blips.content` holds a materialised snapshot so opening a
@@ -83,13 +89,8 @@ CREATE TABLE IF NOT EXISTS ops (
     author    TEXT NOT NULL,
     timestamp INTEGER NOT NULL,
     delta     TEXT NOT NULL,
-    -- Client-generated, unique per submitted op. Lets a reconnecting client
-    -- replay pending work without the risk of applying it twice; the durable
-    -- record is what makes this survive the wave being evicted from memory.
-    op_id     TEXT,
     PRIMARY KEY (blip_id, revision)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ops_op_id ON ops(blip_id, op_id) WHERE op_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ops_wave_time ON ops(wave_id, timestamp);
 
 -- Read state is per blip *revision*, so editing a blip makes it unread again.
