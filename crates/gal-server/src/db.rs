@@ -32,7 +32,7 @@ pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// table, so without this a new column would simply never be added: the server
 /// would start cleanly, then fail at query time in ways that look like data loss
 /// to the user.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The version `schema.sql` describes.
 ///
@@ -265,12 +265,14 @@ impl Storage {
         creator: UserId,
         title: String,
         participants: Vec<UserId>,
+        mode: WaveMode,
     ) -> Result<(Wave, Wavelet)> {
         let ts = now();
         let wave = Wave {
             id: WaveId::new(),
             creator: creator.clone(),
             created_at: ts,
+            mode,
         };
         let wavelet = Wavelet {
             id: WaveletId::new(),
@@ -287,8 +289,13 @@ impl Storage {
         self.run(move |conn| {
             let tx = conn.transaction()?;
             tx.execute(
-                "INSERT INTO waves (id, creator, created_at) VALUES (?1, ?2, ?3)",
-                params![w.id.as_str(), w.creator.as_str(), w.created_at],
+                "INSERT INTO waves (id, creator, created_at, mode) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    w.id.as_str(),
+                    w.creator.as_str(),
+                    w.created_at,
+                    w.mode.as_str()
+                ],
             )?;
             insert_wavelet(&tx, &s)?;
             tx.commit()?;
@@ -312,19 +319,37 @@ impl Storage {
     pub async fn wave(&self, wave_id: &WaveId) -> Result<Option<Wave>> {
         let id = wave_id.clone();
         self.run(move |conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT id, creator, created_at FROM waves WHERE id = ?1",
-                    params![id.as_str()],
-                    |r| {
-                        Ok(Wave {
+            conn.query_row(
+                "SELECT id, creator, created_at, mode FROM waves WHERE id = ?1",
+                params![id.as_str()],
+                |r| {
+                    let stored: String = r.get(3)?;
+                    Ok((
+                        Wave {
                             id: WaveId(r.get(0)?),
                             creator: UserId(r.get(1)?),
                             created_at: r.get(2)?,
-                        })
-                    },
-                )
-                .optional()?)
+                            mode: WaveMode::Document,
+                        },
+                        stored,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(wave, stored)| {
+                // Parse exhaustively. Falling back to a default here would
+                // silently unfreeze a frozen wave.
+                match WaveMode::parse(&stored) {
+                    Some(mode) => Ok(Wave { mode, ..wave }),
+                    None => Err(anyhow::anyhow!(
+                        "wave {} has an unrecognised mode {stored:?}; refusing to \
+                             guess, because guessing could grant edit access to a wave \
+                             that was frozen",
+                        wave.id
+                    )),
+                }
+            })
+            .transpose()
         })
         .await
     }
@@ -374,6 +399,19 @@ impl Storage {
                 .query_map(params![id.as_str()], row_to_blip)?
                 .collect::<Result<_, _>>()?;
             Ok(blips)
+        })
+        .await
+    }
+
+    /// Persist a wave's mode.
+    pub async fn set_mode(&self, wave_id: &WaveId, mode: WaveMode) -> Result<()> {
+        let id = wave_id.clone();
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE waves SET mode = ?2 WHERE id = ?1",
+                params![id.as_str(), mode.as_str()],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -1085,6 +1123,17 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tracing::debug!("migrated database schema to v2");
     }
 
+    if version == 2 {
+        let tx = conn.transaction()?;
+        // Modes apply to a whole wave, so the column lives on `waves`. Existing
+        // waves become Document, which is exactly how they already behaved.
+        tx.execute_batch("ALTER TABLE waves ADD COLUMN mode TEXT NOT NULL DEFAULT 'document';")?;
+        tx.pragma_update(None, "user_version", 3)?;
+        tx.commit()?;
+        version = 3;
+        tracing::debug!("migrated database schema to v3");
+    }
+
     if version < SCHEMA_VERSION {
         anyhow::bail!(
             "no migration available from schema v{version} to v{SCHEMA_VERSION}; \
@@ -1395,6 +1444,7 @@ mod tests {
                 alice.id.clone(),
                 "After upgrade".into(),
                 vec![alice.id.clone()],
+                WaveMode::Document,
             )
             .await
             .unwrap();
@@ -1512,6 +1562,7 @@ mod tests {
                 alice.id.clone(),
                 "Launch".into(),
                 vec![alice.id.clone(), bob.id.clone()],
+                WaveMode::Document,
             )
             .await
             .unwrap();
@@ -1533,6 +1584,7 @@ mod tests {
                 alice.id.clone(),
                 "Launch".into(),
                 vec![alice.id.clone(), bob.id.clone()],
+                WaveMode::Document,
             )
             .await
             .unwrap();
@@ -1571,6 +1623,7 @@ mod tests {
                 alice.id.clone(),
                 "T".into(),
                 vec![alice.id.clone(), bob.id.clone()],
+                WaveMode::Document,
             )
             .await
             .unwrap();
@@ -1621,6 +1674,7 @@ mod tests {
                 alice.id.clone(),
                 "Team".into(),
                 vec![alice.id.clone(), bob.id.clone(), carol.id.clone()],
+                WaveMode::Document,
             )
             .await
             .unwrap();
@@ -1670,7 +1724,12 @@ mod tests {
         let (storage, _dir) = temp_storage().await;
         let alice = make_user(&storage, "alice").await;
         let (wave, wavelet) = storage
-            .create_wave(alice.id.clone(), "Notes".into(), vec![alice.id.clone()])
+            .create_wave(
+                alice.id.clone(),
+                "Notes".into(),
+                vec![alice.id.clone()],
+                WaveMode::Document,
+            )
             .await
             .unwrap();
 
@@ -1751,7 +1810,12 @@ mod tests {
         let (storage, _dir) = temp_storage().await;
         let alice = make_user(&storage, "alice").await;
         let (wave, wavelet) = storage
-            .create_wave(alice.id.clone(), "P".into(), vec![alice.id.clone()])
+            .create_wave(
+                alice.id.clone(),
+                "P".into(),
+                vec![alice.id.clone()],
+                WaveMode::Document,
+            )
             .await
             .unwrap();
 
@@ -1792,7 +1856,12 @@ mod tests {
         let (storage, _dir) = temp_storage().await;
         let alice = make_user(&storage, "alice").await;
         let (wave, wavelet) = storage
-            .create_wave(alice.id.clone(), "N".into(), vec![alice.id.clone()])
+            .create_wave(
+                alice.id.clone(),
+                "N".into(),
+                vec![alice.id.clone()],
+                WaveMode::Document,
+            )
             .await
             .unwrap();
         let mut blip = Blip::new(
@@ -1827,7 +1896,12 @@ mod tests {
         let (storage, _dir) = temp_storage().await;
         let alice = make_user(&storage, "alice").await;
         let (wave, wavelet) = storage
-            .create_wave(alice.id.clone(), "H".into(), vec![alice.id.clone()])
+            .create_wave(
+                alice.id.clone(),
+                "H".into(),
+                vec![alice.id.clone()],
+                WaveMode::Document,
+            )
             .await
             .unwrap();
 
@@ -1894,7 +1968,12 @@ mod tests {
         let (storage, _dir) = temp_storage().await;
         let alice = make_user(&storage, "alice").await;
         let (wave, _) = storage
-            .create_wave(alice.id.clone(), "T".into(), vec![alice.id.clone()])
+            .create_wave(
+                alice.id.clone(),
+                "T".into(),
+                vec![alice.id.clone()],
+                WaveMode::Document,
+            )
             .await
             .unwrap();
 
@@ -1924,6 +2003,7 @@ mod tests {
                 alice.id.clone(),
                 "T".into(),
                 vec![alice.id.clone(), bob.id.clone()],
+                WaveMode::Document,
             )
             .await
             .unwrap();

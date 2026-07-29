@@ -105,6 +105,65 @@ impl LiveWave {
         self.root().map(|w| w.title.clone()).unwrap_or_default()
     }
 
+    /// Is this action allowed here, by this user, in this wave's mode?
+    ///
+    /// Every content mutation goes through this one function rather than
+    /// matching on the mode at each call site. That is deliberate: the rules are
+    /// then in a single place that can be tested exhaustively, and a handler
+    /// added later cannot quietly skip them.
+    // The error *is* the reply sent to the client, which is the convention every
+    // handler in this crate follows. Boxing it here to save stack would force an
+    // unbox at each of the six call sites for no benefit.
+    #[allow(clippy::result_large_err)]
+    pub fn permit(&self, user: &UserId, action: Action) -> Result<(), ServerMessage> {
+        let mode = self.wave.mode;
+        let is_creator = self.wave.creator == *user;
+
+        let allowed = match action {
+            Action::NewMessage => mode.allows_new_message(is_creator),
+            Action::Reply => mode.allows_replies(),
+            Action::Edit { is_author } => mode.allows_edit(is_author),
+            Action::Delete => mode.allows_delete(),
+            Action::Retitle => mode.allows_retitle(is_creator),
+            Action::PrivateReply => mode.allows_private_reply(),
+            // Changing the rules is the creator's alone, in every mode —
+            // including Frozen, or a wave could never be thawed.
+            Action::SetMode => is_creator,
+        };
+        if allowed {
+            return Ok(());
+        }
+
+        Err(ServerMessage::error(
+            ErrorCode::Forbidden,
+            match (mode, action) {
+                (_, Action::SetMode) => {
+                    "Only the person who started this wave can change its mode.".to_string()
+                }
+                (m, _) if m.is_frozen() => {
+                    "This wave is frozen. Unfreeze it to make changes.".to_string()
+                }
+                (WaveMode::Chat, Action::Edit { .. }) => {
+                    "In a chat you can only edit your own messages.".to_string()
+                }
+                (WaveMode::Announcement, Action::Edit { .. }) => {
+                    "Only the author can edit this.".to_string()
+                }
+                (WaveMode::Announcement, Action::NewMessage) => {
+                    "Only the person who started this wave can post here. You can reply."
+                        .to_string()
+                }
+                (WaveMode::Chat, Action::Reply) => {
+                    "This wave is a chat, so messages are not threaded.".to_string()
+                }
+                (WaveMode::Notepad, _) => {
+                    "This wave is a single shared page — edit it directly.".to_string()
+                }
+                _ => format!("That is not allowed in {} mode.", mode.label()),
+            },
+        ))
+    }
+
     /// The next ordering position for a new blip in this wavelet.
     ///
     /// Derived from resident state rather than a query, so it can be allocated
@@ -250,6 +309,7 @@ impl LiveWave {
             created_at: self.wave.created_at,
             wavelets,
             flags,
+            mode: self.wave.mode,
         }
     }
 
@@ -295,6 +355,21 @@ impl LiveWave {
         entries.sort_by(|a, b| a.user.display_name.cmp(&b.user.display_name));
         entries
     }
+}
+
+/// Something a participant is trying to do to a wave's content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    NewMessage,
+    Reply,
+    /// Editing a message, and whether the actor wrote it.
+    Edit {
+        is_author: bool,
+    },
+    Delete,
+    Retitle,
+    PrivateReply,
+    SetMode,
 }
 
 /// One client's edit, as submitted.
@@ -592,6 +667,30 @@ impl AppState {
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "op-id lookup failed; applying anyway"),
             }
+        }
+
+        // The mode check goes *after* the idempotency lookup, and the ordering is
+        // load-bearing. A reconnecting client replays work it never saw
+        // acknowledged; if the wave was frozen in the meantime and this ran
+        // first, an op the server had already committed would be refused. The
+        // client would never get its acknowledgement, its outstanding op would
+        // never clear, and every later keystroke would pile up locally and never
+        // be sent. Checking after the lookup only ever gates genuinely new work.
+        let is_author = live
+            .blips
+            .get(blip_id)
+            .is_some_and(|b| b.meta.author == *author);
+        if let Err(mut refusal) = live.permit(author, Action::Edit { is_author }) {
+            // Carry the blip id so the client knows which document to reset. A
+            // bare refusal leaves it holding an op it will retry forever.
+            if let ServerMessage::Error {
+                blip_id: ref mut target,
+                ..
+            } = refusal
+            {
+                *target = Some(blip_id.clone());
+            }
+            return Err(refusal);
         }
 
         let blip = live.blips.get_mut(blip_id).expect("checked above");

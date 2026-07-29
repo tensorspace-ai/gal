@@ -68,6 +68,9 @@ pub struct WaveView {
     /// others are filtered out server-side and never reach the client.
     pub wavelets: Vec<WaveletView>,
     pub flags: WaveFlags,
+    /// What participants may do here, and how the client should present it.
+    #[serde(default)]
+    pub mode: WaveMode,
 }
 
 /// One row in the inbox.
@@ -146,6 +149,10 @@ pub enum ClientMessage {
         /// Optional text for the first blip, so "reply and send" is one round trip.
         #[serde(default)]
         content: Option<Delta>,
+        /// Defaults to `Document`, which is how every wave behaved before modes
+        /// existed.
+        #[serde(default)]
+        mode: Option<WaveMode>,
     },
 
     /// Submit an edit to a blip, written against `revision`.
@@ -182,6 +189,13 @@ pub enum ClientMessage {
     SetTitle {
         wavelet_id: WaveletId,
         title: String,
+    },
+
+    /// Change how a wave behaves. Only its creator may do this.
+    #[serde(rename_all = "camelCase")]
+    SetMode {
+        wave_id: WaveId,
+        mode: WaveMode,
     },
 
     /// Add someone by username.
@@ -296,6 +310,14 @@ pub enum ServerMessage {
     BlipRemoved {
         wave_id: WaveId,
         blip_id: BlipId,
+    },
+
+    /// The wave's mode changed. Recipients must re-render, and drop any local
+    /// edits the new mode no longer permits.
+    #[serde(rename_all = "camelCase")]
+    ModeChanged {
+        wave_id: WaveId,
+        mode: WaveMode,
     },
 
     #[serde(rename_all = "camelCase")]
@@ -448,6 +470,7 @@ mod tests {
                 title: "Launch plan".into(),
                 participants: vec!["bob".into()],
                 content: Some(Delta::document("hello")),
+                mode: Some(WaveMode::Chat),
             },
             ClientMessage::CreateBlip {
                 wavelet_id: WaveletId::from("s-1"),
@@ -460,6 +483,10 @@ mod tests {
             ClientMessage::SetTitle {
                 wavelet_id: WaveletId::from("s-1"),
                 title: "T".into(),
+            },
+            ClientMessage::SetMode {
+                wave_id: WaveId::from("w-1"),
+                mode: WaveMode::Chat,
             },
             ClientMessage::AddParticipant {
                 wavelet_id: WaveletId::from("s-1"),
@@ -602,6 +629,7 @@ mod tests {
                 title: "T".into(),
                 participants: vec!["bob".into()],
                 content: Some(Delta::document("hi")),
+                mode: None,
             },
             ClientMessage::Submit {
                 blip_id: BlipId::from("b-1"),
@@ -620,6 +648,10 @@ mod tests {
             ClientMessage::SetTitle {
                 wavelet_id: WaveletId::from("s-1"),
                 title: "T".into(),
+            },
+            ClientMessage::SetMode {
+                wave_id: WaveId::from("w-1"),
+                mode: WaveMode::Chat,
             },
             ClientMessage::AddParticipant {
                 wavelet_id: WaveletId::from("s-1"),
@@ -710,6 +742,7 @@ mod tests {
                     created_at: 0,
                     wavelets: vec![wavelet.clone()],
                     flags: WaveFlags::default(),
+                    mode: WaveMode::Chat,
                 },
             },
             ServerMessage::Op {
@@ -738,6 +771,10 @@ mod tests {
                 wave_id: WaveId::from("w-1"),
                 wavelet_id: WaveletId::from("s-1"),
                 title: "T".into(),
+            },
+            ServerMessage::ModeChanged {
+                wave_id: WaveId::from("w-1"),
+                mode: WaveMode::Frozen,
             },
             ServerMessage::ParticipantAdded {
                 wave_id: WaveId::from("w-1"),

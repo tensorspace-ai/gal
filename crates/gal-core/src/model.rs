@@ -146,6 +146,145 @@ pub fn color_for(name: &str) -> u16 {
 
 // --- waves --------------------------------------------------------------
 
+/// How a wave behaves: what participants may do, and how a client presents it.
+///
+/// Deliberately a property of the *wave* rather than of each wavelet. If each
+/// wavelet carried its own, a private reply started before a wave was frozen
+/// would keep its old permissions and stay editable — so "frozen" would not
+/// mean frozen. One value for the whole wave makes the guarantee real and
+/// removes any question of what a new private reply inherits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WaveMode {
+    /// Everyone edits everything, replies nest. The original Wave behaviour.
+    #[default]
+    Document,
+    /// A channel. Anyone posts, nobody edits anyone else's message, no threading.
+    Chat,
+    /// Only the creator posts at the top level; anyone may reply.
+    Announcement,
+    /// One shared page: everyone edits what is there, nothing new is added.
+    Notepad,
+    /// Read-only. Reversible.
+    Frozen,
+}
+
+impl WaveMode {
+    /// Every mode, for iteration in tests and for the client's picker.
+    pub const ALL: [WaveMode; 5] = [
+        WaveMode::Document,
+        WaveMode::Chat,
+        WaveMode::Announcement,
+        WaveMode::Notepad,
+        WaveMode::Frozen,
+    ];
+
+    /// The value stored in the database and sent on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WaveMode::Document => "document",
+            WaveMode::Chat => "chat",
+            WaveMode::Announcement => "announcement",
+            WaveMode::Notepad => "notepad",
+            WaveMode::Frozen => "frozen",
+        }
+    }
+
+    /// Parse a stored value.
+    ///
+    /// Returns `None` rather than falling back to a default: an unreadable mode
+    /// must not silently become the most permissive one, which would quietly
+    /// unfreeze a frozen wave.
+    pub fn parse(value: &str) -> Option<Self> {
+        WaveMode::ALL.into_iter().find(|m| m.as_str() == value)
+    }
+
+    /// A short human label for the picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            WaveMode::Document => "Document",
+            WaveMode::Chat => "Chat",
+            WaveMode::Announcement => "Announcement",
+            WaveMode::Notepad => "Notepad",
+            WaveMode::Frozen => "Frozen",
+        }
+    }
+
+    /// Nothing at all may change.
+    pub fn is_frozen(self) -> bool {
+        self == WaveMode::Frozen
+    }
+
+    /// May a new top-level message be posted, and by whom?
+    pub fn allows_new_message(self, is_creator: bool) -> bool {
+        match self {
+            WaveMode::Document | WaveMode::Chat => true,
+            WaveMode::Announcement => is_creator,
+            WaveMode::Notepad | WaveMode::Frozen => false,
+        }
+    }
+
+    /// May a message be replied to?
+    pub fn allows_replies(self) -> bool {
+        matches!(self, WaveMode::Document | WaveMode::Announcement)
+    }
+
+    /// May `editor` edit a message written by `author`?
+    ///
+    /// Note that even the author-owned modes let an author edit their own
+    /// message. Anything stricter would be unwritable: a message is created
+    /// empty and its text arrives as edits, so locking a message on creation
+    /// would mean it could never be written in the first place.
+    pub fn allows_edit(self, is_author: bool) -> bool {
+        match self {
+            WaveMode::Document | WaveMode::Notepad => true,
+            WaveMode::Chat | WaveMode::Announcement => is_author,
+            WaveMode::Frozen => false,
+        }
+    }
+
+    /// May a message be deleted? Authorship is checked separately.
+    pub fn allows_delete(self) -> bool {
+        matches!(
+            self,
+            WaveMode::Document | WaveMode::Chat | WaveMode::Announcement
+        )
+    }
+
+    /// May the title be changed, and by whom?
+    pub fn allows_retitle(self, is_creator: bool) -> bool {
+        match self {
+            WaveMode::Document | WaveMode::Chat | WaveMode::Notepad => true,
+            WaveMode::Announcement => is_creator,
+            WaveMode::Frozen => false,
+        }
+    }
+
+    /// May a private side conversation be started?
+    pub fn allows_private_reply(self) -> bool {
+        matches!(
+            self,
+            WaveMode::Document | WaveMode::Chat | WaveMode::Announcement
+        )
+    }
+
+    /// Does the client render messages as a flat list rather than a tree?
+    pub fn is_flat(self) -> bool {
+        matches!(self, WaveMode::Chat | WaveMode::Notepad)
+    }
+
+    /// One line explaining the mode, shown in the picker.
+    pub fn description(self) -> &'static str {
+        match self {
+            WaveMode::Document => "Everyone can edit every message. Replies nest.",
+            WaveMode::Chat => "A channel. Only you can edit your own messages.",
+            WaveMode::Announcement => "Only you can post; anyone can reply.",
+            WaveMode::Notepad => "One shared page that everyone edits.",
+            WaveMode::Frozen => "Read-only. Nothing can change until you unfreeze it.",
+        }
+    }
+}
+
 /// A conversation. Holds no content itself; it groups wavelets.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +292,9 @@ pub struct Wave {
     pub id: WaveId,
     pub creator: UserId,
     pub created_at: Timestamp,
+    /// Applies to the whole wave, private replies included.
+    #[serde(default)]
+    pub mode: WaveMode,
 }
 
 /// Why a wavelet exists.
@@ -281,6 +423,110 @@ pub struct WaveFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_mode_round_trips_through_its_stored_value() {
+        for mode in WaveMode::ALL {
+            assert_eq!(WaveMode::parse(mode.as_str()), Some(mode));
+            assert!(!mode.label().is_empty());
+            assert!(!mode.description().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_unreadable_mode_is_rejected_rather_than_defaulted() {
+        // Falling back to a default would silently unfreeze a frozen wave.
+        assert_eq!(WaveMode::parse("Document"), None, "parsing is exact");
+        assert_eq!(WaveMode::parse("nonsense"), None);
+        assert_eq!(WaveMode::parse(""), None);
+    }
+
+    #[test]
+    fn document_mode_is_the_default_and_permits_everything() {
+        let m = WaveMode::default();
+        assert_eq!(m, WaveMode::Document);
+        assert!(m.allows_new_message(false) && m.allows_replies());
+        assert!(m.allows_edit(false) && m.allows_edit(true));
+        assert!(m.allows_delete() && m.allows_retitle(false) && m.allows_private_reply());
+        assert!(!m.is_frozen() && !m.is_flat());
+    }
+
+    #[test]
+    fn chat_lets_you_edit_only_your_own_messages() {
+        let m = WaveMode::Chat;
+        assert!(m.allows_edit(true), "your own message");
+        assert!(!m.allows_edit(false), "someone else's message");
+        assert!(m.allows_new_message(false), "anyone may post");
+        assert!(!m.allows_replies(), "chat is flat");
+        assert!(m.is_flat());
+    }
+
+    #[test]
+    fn announcement_restricts_posting_to_the_creator_but_stays_writable() {
+        let m = WaveMode::Announcement;
+        assert!(m.allows_new_message(true));
+        assert!(!m.allows_new_message(false));
+        assert!(m.allows_replies(), "anyone may reply");
+        // A message is created empty and filled by editing, so the author must
+        // be able to edit it or the announcement could never be written.
+        assert!(m.allows_edit(true));
+        assert!(!m.allows_edit(false));
+        assert!(m.allows_retitle(true) && !m.allows_retitle(false));
+    }
+
+    #[test]
+    fn notepad_is_a_single_editable_page() {
+        let m = WaveMode::Notepad;
+        assert!(m.allows_edit(false), "everyone edits the page");
+        assert!(
+            !m.allows_new_message(true),
+            "not even the creator adds messages"
+        );
+        assert!(!m.allows_replies());
+        // Deleting is off, which is what keeps the page from being emptied and
+        // leaving a wave nobody can add to.
+        assert!(!m.allows_delete());
+        assert!(!m.allows_private_reply());
+        assert!(m.is_flat());
+    }
+
+    #[test]
+    fn frozen_permits_nothing() {
+        let m = WaveMode::Frozen;
+        assert!(m.is_frozen());
+        for is_privileged in [true, false] {
+            assert!(!m.allows_new_message(is_privileged));
+            assert!(!m.allows_edit(is_privileged));
+            assert!(!m.allows_retitle(is_privileged));
+        }
+        assert!(!m.allows_replies() && !m.allows_delete() && !m.allows_private_reply());
+    }
+
+    #[test]
+    fn only_document_and_announcement_thread() {
+        // Replies and flat rendering are opposites; nothing should claim both.
+        for mode in WaveMode::ALL {
+            assert!(
+                !(mode.allows_replies() && mode.is_flat()),
+                "{mode:?} both threads and renders flat"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frozen_wave_permits_nothing_any_other_mode_permits() {
+        // Frozen must be the strict floor: any action allowed in Frozen would be
+        // a hole, since Frozen is what people reach for to stop all change.
+        let frozen = WaveMode::Frozen;
+        for other in WaveMode::ALL.into_iter().filter(|m| !m.is_frozen()) {
+            for privileged in [true, false] {
+                assert!(
+                    !frozen.allows_new_message(privileged) || other.allows_new_message(privileged)
+                );
+                assert!(!frozen.allows_edit(privileged) || other.allows_edit(privileged));
+            }
+        }
+    }
 
     #[test]
     fn identifiers_are_unique_and_prefixed() {

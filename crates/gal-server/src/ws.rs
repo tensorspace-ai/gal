@@ -18,7 +18,7 @@ use std::sync::Arc as StdArc;
 use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::auth::Identity;
-use crate::state::{blip_view, AppState, ConnId, LiveWave, OpSubmission, Subscriber};
+use crate::state::{blip_view, Action, AppState, ConnId, LiveWave, OpSubmission, Subscriber};
 
 /// Outbound queue depth per connection.
 const OUTBOUND_CAPACITY: usize = 512;
@@ -175,7 +175,8 @@ async fn dispatch(
             title,
             participants,
             content,
-        } => create_wave(state, session, title, participants, content).await,
+            mode,
+        } => create_wave(state, session, title, participants, content, mode).await,
 
         ClientMessage::Submit {
             blip_id,
@@ -211,6 +212,8 @@ async fn dispatch(
         ClientMessage::SetTitle { wavelet_id, title } => {
             set_title(state, session, wavelet_id, title).await
         }
+
+        ClientMessage::SetMode { wave_id, mode } => set_mode(state, session, wave_id, mode).await,
 
         ClientMessage::AddParticipant { wavelet_id, name } => {
             add_participant(state, session, wavelet_id, name).await
@@ -360,6 +363,7 @@ async fn create_wave(
     title: String,
     participants: Vec<String>,
     content: Option<Delta>,
+    mode: Option<WaveMode>,
 ) -> Result<(), ServerMessage> {
     let (mut ids, missing) = state
         .db
@@ -379,7 +383,12 @@ async fn create_wave(
     let title = normalise_title(&title);
     let (wave, wavelet) = state
         .db
-        .create_wave(session.user.id.clone(), title, ids)
+        .create_wave(
+            session.user.id.clone(),
+            title,
+            ids,
+            mode.unwrap_or_default(),
+        )
         .await
         .map_err(internal)?;
 
@@ -435,6 +444,14 @@ async fn create_blip(
     if !live.may_access(&session.user.id, &wavelet_id) {
         return Err(not_found());
     }
+    live.permit(
+        &session.user.id,
+        if parent.is_some() {
+            Action::Reply
+        } else {
+            Action::NewMessage
+        },
+    )?;
     // A reply must attach to a blip in the same wavelet.
     if let Some(parent_id) = &parent {
         let ok = live
@@ -525,6 +542,7 @@ async fn delete_blip(
             "Only the author can delete a message.",
         ));
     }
+    live.permit(&session.user.id, Action::Delete)?;
     // Keep the thread intact: a blip with replies would orphan them.
     if live
         .blips
@@ -566,6 +584,7 @@ async fn set_title(
     if !live.may_access(&session.user.id, &wavelet_id) {
         return Err(not_found());
     }
+    live.permit(&session.user.id, Action::Retitle)?;
     if let Some(wavelet) = live.wavelet_mut(&wavelet_id) {
         wavelet.title = title.clone();
     }
@@ -585,6 +604,55 @@ async fn set_title(
         .set_title(&wavelet_id, title)
         .await
         .map_err(internal)?;
+    state.schedule_inbox_update(&wave_id);
+    Ok(())
+}
+
+/// Change how a wave behaves.
+///
+/// Applies to the whole wave rather than a single wavelet, so a private reply
+/// cannot keep the old rules after the wave is frozen.
+async fn set_mode(
+    state: &Arc<AppState>,
+    session: &mut Session,
+    wave_id: WaveId,
+    mode: WaveMode,
+) -> Result<(), ServerMessage> {
+    if !session.subscribed.contains(&wave_id) {
+        return Err(not_found());
+    }
+    let wave = state
+        .open_wave(&wave_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(not_found)?;
+
+    let mut live = wave.lock().await;
+    if !live.may_view(&session.user.id) {
+        return Err(not_found());
+    }
+    live.permit(&session.user.id, Action::SetMode)?;
+    if live.wave.mode == mode {
+        return Ok(());
+    }
+    live.wave.mode = mode;
+
+    // Reaches every participant of the wave, not just one wavelet: the mode
+    // governs private replies too.
+    let wavelet_ids: Vec<WaveletId> = live.wavelets.iter().map(|w| w.id.clone()).collect();
+    for wavelet_id in wavelet_ids {
+        live.broadcast(
+            &wavelet_id,
+            None,
+            ServerMessage::ModeChanged {
+                wave_id: wave_id.clone(),
+                mode,
+            },
+        );
+    }
+    drop(live);
+
+    state.db.set_mode(&wave_id, mode).await.map_err(internal)?;
     state.schedule_inbox_update(&wave_id);
     Ok(())
 }
@@ -762,6 +830,7 @@ async fn private_reply(
     if !live.may_access(&session.user.id, &wavelet_id) {
         return Err(not_found());
     }
+    live.permit(&session.user.id, Action::PrivateReply)?;
     if !live.blips.contains_key(&anchor) {
         return Err(not_found());
     }

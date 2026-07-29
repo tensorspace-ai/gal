@@ -343,11 +343,22 @@ async fn create_wave(
     title: &str,
     participants: Vec<String>,
 ) -> (WaveId, WaveletId, BlipId) {
+    create_wave_in(client, title, participants, None).await
+}
+
+/// Create a wave in a specific mode.
+async fn create_wave_in(
+    client: &mut TestClient,
+    title: &str,
+    participants: Vec<String>,
+    mode: Option<WaveMode>,
+) -> (WaveId, WaveletId, BlipId) {
     client
         .send(ClientMessage::CreateWave {
             title: title.into(),
             participants,
             content: None,
+            mode,
         })
         .await;
 
@@ -796,6 +807,516 @@ async fn the_greeting_carries_an_inbox_with_unread_counts() {
     assert_eq!(row.snippet, "first");
     assert_eq!(row.unread_count, 1, "bob has not read it yet");
     assert_eq!(row.blip_count, 1);
+}
+
+/// Switch a wave's mode and wait for the change to land.
+async fn set_mode(client: &mut TestClient, wave_id: &WaveId, mode: WaveMode) {
+    client
+        .send(ClientMessage::SetMode {
+            wave_id: wave_id.clone(),
+            mode,
+        })
+        .await;
+    client
+        .recv_until(|m| matches!(m, ServerMessage::ModeChanged { .. }).then_some(()))
+        .await;
+}
+
+/// The code an attempted action came back with, or None if it was allowed.
+async fn refusal(client: &mut TestClient, message: ClientMessage) -> Option<ErrorCode> {
+    client.send(message).await;
+    client
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(Some(*code)),
+            // Any of these means the action went through.
+            ServerMessage::BlipAdded { .. }
+            | ServerMessage::Ack { .. }
+            | ServerMessage::TitleChanged { .. }
+            | ServerMessage::BlipRemoved { .. }
+            | ServerMessage::WaveletAdded { .. } => Some(None),
+            _ => None,
+        })
+        .await
+}
+
+#[tokio::test]
+async fn chat_mode_refuses_edits_to_someone_elses_message() {
+    // Sent straight over the socket, bypassing the UI entirely: the mode must be
+    // a server rule, not a hidden button.
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, wavelet_id, blip_id) =
+        create_wave(&mut alice, "Channel", vec!["bob".into()]).await;
+    alice
+        .edit(&blip_id, Delta::new().insert("alice wrote this"))
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    bob.open(&wave_id).await;
+
+    // In Document mode Bob may edit Alice's message — that is the default.
+    bob.edit(&blip_id, Delta::new().retain(5).insert("EDIT"))
+        .await;
+    bob.recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+
+    set_mode(&mut alice, &wave_id, WaveMode::Chat).await;
+    bob.drain().await;
+
+    let revision = bob.docs[&blip_id].revision;
+    let code = refusal(
+        &mut bob,
+        ClientMessage::Submit {
+            blip_id: blip_id.clone(),
+            revision,
+            delta: Delta::new().insert("bob again"),
+            op_id: Some("bob-op".into()),
+        },
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(ErrorCode::Forbidden),
+        "chat must protect others' messages"
+    );
+
+    // But Bob may still write his own message.
+    bob.send(ClientMessage::CreateBlip {
+        wavelet_id,
+        parent: None,
+        content: Some(Delta::document("bob's own")),
+    })
+    .await;
+    let own = bob
+        .recv_until(|m| match m {
+            ServerMessage::BlipAdded { blip, .. } => Some(blip.id.clone()),
+            _ => None,
+        })
+        .await;
+    bob.edit(&own, Delta::new().retain(9).insert("!")).await;
+    bob.recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+}
+
+#[tokio::test]
+async fn chat_mode_refuses_threaded_replies() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, wavelet_id, blip_id) = create_wave(&mut alice, "Channel", vec![]).await;
+    set_mode(&mut alice, &wave_id, WaveMode::Chat).await;
+
+    let code = refusal(
+        &mut alice,
+        ClientMessage::CreateBlip {
+            wavelet_id: wavelet_id.clone(),
+            parent: Some(blip_id),
+            content: None,
+        },
+    )
+    .await;
+    assert_eq!(code, Some(ErrorCode::Forbidden), "chat is flat");
+
+    // A top-level message is still fine.
+    let code = refusal(
+        &mut alice,
+        ClientMessage::CreateBlip {
+            wavelet_id,
+            parent: None,
+            content: Some(Delta::document("hello")),
+        },
+    )
+    .await;
+    assert_eq!(code, None);
+}
+
+#[tokio::test]
+async fn frozen_mode_refuses_every_content_change() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, wavelet_id, blip_id) =
+        create_wave(&mut alice, "Decided", vec!["bob".into()]).await;
+    alice.edit(&blip_id, Delta::new().insert("final")).await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    bob.open(&wave_id).await;
+    set_mode(&mut alice, &wave_id, WaveMode::Frozen).await;
+    bob.drain().await;
+    let frozen_revision = bob.docs[&blip_id].revision;
+
+    // Every mutation, from a participant who is not the creator and from the
+    // creator alike.
+    for (label, message) in [
+        (
+            "edit",
+            ClientMessage::Submit {
+                blip_id: blip_id.clone(),
+                revision: frozen_revision,
+                delta: Delta::new().insert("x"),
+                op_id: Some("frozen-op".into()),
+            },
+        ),
+        (
+            "new message",
+            ClientMessage::CreateBlip {
+                wavelet_id: wavelet_id.clone(),
+                parent: None,
+                content: None,
+            },
+        ),
+        (
+            "retitle",
+            ClientMessage::SetTitle {
+                wavelet_id: wavelet_id.clone(),
+                title: "changed".into(),
+            },
+        ),
+        (
+            "private reply",
+            ClientMessage::PrivateReply {
+                wavelet_id: wavelet_id.clone(),
+                anchor: blip_id.clone(),
+                participants: vec![],
+            },
+        ),
+    ] {
+        let code = refusal(&mut bob, message).await;
+        assert_eq!(
+            code,
+            Some(ErrorCode::Forbidden),
+            "frozen should refuse: {label}"
+        );
+    }
+
+    // Even the creator cannot edit a frozen wave — but can unfreeze it.
+    let code = refusal(
+        &mut alice,
+        ClientMessage::SetTitle {
+            wavelet_id,
+            title: "creator".into(),
+        },
+    )
+    .await;
+    assert_eq!(code, Some(ErrorCode::Forbidden));
+
+    set_mode(&mut alice, &wave_id, WaveMode::Document).await;
+    alice.drain().await;
+    alice
+        .edit(&blip_id, Delta::new().retain(5).insert(" again"))
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    assert!(
+        alice.text(&blip_id).contains("again"),
+        "unfreezing must restore editing"
+    );
+}
+
+#[tokio::test]
+async fn every_content_command_is_refused_by_a_frozen_wave() {
+    // A catch-all for the handler somebody adds in six months. Every command
+    // that can change content must be refused; anything that only reads, or is
+    // per-user, is listed explicitly so adding to that list is a deliberate act.
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, wavelet_id, blip_id) = create_wave(&mut alice, "Frozen", vec![]).await;
+    set_mode(&mut alice, &wave_id, WaveMode::Frozen).await;
+
+    let mutations = vec![
+        ClientMessage::Submit {
+            blip_id: blip_id.clone(),
+            revision: 0,
+            delta: Delta::new().insert("x"),
+            op_id: Some("guard".into()),
+        },
+        ClientMessage::CreateBlip {
+            wavelet_id: wavelet_id.clone(),
+            parent: None,
+            content: None,
+        },
+        ClientMessage::CreateBlip {
+            wavelet_id: wavelet_id.clone(),
+            parent: Some(blip_id.clone()),
+            content: None,
+        },
+        ClientMessage::DeleteBlip {
+            blip_id: blip_id.clone(),
+        },
+        ClientMessage::SetTitle {
+            wavelet_id: wavelet_id.clone(),
+            title: "no".into(),
+        },
+        ClientMessage::PrivateReply {
+            wavelet_id: wavelet_id.clone(),
+            anchor: blip_id.clone(),
+            participants: vec![],
+        },
+    ];
+    for message in mutations {
+        let label = format!("{message:?}");
+        let code = refusal(&mut alice, message).await;
+        assert_eq!(
+            code,
+            Some(ErrorCode::Forbidden),
+            "a frozen wave accepted a content change: {label}"
+        );
+    }
+
+    // Deliberately still allowed while frozen: reading, per-user state, and
+    // membership. Freezing stops content changing; it does not lock people out.
+    for message in [
+        ClientMessage::MarkRead {
+            wave_id: wave_id.clone(),
+        },
+        ClientMessage::RequestPlayback {
+            wave_id: wave_id.clone(),
+        },
+        ClientMessage::Search {
+            query: "anything".into(),
+        },
+    ] {
+        alice.send(message).await;
+        alice.drain().await;
+    }
+    // Still reachable and unchanged afterwards.
+    let mut fresh = server.connect(&cookie).await;
+    fresh.open(&wave_id).await;
+}
+
+#[tokio::test]
+async fn only_the_creator_can_change_the_mode() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, _, _) = create_wave(&mut alice, "Mine", vec!["bob".into()]).await;
+    bob.open(&wave_id).await;
+
+    bob.send(ClientMessage::SetMode {
+        wave_id: wave_id.clone(),
+        mode: WaveMode::Frozen,
+    })
+    .await;
+    let code = bob
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::ModeChanged { .. } => panic!("a non-creator changed the mode"),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::Forbidden);
+}
+
+#[tokio::test]
+async fn a_mode_change_is_never_destructive() {
+    // Switching to Chat hides threading; switching back must bring it back
+    // exactly, because nothing was rewritten.
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, wavelet_id, root) = create_wave(&mut alice, "Thread", vec![]).await;
+
+    for i in 0..3 {
+        alice
+            .send(ClientMessage::CreateBlip {
+                wavelet_id: wavelet_id.clone(),
+                parent: Some(root.clone()),
+                content: Some(Delta::document(format!("reply {i}"))),
+            })
+            .await;
+        alice
+            .recv_until(|m| matches!(m, ServerMessage::BlipAdded { .. }).then_some(()))
+            .await;
+    }
+
+    let snapshot = |client: &mut TestClient| async {
+        let mut fresh = server.connect(&cookie).await;
+        let _ = client;
+        fresh
+            .send(ClientMessage::Open {
+                wave_id: wave_id.clone(),
+            })
+            .await;
+        fresh
+            .recv_until(|m| match m {
+                ServerMessage::WaveState { wave } => Some(
+                    wave.wavelets
+                        .iter()
+                        .flat_map(|w| w.blips.iter())
+                        .map(|b| (b.id.clone(), b.parent.clone(), b.content.to_plain_text()))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .await
+    };
+
+    let before = snapshot(&mut alice).await;
+    set_mode(&mut alice, &wave_id, WaveMode::Chat).await;
+    let during = snapshot(&mut alice).await;
+    set_mode(&mut alice, &wave_id, WaveMode::Document).await;
+    let after = snapshot(&mut alice).await;
+
+    assert_eq!(
+        before, after,
+        "round-tripping the mode changed stored content"
+    );
+    assert_eq!(
+        before, during,
+        "chat mode should hide threading in the client, not discard it on the server"
+    );
+}
+
+#[tokio::test]
+async fn a_frozen_wave_stays_frozen_inside_a_private_reply() {
+    // The reason mode belongs to the wave and not to each wavelet: a private
+    // reply created before the freeze must not keep the old permissions.
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, wavelet_id, root) = create_wave(&mut alice, "Team", vec!["bob".into()]).await;
+    bob.open(&wave_id).await;
+
+    alice
+        .send(ClientMessage::PrivateReply {
+            wavelet_id,
+            anchor: root,
+            participants: vec!["bob".into()],
+        })
+        .await;
+    let private = bob
+        .recv_until(|m| match m {
+            ServerMessage::WaveletAdded { wavelet, .. } => Some(wavelet.clone()),
+            _ => None,
+        })
+        .await;
+    let secret = private.blips[0].id.clone();
+    bob.edit(&secret, Delta::new().insert("before")).await;
+    bob.recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+
+    set_mode(&mut alice, &wave_id, WaveMode::Frozen).await;
+    bob.drain().await;
+
+    let revision = bob.docs[&secret].revision;
+    let code = refusal(
+        &mut bob,
+        ClientMessage::Submit {
+            blip_id: secret.clone(),
+            revision,
+            delta: Delta::new().insert("after"),
+            op_id: Some("private-op".into()),
+        },
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(ErrorCode::Forbidden),
+        "a private reply must be frozen with the rest of the wave"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_op_is_still_acknowledged_after_the_wave_freezes() {
+    // Ordering matters: the mode check runs after the idempotency lookup. If it
+    // ran first, an op the server had already committed would be refused on
+    // replay, the client would never see its acknowledgement, and everything it
+    // typed afterwards would pile up locally and never be sent.
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, _, blip_id) = create_wave(&mut alice, "Race", vec![]).await;
+
+    let op_id = "replayed-op".to_string();
+    alice
+        .send(ClientMessage::Submit {
+            blip_id: blip_id.clone(),
+            revision: 0,
+            delta: Delta::new().insert("committed"),
+            op_id: Some(op_id.clone()),
+        })
+        .await;
+    let first = alice
+        .recv_until(|m| match m {
+            ServerMessage::Ack { revision, .. } => Some(*revision),
+            _ => None,
+        })
+        .await;
+
+    set_mode(&mut alice, &wave_id, WaveMode::Frozen).await;
+
+    // Replay exactly what a reconnecting client would.
+    alice
+        .send(ClientMessage::Submit {
+            blip_id: blip_id.clone(),
+            revision: 0,
+            delta: Delta::new().insert("committed"),
+            op_id: Some(op_id),
+        })
+        .await;
+    let second = alice
+        .recv_until(|m| match m {
+            ServerMessage::Ack { revision, .. } => Some(Some(*revision)),
+            ServerMessage::Error { .. } => Some(None),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        second,
+        Some(first),
+        "a replay of an already-committed op must still be acknowledged"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_edit_tells_the_client_which_message_to_reset() {
+    // A bare refusal leaves the client holding an op it retries forever.
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, _, blip_id) = create_wave(&mut alice, "Channel", vec!["bob".into()]).await;
+    bob.open(&wave_id).await;
+    set_mode(&mut alice, &wave_id, WaveMode::Chat).await;
+    bob.drain().await;
+
+    bob.send(ClientMessage::Submit {
+        blip_id: blip_id.clone(),
+        revision: 0,
+        delta: Delta::new().insert("nope"),
+        op_id: Some("bob-1".into()),
+    })
+    .await;
+    let carried = bob
+        .recv_until(|m| match m {
+            ServerMessage::Error { blip_id, .. } => Some(blip_id.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        carried,
+        Some(blip_id),
+        "the refusal must name the message so the client can drop its pending edit"
+    );
 }
 
 #[tokio::test]
