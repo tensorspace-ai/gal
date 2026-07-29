@@ -10,6 +10,11 @@ description = "Gal — a Google Wave-style real-time collaboration server"
 # installed with `cargo install gal-server`. It depends on both library crates,
 # so the release order is gal-ot, then gal-core, then this.
 publish = true
+# The end-to-end suite drives a real server over real sockets: it belongs to the
+# repository, not to what anyone installs. `mod e2e` is #[cfg(test)], so leaving
+# the file out still builds — at the cost that `cargo test` inside an unpacked
+# .crate cannot find the module. Run the suite from a checkout instead.
+exclude = ["src/e2e.rs"]
 
 [dependencies]
 serde = { workspace = true }
