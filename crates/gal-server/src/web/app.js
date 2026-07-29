@@ -481,7 +481,11 @@ function renderThread() {
     if (!byParent.has(key)) byParent.set(key, []);
     byParent.get(key).push(blip);
   }
-  for (const list of byParent.values()) list.sort((a, b) => a.seq - b.seq);
+  // Same total order the server uses. Sorting on seq alone leaves ties to
+  // arrival order, which differs between clients.
+  for (const list of byParent.values()) {
+    list.sort((a, b) => a.seq - b.seq || a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
+  }
 
   const privateReplies = new Map();
   for (const wavelet of state.wave.wavelets) {

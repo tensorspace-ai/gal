@@ -105,6 +105,21 @@ impl LiveWave {
         self.root().map(|w| w.title.clone()).unwrap_or_default()
     }
 
+    /// The next ordering position for a new blip in this wavelet.
+    ///
+    /// Derived from resident state rather than a query, so it can be allocated
+    /// while holding this wave's lock. Reading it from storage beforehand let
+    /// two concurrent creates receive the same position, and blips that tie
+    /// have no defined order.
+    pub fn next_seq(&self, wavelet_id: &WaveletId) -> i64 {
+        self.blips
+            .values()
+            .filter(|b| &b.meta.wavelet_id == wavelet_id)
+            .map(|b| b.meta.seq)
+            .max()
+            .map_or(0, |max| max + 1)
+    }
+
     /// Can `user` see this wavelet?
     pub fn may_access(&self, user: &UserId, wavelet_id: &WaveletId) -> bool {
         self.wavelet(wavelet_id)
@@ -197,7 +212,17 @@ impl LiveWave {
                     .values()
                     .filter(|b| b.meta.wavelet_id == w.id)
                     .collect();
-                blips.sort_by_key(|b| b.meta.seq);
+                // Total order. `seq` alone is not enough: it is only unique per
+                // wavelet by convention, and ties would otherwise resolve to
+                // HashMap iteration order — different for every client, and
+                // different again after a reload.
+                blips.sort_by(|a, b| {
+                    (a.meta.seq, a.meta.created_at, &a.meta.id).cmp(&(
+                        b.meta.seq,
+                        b.meta.created_at,
+                        &b.meta.id,
+                    ))
+                });
                 WaveletView {
                     id: w.id.clone(),
                     wave_id: w.wave_id.clone(),

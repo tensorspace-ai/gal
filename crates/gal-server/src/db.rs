@@ -532,20 +532,6 @@ impl Storage {
         .await
     }
 
-    /// Next ordering value for a new blip in a wavelet.
-    pub async fn next_seq(&self, wavelet_id: &WaveletId) -> Result<i64> {
-        let id = wavelet_id.clone();
-        self.run(move |conn| {
-            let max: Option<i64> = conn.query_row(
-                "SELECT MAX(seq) FROM blips WHERE wavelet_id = ?1",
-                params![id.as_str()],
-                |r| r.get(0),
-            )?;
-            Ok(max.unwrap_or(-1) + 1)
-        })
-        .await
-    }
-
     // --- inbox ----------------------------------------------------------
 
     /// Every wave the user participates in, as inbox rows.
@@ -1952,26 +1938,5 @@ mod tests {
         let alice_inbox = storage.inbox(&alice.id).await.unwrap();
         assert_eq!(alice_inbox.len(), 1);
         assert_eq!(alice_inbox[0].id, wave.id);
-    }
-
-    #[tokio::test]
-    async fn next_seq_increments_per_wavelet() {
-        let (storage, _dir) = temp_storage().await;
-        let alice = make_user(&storage, "alice").await;
-        let (wave, wavelet) = storage
-            .create_wave(alice.id.clone(), "T".into(), vec![alice.id.clone()])
-            .await
-            .unwrap();
-
-        assert_eq!(storage.next_seq(&wavelet.id).await.unwrap(), 0);
-        let blip = Blip::new(
-            wave.id.clone(),
-            wavelet.id.clone(),
-            alice.id.clone(),
-            None,
-            0,
-        );
-        storage.insert_blip(blip).await.unwrap();
-        assert_eq!(storage.next_seq(&wavelet.id).await.unwrap(), 1);
     }
 }

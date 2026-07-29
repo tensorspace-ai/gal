@@ -799,6 +799,87 @@ async fn the_greeting_carries_an_inbox_with_unread_counts() {
 }
 
 #[tokio::test]
+async fn concurrent_replies_get_distinct_positions_and_a_stable_order() {
+    // Ordering positions used to be read from storage before the wave lock was
+    // taken, so two creates racing in the same wavelet could be handed the same
+    // one. Ties then resolved to hash iteration order — a different order for
+    // every client, and a different one again after a reload.
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, wavelet_id, _) = create_wave(&mut alice, "Race", vec!["bob".into()]).await;
+    bob.open(&wave_id).await;
+
+    // Fire creates from both connections without waiting for each other.
+    for i in 0..8 {
+        alice
+            .send(ClientMessage::CreateBlip {
+                wavelet_id: wavelet_id.clone(),
+                parent: None,
+                content: Some(Delta::document(format!("a{i}"))),
+            })
+            .await;
+        bob.send(ClientMessage::CreateBlip {
+            wavelet_id: wavelet_id.clone(),
+            parent: None,
+            content: Some(Delta::document(format!("b{i}"))),
+        })
+        .await;
+    }
+    for _ in 0..4 {
+        alice.drain().await;
+        bob.drain().await;
+    }
+
+    // Read the wave back from two independent connections and compare order.
+    async fn order_seen_by(
+        server: &TestServer,
+        cookie: &str,
+        wave_id: &WaveId,
+    ) -> Vec<(i64, String)> {
+        let mut client = server.connect(cookie).await;
+        client
+            .send(ClientMessage::Open {
+                wave_id: wave_id.clone(),
+            })
+            .await;
+        client
+            .recv_until(|m| match m {
+                ServerMessage::WaveState { wave } => Some(
+                    wave.wavelets
+                        .iter()
+                        .flat_map(|w| w.blips.iter())
+                        .map(|b| (b.seq, b.content.to_plain_text()))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .await
+    }
+    let first = order_seen_by(&server, &alice_cookie, &wave_id).await;
+    let second = order_seen_by(&server, &bob_cookie, &wave_id).await;
+
+    assert_eq!(first, second, "two clients disagreed about message order");
+
+    let seqs: Vec<i64> = first.iter().map(|(s, _)| *s).collect();
+    let mut unique = seqs.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        seqs.len(),
+        unique.len(),
+        "two blips share an ordering position: {seqs:?}"
+    );
+    assert!(
+        seqs.windows(2).all(|w| w[0] <= w[1]),
+        "not sorted: {seqs:?}"
+    );
+}
+
+#[tokio::test]
 async fn changing_a_password_revokes_other_sessions() {
     let server = start_server().await;
     let first = server.register("alice").await;

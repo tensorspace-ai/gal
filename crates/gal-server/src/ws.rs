@@ -425,9 +425,13 @@ async fn create_blip(
     content: Option<Delta>,
 ) -> Result<(), ServerMessage> {
     let (wave_id, wave) = find_wavelet(state, session, &wavelet_id).await?;
-    let seq = state.db.next_seq(&wavelet_id).await.map_err(internal)?;
 
-    let live = wave.lock().await;
+    // The lock is held for the whole operation, including the writes. Releasing
+    // it between the checks and the insert left two holes: two concurrent
+    // creates could be handed the same ordering position, and a rule change
+    // could land in the gap and be applied to a blip that had already passed its
+    // checks.
+    let mut live = wave.lock().await;
     if !live.may_access(&session.user.id, &wavelet_id) {
         return Err(not_found());
     }
@@ -450,17 +454,16 @@ async fn create_blip(
         wavelet_id.clone(),
         session.user.id.clone(),
         parent,
-        seq,
+        live.next_seq(&wavelet_id),
     );
     if let Some(content) = seed_content(content).map_err(|e| *e)? {
         blip.content = content;
         blip.revision = 1;
     }
-    drop(live);
 
     state.db.insert_blip(blip.clone()).await.map_err(internal)?;
     if blip.revision > 0 {
-        state
+        if let Err(e) = state
             .db
             .commit_op(
                 blip.clone(),
@@ -471,10 +474,15 @@ async fn create_blip(
                 None,
             )
             .await
-            .map_err(internal)?;
+        {
+            // The row exists but its seed op does not, which would make playback
+            // reconstruct the wrong document. Remove it rather than leave the
+            // two disagreeing.
+            let _ = state.db.delete_blip(&blip.id).await;
+            return Err(internal(e));
+        }
     }
 
-    let mut live = wave.lock().await;
     live.blips
         .insert(blip.id.clone(), crate::state::LiveBlip::new(blip.clone()));
     if let Some(wavelet) = live.wavelet_mut(&wavelet_id) {
@@ -796,7 +804,10 @@ async fn private_reply(
         .await
         .map_err(internal)?;
 
-    let seq = state.db.next_seq(&wavelet.id).await.map_err(internal)?;
+    let seq = {
+        let live = wave.lock().await;
+        live.next_seq(&wavelet.id)
+    };
     let blip = Blip::new(
         wave_id.clone(),
         wavelet.id.clone(),
