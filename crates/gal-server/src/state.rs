@@ -1,0 +1,715 @@
+//! Live server state: resident waves, connections, and op routing.
+//!
+//! # Concurrency
+//!
+//! Each open wave is an actor: an `Arc<Mutex<LiveWave>>` holding its documents
+//! and its subscribers. Every mutation of a wave — applying an op, adding a
+//! blip, changing participants — happens while holding that one lock, which
+//! gives a total order per wave. Different waves never contend, so throughput
+//! scales with the number of active conversations.
+//!
+//! An op is persisted *before* it is acknowledged, so a client is never told
+//! its edit landed when it might not survive a crash.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use anyhow::Result;
+use dashmap::DashMap;
+use gal_core::model::*;
+use gal_core::protocol::*;
+use gal_ot::{Delta, OtError, ServerDoc};
+use tokio::sync::{mpsc, Mutex, Notify};
+
+use crate::config::Config;
+use crate::db::Storage;
+use crate::limit::{client_key, RateLimiter};
+
+/// Identifies one WebSocket connection.
+pub type ConnId = u64;
+
+/// How long to coalesce inbox notifications for a wave.
+///
+/// Typing generates an op per keystroke, but the inbox only shows a snippet and
+/// an unread count. Recomputing that per keystroke for every non-viewing
+/// participant would dominate the server's work, so updates are batched.
+const INBOX_DEBOUNCE_MS: u64 = 600;
+
+/// A blip's document plus the OT history needed to rebase concurrent edits.
+pub struct LiveBlip {
+    pub meta: Blip,
+    pub doc: ServerDoc,
+}
+
+impl LiveBlip {
+    /// Wrap a stored blip, seeding its OT history from the persisted snapshot.
+    pub fn new(blip: Blip) -> Self {
+        let doc = ServerDoc::from_snapshot(blip.content.clone(), blip.revision)
+            .unwrap_or_else(|_| ServerDoc::new());
+        LiveBlip { meta: blip, doc }
+    }
+
+    /// Copy the authoritative document back onto the metadata that gets persisted.
+    fn sync(&mut self) {
+        self.meta.content = self.doc.content().clone();
+        self.meta.revision = self.doc.revision();
+    }
+}
+
+/// Someone currently watching a wave.
+pub struct Subscriber {
+    pub user_id: UserId,
+    pub tx: mpsc::Sender<ServerMessage>,
+    /// Fires when this connection must be torn down. A client whose outbound
+    /// queue overflowed has missed ops, so the only safe thing to do is close
+    /// the socket and let it reconnect and resynchronise.
+    pub kill: Arc<Notify>,
+    /// Blip the subscriber's caret is in, used for the presence display.
+    pub editing: Option<BlipId>,
+}
+
+/// A wave resident in memory, with its documents and watchers.
+pub struct LiveWave {
+    pub wave: Wave,
+    pub wavelets: Vec<Wavelet>,
+    pub blips: HashMap<BlipId, LiveBlip>,
+    pub subscribers: HashMap<ConnId, Subscriber>,
+    /// Public profiles of everyone who might appear in this wave, so rendering
+    /// a view never has to go back to the database.
+    pub user_cache: HashMap<UserId, PublicUser>,
+    /// Set while holding this lock, immediately before the wave is removed from
+    /// the residency map. A task that obtained the `Arc` before removal is
+    /// blocked on this very lock, so it observes the flag and reloads instead of
+    /// attaching itself to an orphaned copy.
+    pub evicted: bool,
+}
+
+impl LiveWave {
+    pub fn wavelet(&self, id: &WaveletId) -> Option<&Wavelet> {
+        self.wavelets.iter().find(|w| &w.id == id)
+    }
+
+    pub fn wavelet_mut(&mut self, id: &WaveletId) -> Option<&mut Wavelet> {
+        self.wavelets.iter_mut().find(|w| &w.id == id)
+    }
+
+    /// The wavelet every wave has.
+    pub fn root(&self) -> Option<&Wavelet> {
+        self.wavelets
+            .iter()
+            .find(|w| w.kind == WaveletKind::Conversation)
+    }
+
+    pub fn title(&self) -> String {
+        self.root().map(|w| w.title.clone()).unwrap_or_default()
+    }
+
+    /// Can `user` see this wavelet?
+    pub fn may_access(&self, user: &UserId, wavelet_id: &WaveletId) -> bool {
+        self.wavelet(wavelet_id)
+            .is_some_and(|w| w.has_participant(user))
+    }
+
+    /// Every wavelet `user` can see.
+    pub fn visible_wavelets(&self, user: &UserId) -> Vec<&Wavelet> {
+        self.wavelets
+            .iter()
+            .filter(|w| w.has_participant(user))
+            .collect()
+    }
+
+    /// Does `user` participate in this wave at all?
+    pub fn may_view(&self, user: &UserId) -> bool {
+        self.wavelets.iter().any(|w| w.has_participant(user))
+    }
+
+    /// Send to every subscriber who may see `wavelet_id`, optionally skipping one
+    /// connection (used so an author gets an ack instead of an echo).
+    ///
+    /// A subscriber whose queue is full has already missed messages, so it is
+    /// disconnected rather than merely unsubscribed. Silently dropping it would
+    /// leave a client that still believes it is watching the wave, still able to
+    /// submit, and never again acknowledged — its edits would accumulate locally
+    /// and never be sent.
+    pub fn broadcast(
+        &mut self,
+        wavelet_id: &WaveletId,
+        skip: Option<ConnId>,
+        message: ServerMessage,
+    ) {
+        let allowed: HashSet<UserId> = self
+            .wavelet(wavelet_id)
+            .map(|w| w.participants.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut failed = Vec::new();
+        for (conn_id, sub) in &self.subscribers {
+            if Some(*conn_id) == skip || !allowed.contains(&sub.user_id) {
+                continue;
+            }
+            if sub.tx.try_send(message.clone()).is_err() {
+                failed.push(*conn_id);
+            }
+        }
+        self.disconnect(&failed);
+    }
+
+    /// Drop these subscribers and tear their connections down.
+    pub fn disconnect(&mut self, conn_ids: &[ConnId]) {
+        for conn_id in conn_ids {
+            if let Some(sub) = self.subscribers.remove(conn_id) {
+                // Wakes the connection task, which closes the socket. The client
+                // reconnects and re-opens, which is a full resynchronisation.
+                sub.kill.notify_waiters();
+            }
+        }
+    }
+
+    /// Send to one subscriber, disconnecting it if its queue has overflowed.
+    ///
+    /// Used for messages that are meaningless to lose — an `Ack` the author is
+    /// waiting on, or the `WaveState` snapshot everything else is relative to.
+    pub fn send_to(&mut self, conn_id: ConnId, message: ServerMessage) {
+        let failed = match self.subscribers.get(&conn_id) {
+            Some(sub) => sub.tx.try_send(message).is_err(),
+            None => false,
+        };
+        if failed {
+            self.disconnect(&[conn_id]);
+        }
+    }
+
+    /// Build the view of this wave for one user, hiding wavelets they are not in.
+    pub fn view(
+        &self,
+        user: &UserId,
+        read_marks: &HashMap<BlipId, u64>,
+        flags: WaveFlags,
+    ) -> WaveView {
+        let users = &self.user_cache;
+        let wavelets = self
+            .visible_wavelets(user)
+            .into_iter()
+            .map(|w| {
+                let mut blips: Vec<&LiveBlip> = self
+                    .blips
+                    .values()
+                    .filter(|b| b.meta.wavelet_id == w.id)
+                    .collect();
+                blips.sort_by_key(|b| b.meta.seq);
+                WaveletView {
+                    id: w.id.clone(),
+                    wave_id: w.wave_id.clone(),
+                    kind: w.kind,
+                    title: w.title.clone(),
+                    participants: w
+                        .participants
+                        .iter()
+                        .filter_map(|id| users.get(id).cloned())
+                        .collect(),
+                    anchor_blip: w.anchor_blip.clone(),
+                    created_at: w.created_at,
+                    last_modified: w.last_modified,
+                    blips: blips
+                        .into_iter()
+                        .map(|b| blip_view(&b.meta, read_marks))
+                        .collect(),
+                }
+            })
+            .collect();
+
+        WaveView {
+            id: self.wave.id.clone(),
+            creator: self.wave.creator.clone(),
+            created_at: self.wave.created_at,
+            wavelets,
+            flags,
+        }
+    }
+
+    /// Presence entries as `viewer` is allowed to see them.
+    ///
+    /// Scoped deliberately: an unscoped list leaks the *existence* of private
+    /// replies, because `editing` would name a blip in a wavelet the viewer is
+    /// not part of. Content stayed private but "who is talking privately, and
+    /// when" did not, which contradicts the isolation this server promises.
+    pub fn presence_for(&self, viewer: &UserId) -> Vec<PresenceEntry> {
+        let visible: HashSet<&WaveletId> = self
+            .visible_wavelets(viewer)
+            .into_iter()
+            .map(|w| &w.id)
+            .collect();
+        // Everyone the viewer shares at least one wavelet with.
+        let co_participants: HashSet<&UserId> = self
+            .visible_wavelets(viewer)
+            .into_iter()
+            .flat_map(|w| w.participants.iter())
+            .collect();
+
+        let mut seen = HashSet::new();
+        let mut entries = Vec::new();
+        for sub in self.subscribers.values() {
+            if !co_participants.contains(&sub.user_id) || !seen.insert(sub.user_id.clone()) {
+                continue;
+            }
+            let Some(user) = self.user_cache.get(&sub.user_id) else {
+                continue;
+            };
+            // Only reveal what they are editing if the viewer can see that blip.
+            let editing = sub.editing.as_ref().filter(|blip_id| {
+                self.blips
+                    .get(*blip_id)
+                    .is_some_and(|b| visible.contains(&b.meta.wavelet_id))
+            });
+            entries.push(PresenceEntry {
+                user: user.clone(),
+                editing: editing.cloned(),
+            });
+        }
+        entries.sort_by(|a, b| a.user.display_name.cmp(&b.user.display_name));
+        entries
+    }
+}
+
+/// One client's edit, as submitted.
+pub struct OpSubmission {
+    pub blip_id: BlipId,
+    /// The revision the edit was written against.
+    pub revision: u64,
+    pub delta: Delta,
+    /// Unique per submitted op, so a replay after a reconnect is recognisable.
+    pub op_id: Option<String>,
+}
+
+/// Render a blip for the wire, resolving the viewer's unread state.
+pub fn blip_view(blip: &Blip, read_marks: &HashMap<BlipId, u64>) -> BlipView {
+    let unread = read_marks.get(&blip.id).copied().unwrap_or(0) < blip.revision;
+    BlipView {
+        id: blip.id.clone(),
+        wavelet_id: blip.wavelet_id.clone(),
+        parent: blip.parent.clone(),
+        seq: blip.seq,
+        author: blip.author.clone(),
+        contributors: blip.contributors.clone(),
+        created_at: blip.created_at,
+        last_modified: blip.last_modified,
+        content: blip.content.clone(),
+        revision: blip.revision,
+        unread,
+    }
+}
+
+/// A live connection's outbound handle.
+#[derive(Clone)]
+pub struct ConnHandle {
+    pub user_id: UserId,
+    pub tx: mpsc::Sender<ServerMessage>,
+}
+
+pub struct AppState {
+    pub db: Storage,
+    pub config: Config,
+    waves: DashMap<WaveId, Arc<Mutex<LiveWave>>>,
+    conns: DashMap<ConnId, ConnHandle>,
+    user_conns: DashMap<UserId, HashSet<ConnId>>,
+    /// Waves with a pending debounced inbox notification.
+    inbox_pending: DashMap<WaveId, ()>,
+    /// Serialises loading and eviction so a wave can never be resident twice.
+    /// Two copies would each accept ops and silently fork the document.
+    residency: Mutex<()>,
+    next_conn_id: AtomicU64,
+    /// Login and registration. Tight, because each attempt costs an Argon2 hash.
+    auth_limiter: RateLimiter,
+    /// Username lookup, which is an existence oracle by nature.
+    lookup_limiter: RateLimiter,
+}
+
+impl AppState {
+    pub fn new(db: Storage, config: Config) -> Arc<Self> {
+        Arc::new(AppState {
+            db,
+            config,
+            waves: DashMap::new(),
+            conns: DashMap::new(),
+            user_conns: DashMap::new(),
+            inbox_pending: DashMap::new(),
+            residency: Mutex::new(()),
+            next_conn_id: AtomicU64::new(1),
+            // A person signing in mistypes a few times; nobody legitimately
+            // makes ten attempts a second.
+            auth_limiter: RateLimiter::new(10.0, 0.5),
+            lookup_limiter: RateLimiter::new(30.0, 2.0),
+        })
+    }
+
+    // --- rate limiting --------------------------------------------------
+
+    /// `Some(response)` when the caller is over their allowance.
+    pub fn check_auth_rate(
+        &self,
+        headers: &axum::http::HeaderMap,
+        peer: Option<std::net::IpAddr>,
+    ) -> Option<axum::response::Response> {
+        self.check(
+            &self.auth_limiter,
+            headers,
+            peer,
+            "Too many attempts. Wait a moment and try again.",
+        )
+    }
+
+    pub fn check_lookup_rate(
+        &self,
+        headers: &axum::http::HeaderMap,
+        peer: Option<std::net::IpAddr>,
+    ) -> Option<axum::response::Response> {
+        self.check(
+            &self.lookup_limiter,
+            headers,
+            peer,
+            "Too many lookups. Slow down.",
+        )
+    }
+
+    fn check(
+        &self,
+        limiter: &RateLimiter,
+        headers: &axum::http::HeaderMap,
+        peer: Option<std::net::IpAddr>,
+        message: &str,
+    ) -> Option<axum::response::Response> {
+        use axum::response::IntoResponse;
+
+        let forwarded = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        // Only honour the forwarded header when the operator has said they are
+        // behind a proxy; otherwise any client could spoof it to evade limits.
+        let key = client_key(peer, forwarded, self.config.trust_forwarded_for);
+
+        if limiter.check(&key) {
+            return None;
+        }
+        Some(
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "10")],
+                axum::Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+        )
+    }
+
+    // --- connections ----------------------------------------------------
+
+    pub fn register_conn(&self, user_id: UserId, tx: mpsc::Sender<ServerMessage>) -> ConnId {
+        let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        self.conns.insert(
+            id,
+            ConnHandle {
+                user_id: user_id.clone(),
+                tx,
+            },
+        );
+        self.user_conns.entry(user_id).or_default().insert(id);
+        id
+    }
+
+    pub fn unregister_conn(&self, conn_id: ConnId) {
+        if let Some((_, handle)) = self.conns.remove(&conn_id) {
+            if let Some(mut set) = self.user_conns.get_mut(&handle.user_id) {
+                set.remove(&conn_id);
+            }
+            self.user_conns
+                .remove_if(&handle.user_id, |_, set| set.is_empty());
+        }
+    }
+
+    /// Deliver a message to every connection of a user.
+    pub fn send_to_user(&self, user_id: &UserId, message: &ServerMessage) {
+        let Some(conn_ids) = self.user_conns.get(user_id).map(|s| s.clone()) else {
+            return;
+        };
+        for conn_id in conn_ids {
+            if let Some(handle) = self.conns.get(&conn_id) {
+                let _ = handle.tx.try_send(message.clone());
+            }
+        }
+    }
+
+    // --- wave residency -------------------------------------------------
+
+    /// Get the resident copy of a wave, loading it from storage if needed.
+    ///
+    /// Guarded by the residency lock so concurrent openers share one instance.
+    pub async fn open_wave(&self, wave_id: &WaveId) -> Result<Option<Arc<Mutex<LiveWave>>>> {
+        if let Some(existing) = self.waves.get(wave_id) {
+            return Ok(Some(existing.clone()));
+        }
+        let _guard = self.residency.lock().await;
+        // Re-check: another task may have loaded it while we waited.
+        if let Some(existing) = self.waves.get(wave_id) {
+            return Ok(Some(existing.clone()));
+        }
+
+        let Some(wave) = self.db.wave(wave_id).await? else {
+            return Ok(None);
+        };
+        let wavelets = self.db.wavelets_of_wave(wave_id).await?;
+        let blips = self.db.blips_of_wave(wave_id).await?;
+        let all_users = self.db.all_users().await?;
+
+        let mut live = LiveWave {
+            wave,
+            wavelets,
+            blips: blips
+                .into_iter()
+                .map(|b| (b.id.clone(), LiveBlip::new(b)))
+                .collect(),
+            subscribers: HashMap::new(),
+            user_cache: HashMap::new(),
+            evicted: false,
+        };
+        live.user_cache = all_users.into_iter().map(|u| (u.id.clone(), u)).collect();
+
+        let arc = Arc::new(Mutex::new(live));
+        self.waves.insert(wave_id.clone(), arc.clone());
+        Ok(Some(arc))
+    }
+
+    /// Drop a wave from memory once nobody is watching it.
+    ///
+    /// The tombstone is what makes this safe. `open_wave` hands out the `Arc`
+    /// without taking the residency lock (it is on the hot path of every
+    /// submit), so a task can be holding the `Arc` and waiting on the wave lock
+    /// at the moment we decide to evict. Marking `evicted` while we still hold
+    /// that lock guarantees such a task sees the flag and reloads, instead of
+    /// attaching a subscriber to a copy that is about to be dropped.
+    pub async fn maybe_evict(&self, wave_id: &WaveId) {
+        let _guard = self.residency.lock().await;
+        // Clone the Arc out of the map first: holding a DashMap guard across an
+        // await is a deadlock waiting to happen.
+        let Some(entry) = self.waves.get(wave_id).map(|e| e.clone()) else {
+            return;
+        };
+        let mut live = entry.lock().await;
+        if live.subscribers.is_empty() {
+            live.evicted = true;
+            self.waves.remove(wave_id);
+        }
+    }
+
+    /// Refresh the cached profile of a user in every resident wave, so a newly
+    /// registered account renders correctly in waves already in memory.
+    pub async fn cache_user(&self, user: PublicUser) {
+        let waves: Vec<_> = self.waves.iter().map(|e| e.value().clone()).collect();
+        for wave in waves {
+            wave.lock()
+                .await
+                .user_cache
+                .insert(user.id.clone(), user.clone());
+        }
+    }
+
+    // --- op application -------------------------------------------------
+
+    /// Apply a client op to a blip and fan the result out.
+    ///
+    /// Returns the committed revision. The caller already holds the wave lock,
+    /// which is what serialises concurrent submissions.
+    pub async fn apply_op(
+        self: &Arc<Self>,
+        live: &mut LiveWave,
+        conn_id: ConnId,
+        author: &UserId,
+        submission: OpSubmission,
+    ) -> std::result::Result<(), ServerMessage> {
+        let OpSubmission {
+            blip_id,
+            revision: client_revision,
+            delta,
+            op_id,
+        } = submission;
+        let blip_id = &blip_id;
+        let Some(blip) = live.blips.get(blip_id) else {
+            return Err(ServerMessage::error(ErrorCode::NotFound, "No such blip."));
+        };
+        let wavelet_id = blip.meta.wavelet_id.clone();
+        if !live.may_access(author, &wavelet_id) {
+            // Same response as a missing blip: distinguishing them would reveal
+            // that a private reply exists.
+            return Err(ServerMessage::error(ErrorCode::NotFound, "No such blip."));
+        }
+
+        // A reconnecting client replays work it never saw acknowledged. Without
+        // this check the same edit is applied twice — and because SIGTERM closes
+        // every socket, that happens on an ordinary deploy, not just a crash.
+        if let Some(op_id) = op_id.as_deref() {
+            match self.db.revision_for_op(blip_id, op_id).await {
+                Ok(Some(revision)) => {
+                    let content = live
+                        .blips
+                        .get(blip_id)
+                        .map(|b| b.doc.content().clone())
+                        .unwrap_or_default();
+                    live.send_to(
+                        conn_id,
+                        ServerMessage::Ack {
+                            wave_id: live.wave.id.clone(),
+                            blip_id: blip_id.clone(),
+                            revision,
+                            delta: Delta::new(),
+                            op_id: Some(op_id.to_string()),
+                        },
+                    );
+                    let _ = content;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "op-id lookup failed; applying anyway"),
+            }
+        }
+
+        let blip = live.blips.get_mut(blip_id).expect("checked above");
+        let committed = match blip.doc.apply(client_revision, &delta, author.as_str()) {
+            Ok(rev) => rev,
+            Err(OtError::RevisionTooOld { .. }) | Err(OtError::RevisionInFuture { .. }) => {
+                return Err(ServerMessage::resync(
+                    blip_id.clone(),
+                    "Your edit was too far out of date; reloading this wave.",
+                ));
+            }
+            Err(e) => {
+                return Err(ServerMessage::resync(blip_id.clone(), e.to_string()));
+            }
+        };
+
+        blip.sync();
+        blip.meta.record_contributor(author);
+        let meta = blip.meta.clone();
+        let wave_id = meta.wave_id.clone();
+
+        // Durable before acknowledged. If the write fails the in-memory document
+        // must go back: leaving it ahead of storage would mean later ops
+        // transform over an op that exists nowhere else, and the next successful
+        // commit would skip a revision, leaving a permanent hole in the op log
+        // that corrupts playback from that point on.
+        if let Err(e) = self
+            .db
+            .commit_op(
+                meta.clone(),
+                committed.delta.clone(),
+                author.clone(),
+                meta.last_modified,
+                op_id.clone(),
+            )
+            .await
+        {
+            tracing::error!(error = %e, blip = %blip_id, "failed to persist op; rolling back");
+            if let Some(blip) = live.blips.get_mut(blip_id) {
+                blip.doc.rollback_last();
+                blip.sync();
+            }
+            return Err(ServerMessage::resync(
+                blip_id.clone(),
+                "The server could not save your edit; reloading this wave.",
+            ));
+        }
+
+        if let Some(wavelet) = live.wavelet_mut(&wavelet_id) {
+            wavelet.last_modified = meta.last_modified;
+        }
+
+        // The author gets an ack; everyone else gets the transformed op.
+        live.broadcast(
+            &wavelet_id,
+            Some(conn_id),
+            ServerMessage::Op {
+                wave_id: wave_id.clone(),
+                blip_id: blip_id.clone(),
+                revision: committed.revision,
+                author: author.clone(),
+                delta: committed.delta.clone(),
+            },
+        );
+        // An ack is never droppable: the author's client holds the op as
+        // outstanding until it arrives, and stops sending anything further for
+        // that blip. If the queue is full, disconnect so it resynchronises.
+        live.send_to(
+            conn_id,
+            ServerMessage::Ack {
+                wave_id: wave_id.clone(),
+                blip_id: blip_id.clone(),
+                revision: committed.revision,
+                delta: committed.delta,
+                op_id,
+            },
+        );
+
+        self.schedule_inbox_update(&wave_id);
+        Ok(())
+    }
+
+    // --- inbox notifications --------------------------------------------
+
+    /// Queue a debounced inbox refresh for everyone in a wave.
+    pub fn schedule_inbox_update(self: &Arc<Self>, wave_id: &WaveId) {
+        if self.inbox_pending.insert(wave_id.clone(), ()).is_some() {
+            return; // already queued
+        }
+        let state = self.clone();
+        let wave_id = wave_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(INBOX_DEBOUNCE_MS)).await;
+            state.inbox_pending.remove(&wave_id);
+            state.push_inbox_update(&wave_id).await;
+        });
+    }
+
+    /// Send a fresh inbox row for `wave_id` to every participant who is
+    /// connected. Viewers get it too: their inbox list is on screen beside the
+    /// wave they are reading.
+    async fn push_inbox_update(&self, wave_id: &WaveId) {
+        // Read the participant set from storage rather than via `open_wave`.
+        // Going through residency here would re-load a wave that nobody is
+        // watching, and nothing would ever evict it again — an unbounded leak,
+        // since each resident wave pins every blip's history plus a copy of the
+        // user directory.
+        let participants = match self.db.wave_participants(wave_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list participants for inbox update");
+                return;
+            }
+        };
+
+        for user_id in participants {
+            if !self.user_conns.contains_key(&user_id) {
+                continue;
+            }
+            match self.db.wave_summary(&user_id, wave_id).await {
+                Ok(Some(summary)) => {
+                    self.send_to_user(&user_id, &ServerMessage::InboxUpdated { summary });
+                }
+                Ok(None) => {
+                    self.send_to_user(
+                        &user_id,
+                        &ServerMessage::WaveRemoved {
+                            wave_id: wave_id.clone(),
+                        },
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to build inbox summary"),
+            }
+        }
+    }
+
+    /// Read marks for a user in a wave, as a lookup table.
+    pub async fn read_marks(&self, user_id: &UserId, wave_id: &WaveId) -> HashMap<BlipId, u64> {
+        self.db
+            .read_marks(user_id, wave_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "gal-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Wave domain model and wire protocol"
+
+[dependencies]
+gal-ot = { path = "../gal-ot", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

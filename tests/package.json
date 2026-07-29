@@ -1,0 +1,9 @@
+{
+  "name": "gal-browser-tests",
+  "private": true,
+  "type": "module",
+  "description": "Browser tests for Gal. Run: npm install --prefix tests && node tests/browser.mjs",
+  "devDependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}

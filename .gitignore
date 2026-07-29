@@ -1,0 +1,4 @@
+/target
+/gal.db*
+/tests/vectors.json
+node_modules

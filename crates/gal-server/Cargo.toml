@@ -1,0 +1,39 @@
+[package]
+name = "gal-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Gal — a Google Wave-style real-time collaboration server"
+# An application, not a library. The two library crates are publishable
+# (gal-ot first, then gal-core); this one is not.
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "trace", "set-header"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["rand_core"] }
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+dashmap = "6"
+futures = "0.3"
+gal-core = { path = "../gal-core", version = "0.1.0" }
+gal-ot = { path = "../gal-ot", version = "0.1.0" }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.29"
