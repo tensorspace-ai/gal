@@ -163,7 +163,9 @@ impl TestClient {
     async fn recv_until<T>(&mut self, mut f: impl FnMut(&ServerMessage) -> Option<T>) -> T {
         for _ in 0..80 {
             let message = self.recv().await;
-            self.absorb(&message);
+            if let Some(queued) = self.absorb(&message) {
+                self.send(queued).await;
+            }
             if let Some(value) = f(&message) {
                 return value;
             }
@@ -178,14 +180,19 @@ impl TestClient {
         {
             if let Message::Text(text) = message {
                 if let Ok(parsed) = serde_json::from_str::<ServerMessage>(&text) {
-                    self.absorb(&parsed);
+                    if let Some(queued) = self.absorb(&parsed) {
+                        self.send(queued).await;
+                    }
                 }
             }
         }
     }
 
     /// Apply protocol messages to the local mirror, exactly as the browser does.
-    fn absorb(&mut self, message: &ServerMessage) {
+    ///
+    /// Returns the op the caller must now send, if an acknowledgement released
+    /// work that had queued up behind it.
+    fn absorb(&mut self, message: &ServerMessage) -> Option<ClientMessage> {
         match message {
             ServerMessage::WaveState { wave } => {
                 for wavelet in &wave.wavelets {
@@ -232,9 +239,7 @@ impl TestClient {
                 delta,
                 ..
             } => {
-                let Some(state) = self.docs.get_mut(blip_id) else {
-                    return;
-                };
+                let state = self.docs.get_mut(blip_id)?;
                 state.revision = *revision;
                 match state.outstanding.clone() {
                     None => state.doc = compose(&state.doc, delta),
@@ -262,13 +267,32 @@ impl TestClient {
             ServerMessage::Ack {
                 blip_id, revision, ..
             } => {
-                if let Some(state) = self.docs.get_mut(blip_id) {
+                let released = self.docs.get_mut(blip_id).and_then(|state| {
                     state.revision = *revision;
                     state.outstanding = state.buffer.take();
+                    state
+                        .outstanding
+                        .clone()
+                        .map(|delta| (state.revision, delta))
+                });
+                // Whatever queued up behind the acknowledged op goes on the wire
+                // now, exactly as `web/client.js` does. Merely promoting it to
+                // `outstanding` leaves the work stranded: every later edit sees
+                // something in flight and queues behind an op that is never
+                // sent, so the client silently stops contributing.
+                if let Some((revision, delta)) = released {
+                    let op_id = self.next_op_id();
+                    return Some(ClientMessage::Submit {
+                        blip_id: blip_id.clone(),
+                        revision,
+                        delta,
+                        op_id: Some(op_id),
+                    });
                 }
             }
             _ => {}
         }
+        None
     }
 
     /// Make a local edit and send it if nothing is in flight.
@@ -311,6 +335,13 @@ impl TestClient {
         self.presence
             .iter()
             .any(|entry| entry.editing.as_ref() == Some(blip_id))
+    }
+
+    /// Is an op still in flight, or queued behind one, for this blip?
+    fn in_flight(&self, blip_id: &BlipId) -> bool {
+        self.docs
+            .get(blip_id)
+            .is_some_and(|d| d.outstanding.is_some() || d.buffer.is_some())
     }
 
     fn text(&self, blip_id: &BlipId) -> String {
@@ -478,9 +509,19 @@ async fn rapid_interleaved_typing_converges() {
         alice.drain().await;
         bob.drain().await;
     }
-    for _ in 0..6 {
+    // Settle: a queued op only goes out once its predecessor is acknowledged,
+    // so this takes as many rounds as there are queued ops. Wait for that to
+    // finish rather than for a fixed number of rounds, which on a loaded runner
+    // stopped early and read as a divergence.
+    for _ in 0..40 {
         alice.drain().await;
         bob.drain().await;
+        if !alice.in_flight(&blip_id)
+            && !bob.in_flight(&blip_id)
+            && alice.text(&blip_id) == bob.text(&blip_id)
+        {
+            break;
+        }
     }
 
     let final_text = alice.text(&blip_id);
