@@ -1253,6 +1253,10 @@ function updateToolbar() {
   const bar = state.toolbar;
   if (!bar) return;
   const editor = state.activeEditor;
+  // Resting beside the composer with nothing to act on yet. Dimmed rather than
+  // hidden: it is how you find out the formatting is there at all, and it
+  // should not claim to be usable before there is a caret.
+  bar.classList.toggle('idle', !editor);
   for (const [name] of FORMATS) {
     const button = bar.querySelector(`.tool-${name}`);
     // Without the `editor` guard the buttons keep whatever they were showing

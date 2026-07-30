@@ -609,6 +609,10 @@ textarea {
   margin-top: 6px;
 }
 
+.toolbar.idle {
+  opacity: 0.55;
+}
+
 /* Inside a message the toolbar is chrome, not content: quiet until the message
    is being written in, which is the only time it is there at all. */
 .blip-tools .toolbar {

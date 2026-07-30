@@ -15,14 +15,19 @@
 // only ever reach one message at a time), and the window is a fixed size so the
 // images stay consistent between runs.
 
-import { chromium } from 'playwright-core';
 import { spawn, execSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+// Resolved from `tests/`, where `npm install --prefix tests` puts it. A plain
+// import would search upwards from *this* directory and find nothing, so the
+// command in the header would fail for anyone who followed it.
+const { chromium } = createRequire(join(ROOT, 'tests/package.json'))('playwright-core');
 const SHOTS = join(ROOT, 'docs/screenshots');
 const PORT = Number(process.env.GAL_SHOT_PORT || 8119);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -313,9 +318,9 @@ try {
   await bob.waitForTimeout(400);
   await shot(bob, 'mode-chat.png');
 
-  // And the creator's view once it is frozen. Long enough for the toast to go:
-  // it sits in the same place as the line explaining the mode, and covering
-  // that line is the one thing this image is for.
+  // And the creator's view once it is frozen. Long enough for the toast
+  // announcing the switch to clear, so the image is of the wave rather than of
+  // a notification about it.
   await setMode(alice, 'frozen');
   await alice.mouse.move(700, 400);
   await alice.waitForTimeout(4000);

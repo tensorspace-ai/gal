@@ -15,7 +15,8 @@ them](docs/screenshots/wave.png)
 Alice's view of a wave she shares with Bob and Carol. The top message has been
 edited by both Alice and Bob; Bob's caret is visible inside the reply he is
 typing. The dashed block is a private reply — Carol is a full participant in this
-wave and never receives it.
+wave and never receives it. The formatting controls are at the bottom, dimmed
+because nothing has the caret; click into a message and they move into it.
 
 ## Running it
 
@@ -128,9 +129,10 @@ upgrading.
   as a channel rather than a stack of cards: the day is marked off, consecutive
   messages from one person collapse under a single header and show their send
   time on hover, and the composer stays below the thread instead of scrolling
-  away with it. The nesting is gone, the other people's messages are not
-  editable, and the mode shows as a badge rather than a picker, because only the
-  creator may change it.
+  away with it, carrying the formatting and attachment controls in its own box.
+  The nesting is gone, the other people's messages are not editable, and the
+  mode shows as a badge rather than a picker, because only the creator may
+  change it.
 
   ![The same wave in Frozen mode: read-only, with a note explaining
   why](docs/screenshots/mode-frozen.png)
