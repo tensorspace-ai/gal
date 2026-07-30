@@ -711,7 +711,8 @@ function renderThread() {
         chat &&
           previous &&
           previous.author === blip.author &&
-          blip.createdAt - previous.createdAt < GROUP_WINDOW,
+          blip.createdAt - previous.createdAt < GROUP_WINDOW &&
+          !carriesHeaderDetail(blip),
       );
 
       const node = blipElement(blip, depth, { grouped });
@@ -915,6 +916,16 @@ function lookupUser(userId) {
 /// chat is full of.
 function wasEdited(blip) {
   return blip.lastModified - blip.createdAt > 60 * 1000;
+}
+
+/// Whether a message's header says more than "who, and when".
+///
+/// Folding a message into the run above it drops the header, which is the point
+/// — but it must not be a way to lose the mark saying a message was edited, or
+/// the names of the other people on it. A wave that spent time in Document mode
+/// and was then switched to Chat is full of both.
+function carriesHeaderDetail(blip) {
+  return wasEdited(blip) || (blip.contributors || []).some((id) => id !== blip.author);
 }
 
 function actionButton(label, title, handler) {
