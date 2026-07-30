@@ -13,9 +13,16 @@ use gal_core::protocol::{PlaybackFrame, SearchHit, WaveSummary};
 use gal_ot::{Delta, Insert, OpKind};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
 
 pub type SqlitePool = Pool<SqliteConnectionManager>;
+
+/// How much one account may still upload, and over what window.
+#[derive(Clone, Copy, Debug)]
+pub struct UploadQuota {
+    pub bytes: u64,
+    pub since: Timestamp,
+}
 
 #[derive(Clone)]
 pub struct Storage {
@@ -948,6 +955,9 @@ impl Storage {
     }
 
     // --- attachments ----------------------------------------------------
+    //
+    // Uploads are the one place an ordinary participant can make the server
+    // spend disk, so they are the one place with an allowance.
 
     /// Is this user a member of this specific wavelet?
     ///
@@ -971,12 +981,21 @@ impl Storage {
         .await
     }
 
-    /// Store an uploaded file and return its metadata.
+    /// Store an uploaded file, unless the uploader is over their allowance.
     ///
     /// The bytes live in the database rather than beside it, which keeps the
     /// promise that a deployment is one file: back Gal up by copying `gal.db`,
     /// and the attachments come with it. It is also what makes the access check
     /// on the way out a join rather than a second thing to keep in step.
+    ///
+    /// The quota is measured *inside* the same transaction as the insert, and
+    /// not by the caller beforehand. Every method here runs on its own pooled
+    /// connection, so a check made in a separate call is a check every
+    /// concurrent upload passes at once: forty parallel 10 MB posts all read a
+    /// total of zero and all went through, which put 400 MB into a database
+    /// with a 200 MB daily ceiling.
+    ///
+    /// `Ok(None)` means the allowance is spent.
     pub async fn create_attachment(
         &self,
         wavelet_id: WaveletId,
@@ -984,7 +1003,8 @@ impl Storage {
         name: String,
         mime: String,
         bytes: Vec<u8>,
-    ) -> Result<Attachment> {
+        quota: UploadQuota,
+    ) -> Result<Option<Attachment>> {
         let attachment = Attachment {
             id: AttachmentId::new(),
             wavelet_id,
@@ -995,26 +1015,43 @@ impl Storage {
             created_at: now(),
         };
         let stored = attachment.clone();
-        self.run(move |conn| {
-            conn.execute(
-                "INSERT INTO attachments
-                     (id, wavelet_id, uploader, name, mime, size, created_at, bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    stored.id.as_str(),
-                    stored.wavelet_id.as_str(),
-                    stored.uploader.as_str(),
-                    stored.name,
-                    stored.mime,
-                    stored.size as i64,
-                    stored.created_at,
-                    bytes,
-                ],
-            )?;
-            Ok(())
-        })
-        .await?;
-        Ok(attachment)
+        let inserted = self
+            .run(move |conn| {
+                // IMMEDIATE, not the default deferred: this reads and then
+                // writes, and a deferred transaction takes only a read lock
+                // first. Two of them upgrading at once is an instant
+                // SQLITE_BUSY that the busy timeout cannot wait out, because
+                // neither can proceed until the other gives up.
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let used: i64 = tx.query_row(
+                    "SELECT COALESCE(SUM(size), 0) FROM attachments
+                     WHERE uploader = ?1 AND created_at >= ?2",
+                    params![stored.uploader.as_str(), quota.since],
+                    |r| r.get(0),
+                )?;
+                if used.max(0) as u64 + stored.size > quota.bytes {
+                    return Ok(false);
+                }
+                tx.execute(
+                    "INSERT INTO attachments
+                         (id, wavelet_id, uploader, name, mime, size, created_at, bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        stored.id.as_str(),
+                        stored.wavelet_id.as_str(),
+                        stored.uploader.as_str(),
+                        stored.name,
+                        stored.mime,
+                        stored.size as i64,
+                        stored.created_at,
+                        bytes,
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await?;
+        Ok(inserted.then_some(attachment))
     }
 
     /// Fetch an attachment, but only for someone who is in the wavelet it was
@@ -1053,24 +1090,6 @@ impl Storage {
                     },
                 )
                 .optional()?)
-        })
-        .await
-    }
-
-    /// How much this user has uploaded since `since`, in bytes.
-    ///
-    /// Uploads are the one place where an ordinary participant can make the
-    /// server spend disk, so there is a ceiling on it.
-    pub async fn attachment_bytes_since(&self, user_id: &UserId, since: Timestamp) -> Result<u64> {
-        let u = user_id.clone();
-        self.run(move |conn| {
-            let total: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(size), 0) FROM attachments
-                 WHERE uploader = ?1 AND created_at >= ?2",
-                params![u.as_str(), since],
-                |r| r.get(0),
-            )?;
-            Ok(total.max(0) as u64)
         })
         .await
     }
@@ -1535,6 +1554,15 @@ mod tests {
         (storage, dir)
     }
 
+    /// An allowance no test upload can exhaust, for the tests that are about
+    /// something else.
+    fn unlimited() -> UploadQuota {
+        UploadQuota {
+            bytes: u64::MAX,
+            since: 0,
+        }
+    }
+
     async fn make_user(storage: &Storage, name: &str) -> User {
         storage
             .create_user(
@@ -1945,9 +1973,11 @@ mod tests {
                 "plan.png".into(),
                 "image/png".into(),
                 b"public bytes".to_vec(),
+                unlimited(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("within quota");
         let secret = storage
             .create_attachment(
                 private.id.clone(),
@@ -1955,9 +1985,11 @@ mod tests {
                 "salary.pdf".into(),
                 "application/octet-stream".into(),
                 b"secret bytes".to_vec(),
+                unlimited(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("within quota");
 
         // Everyone in the conversation can read what was uploaded into it.
         for user in [&alice, &bob, &carol] {
@@ -1993,7 +2025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uploads_count_towards_a_daily_total() {
+    async fn the_upload_allowance_holds_against_concurrent_uploads() {
         let (storage, _dir) = temp_storage().await;
         let alice = make_user(&storage, "alice").await;
         let bob = make_user(&storage, "bob").await;
@@ -2007,34 +2039,56 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            storage.attachment_bytes_since(&alice.id, 0).await.unwrap(),
-            0
-        );
-        storage
+        let quota = UploadQuota {
+            bytes: 2048,
+            since: 0,
+        };
+        let upload = |who: UserId| {
+            let storage = storage.clone();
+            let wavelet = root.id.clone();
+            async move {
+                storage
+                    .create_attachment(
+                        wavelet,
+                        who,
+                        "a.bin".into(),
+                        "application/octet-stream".into(),
+                        vec![0u8; 512],
+                        quota,
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        };
+
+        // Eight 512-byte uploads at once against a 2 KiB allowance. Checking
+        // the total in a separate call would let every one of them read zero
+        // and go through; the check lives inside the insert's transaction, so
+        // exactly four fit.
+        let results = futures::future::join_all((0..8).map(|_| upload(alice.id.clone()))).await;
+        assert_eq!(results.iter().filter(|ok| **ok).count(), 4);
+
+        // Per uploader, not per server: Bob's allowance is his own.
+        assert!(upload(bob.id.clone()).await);
+
+        // And bounded by the window, or an allowance would never refill.
+        let tomorrow = UploadQuota {
+            bytes: 2048,
+            since: now() + 60_000,
+        };
+        assert!(storage
             .create_attachment(
                 root.id.clone(),
                 alice.id.clone(),
-                "a.bin".into(),
+                "b.bin".into(),
                 "application/octet-stream".into(),
                 vec![0u8; 512],
+                tomorrow,
             )
             .await
-            .unwrap();
-        assert_eq!(
-            storage.attachment_bytes_since(&alice.id, 0).await.unwrap(),
-            512
-        );
-        // Per uploader, not per server: Bob's allowance is his own.
-        assert_eq!(storage.attachment_bytes_since(&bob.id, 0).await.unwrap(), 0);
-        // And bounded by the window, or a quota would never refill.
-        assert_eq!(
-            storage
-                .attachment_bytes_since(&alice.id, now() + 60_000)
-                .await
-                .unwrap(),
-            0
-        );
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

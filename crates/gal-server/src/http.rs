@@ -463,7 +463,6 @@ async fn upload_attachment(
     identity: Identity,
     axum::extract::Path(wavelet_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<UploadQuery>,
-    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let wavelet_id = gal_core::model::WaveletId(wavelet_id);
@@ -489,39 +488,13 @@ async fn upload_attachment(
         return payload_too_large();
     }
 
-    let since = gal_core::model::now() - UPLOAD_QUOTA_WINDOW_MS;
-    match state
-        .db
-        .attachment_bytes_since(&identity.user.id, since)
-        .await
-    {
-        Ok(used) if used + body.len() as u64 > UPLOAD_QUOTA_BYTES => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(ApiError {
-                    error: "You have uploaded too much today. Try again tomorrow.".into(),
-                }),
-            )
-                .into_response();
-        }
-        Ok(_) => {}
-        Err(e) => return server_error(e),
-    }
-
     // What the file *is*, never what it was called or what the client declared.
     // A name ending in .png proves nothing, and believing it is how an upload
     // endpoint turns into a way to serve HTML from your own origin.
     let mime = sniff_image(&body)
         .unwrap_or("application/octet-stream")
         .to_string();
-    let name = clean_filename(if query.name.is_empty() {
-        headers
-            .get("x-gal-filename")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("file")
-    } else {
-        &query.name
-    });
+    let name = clean_filename(&query.name);
 
     match state
         .db
@@ -531,10 +504,25 @@ async fn upload_attachment(
             name,
             mime,
             body.into(),
+            // The allowance is applied inside the insert's own transaction
+            // rather than checked here: a check on this side runs on a
+            // different pooled connection from the write, so every concurrent
+            // upload would read the same pre-upload total and all would pass.
+            crate::db::UploadQuota {
+                bytes: UPLOAD_QUOTA_BYTES,
+                since: gal_core::model::now() - UPLOAD_QUOTA_WINDOW_MS,
+            },
         )
         .await
     {
-        Ok(attachment) => (StatusCode::CREATED, Json(attachment)).into_response(),
+        Ok(Some(attachment)) => (StatusCode::CREATED, Json(attachment)).into_response(),
+        Ok(None) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiError {
+                error: "You have uploaded too much today. Try again tomorrow.".into(),
+            }),
+        )
+            .into_response(),
         Err(e) => server_error(e),
     }
 }
@@ -556,19 +544,16 @@ async fn get_attachment(
     // rendered in place. Anything else is handed over as an opaque download,
     // which is what stops an uploaded page from ever being a page on this
     // origin.
-    let disposition = if attachment.is_image() {
-        format!(
-            "inline; filename=\"{}\"; filename*=UTF-8''{}",
-            attachment.name,
-            encode_filename(&attachment.name)
-        )
+    let how = if attachment.is_image() {
+        "inline"
     } else {
-        format!(
-            "attachment; filename=\"{}\"; filename*=UTF-8''{}",
-            attachment.name,
-            encode_filename(&attachment.name)
-        )
+        "attachment"
     };
+    let disposition = format!(
+        "{how}; filename=\"{}\"; filename*=UTF-8''{}",
+        attachment.name,
+        encode_filename(&attachment.name)
+    );
 
     let mut response_headers = HeaderMap::new();
     if let Ok(value) = attachment.mime.parse() {

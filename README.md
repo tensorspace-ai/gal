@@ -179,6 +179,14 @@ upgrading.
   `application/octet-stream` with `Content-Disposition: attachment`. That is
   what keeps an upload endpoint from becoming a way to serve script from your
   own origin.
+
+  **Uploads are not deleted when they stop being referenced.** Deleting the
+  message that held a file, or editing the file out of it, leaves the bytes in
+  the database and the URL still fetchable by the wavelet's participants. That
+  is deliberate — playback replays the op log, so a file that was in a wave
+  yesterday has to still resolve when you scrub back to yesterday — but it does
+  mean attachment storage only grows. Removing a wave *does* take its files with
+  it. If you need a retraction to be a deletion, it is not one yet.
 - **Unread tracking that understands editing.** Read state is per *revision*, so
   a message you have already read becomes unread again when somebody revises it.
 - **Full-text search** across every wave you participate in, with highlights.

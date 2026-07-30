@@ -83,6 +83,11 @@ const state = {
   /// caret. Both are rebuilt with the wave.
   toolbar: null,
   toolbarHome: null,
+  /// Blips whose outstanding op the server has refused by name. The reopen
+  /// that follows must not rescue and resubmit it: a refusal the mode check
+  /// knows nothing about — an embed the server will not take, say — would be
+  /// replayed, refused, and replayed again forever.
+  doomed: new Set(),
   playback: null,
   search: null,
   filter: 'all',
@@ -381,6 +386,7 @@ function teardownWave() {
   state.composer = null;
   state.toolbar = null;
   state.toolbarHome = null;
+  state.doomed.clear();
 }
 
 function rootWavelet() {
@@ -783,6 +789,11 @@ function renderThread() {
   if (root) renderInto(host, `root:${root.id}`, 0);
 
   restoreFocus(focused);
+  // The toolbar was docked inside one of the nodes just discarded. Without
+  // this it stays in the detached subtree whenever the caret was not in an
+  // editor — clicking the search box and then having someone post was enough
+  // to take bold, links and the paperclip off the page entirely.
+  dockToolbar();
   if (chat && pinned) scroller.scrollTop = scroller.scrollHeight;
 }
 
@@ -1379,9 +1390,15 @@ conn.on('waveState', (message) => {
   const unsent = new Map();
   if (state.waveId === wave.id) {
     for (const [blipId, doc] of state.docs) {
+      // Work the server has already refused by name is dropped here rather
+      // than rescued. replayUnsentEdits only knows how to recognise a mode
+      // refusal, so anything else would be resubmitted, refused, and
+      // resubmitted again for as long as the tab stays open.
+      if (state.doomed.has(blipId)) continue;
       const work = doc.pendingWork();
       if (work && !work.isEmpty()) unsent.set(blipId, work);
     }
+    state.doomed.clear();
     for (const editor of state.editors.values()) editor.destroy();
     state.editors.clear();
     state.docs.clear();
@@ -1634,9 +1651,13 @@ conn.on('error', (message) => {
     toast(message.message, 'error');
     // Reopen rather than reconstructing locally: the client's copy of the blip
     // is the snapshot from when the wave was opened, so it is not a safe source
-    // of truth. The reopen drops the pending op (replayUnsentEdits skips blips
-    // the mode forbids) and restores the server's version of everything else.
-    if (state.docs.get(message.blipId)?.pendingWork()) conn.openWave(state.waveId);
+    // of truth. Marking it doomed first is what makes the reopen drop the op
+    // rather than replay it — the reopen alone only sheds work the *mode*
+    // forbids, so any other refusal came back around and was sent again.
+    if (state.docs.get(message.blipId)?.pendingWork()) {
+      state.doomed.add(message.blipId);
+      conn.openWave(state.waveId);
+    }
     return;
   }
   if (message.code === 'resync' && message.blipId) {

@@ -52,7 +52,7 @@ fn random_delta(rng: &mut Rng, bounds: &[usize]) -> Delta {
     while at < last {
         let end = at + 1 + rng.below(last - at);
         let span = bounds[end] - bounds[at];
-        match rng.below(4) {
+        match rng.below(5) {
             0 => {
                 delta.push(Op::retain(span));
                 at = end;
@@ -64,6 +64,17 @@ fn random_delta(rng: &mut Rng, bounds: &[usize]) -> Delta {
             2 => {
                 let words = ["cat", "🌊", "xyz", "the ", "é", "日本"];
                 delta.push(Op::insert(words[rng.below(words.len())]));
+            }
+            3 => {
+                // An embed: one unit of the document however much JSON it
+                // carries, and the only insert whose payload is not a string.
+                // Both engines have to slice, merge and transform around it
+                // identically — an attachment is exactly this op, so a
+                // disagreement here corrupts a real document.
+                let id = rng.below(3);
+                delta.push(Op::embed(json!({
+                    "attachment": { "id": format!("a-{id}"), "name": "plan.png" }
+                })));
             }
             _ => {
                 let keys = ["bold", "italic", "link"];
@@ -97,6 +108,14 @@ fn main() {
                 [("bold".to_string(), json!(true))].into_iter().collect(),
             )
             .insert(" here"),
+        // A document that already contains embeds, so ops are generated
+        // *across* them rather than only appending them.
+        Delta::new()
+            .insert("see ")
+            .embed(json!({ "attachment": { "id": "a-1", "name": "plan.png" } }))
+            .insert(" and ")
+            .embed(json!({ "attachment": { "id": "a-2", "name": "notes.txt" } }))
+            .insert(" below"),
     ];
 
     let mut cases = Vec::new();

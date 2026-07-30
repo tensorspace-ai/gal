@@ -105,6 +105,12 @@ Attachments are the reason `attachments.wavelet_id` exists rather than a
 way to get the bytes without the membership test. A wave-scoped check would hand
 a file uploaded into a private reply to everyone else in the wave.
 
+Attachment rows are never deleted when an embed is edited out of a message or
+its blip is removed. That is not an oversight: playback replays the op log, so
+a file that was in the wave at frame 40 must still resolve when someone scrubs
+there. Removing the wavelet cascades, which is the only collection there is. The
+README says so; if you add a retraction, say so there too.
+
 Presence is the easy one to miss: an unscoped presence list names the blip each
 person is editing, which reveals that a private thread exists and when it is
 active, even though the content stays hidden. There is a test for this; keep it

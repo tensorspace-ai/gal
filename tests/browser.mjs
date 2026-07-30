@@ -500,9 +500,11 @@ try {
   await fAlice.keyboard.type('Here it is:');
   await fAlice.setInputFiles('.file-picker', join(dataDir, 'diagram.png'));
   await fAlice.waitForSelector('.embed-image img', { timeout: 15000 });
-  const drawn = await fAlice.evaluate(() => {
+  const drawn = await fAlice.evaluate(async () => {
     const img = document.querySelector('.embed-image img');
-    return img && img.complete && img.naturalWidth > 0;
+    if (!img) return false;
+    if (!img.complete) await new Promise((r) => img.addEventListener('load', r, { once: true }));
+    return img.naturalWidth > 0;
   });
   check('an image attachment is rendered, and really loads', drawn);
 
@@ -565,6 +567,42 @@ try {
   check('someone outside the wave cannot fetch the file', outsiderStatus === 404,
     `status ${outsiderStatus}`);
 
+  // The browser will move an embed element itself — a drag inside the message
+  // does it — and the text-diffing path would then read the moved embed back
+  // as a literal U+FFFC and send an op replacing the attachment with it. The
+  // picture would become an empty box for everyone, permanently. Simulated by
+  // doing to the DOM exactly what such a drag does.
+  const beforeSabotage = await fAlice.textContent('.blip .editor');
+  await fAlice.evaluate(() => {
+    const editor = document.querySelector('.blip .editor');
+    editor.appendChild(document.createTextNode('￼'));
+    editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+  });
+  await fAlice.waitForTimeout(700);
+  check('an embed the browser moved behind our back is put back, not sent as text',
+    (await fAlice.locator('.embed-image img').count()) === 1 &&
+      (await fAlice.textContent('.blip .editor')) === beforeSabotage);
+  await fBob.waitForTimeout(700);
+  check('and nothing reached the other side',
+    (await fBob.locator('.embed-image img').count()) === 1);
+
+  // Copying a spreadsheet range or part of a page puts a bitmap on the
+  // clipboard *beside* the text. Taking the file there silently discards what
+  // was actually copied.
+  await fAlice.click('.editor');
+  await fAlice.keyboard.press('End');
+  await fAlice.evaluate(() => {
+    const data = new DataTransfer();
+    data.setData('text/plain', ' pasted text');
+    data.items.add(new File([new Uint8Array([1, 2, 3])], 'clip.png', { type: 'image/png' }));
+    document.querySelector('.blip .editor')
+      .dispatchEvent(new ClipboardEvent('paste', { bubbles: true, clipboardData: data }));
+  });
+  await fAlice.waitForTimeout(900);
+  check('a paste carrying both text and a bitmap keeps the text',
+    (await fAlice.textContent('.blip .editor')).includes('pasted text') &&
+      (await fAlice.locator('.embed-image img').count()) === 1);
+
   await fAlice.reload();
   await fAlice.waitForSelector('.blip .editor', { timeout: 15000 });
   await fAlice.waitForTimeout(800);
@@ -573,6 +611,22 @@ try {
       (await fAlice.locator('.embed-file').count()) === 3);
   check('and the inbox names the file rather than showing a blank box',
     !(await fAlice.textContent('.inbox-snippet')).includes('￼'));
+
+  // The toolbar is a single element that lives inside whichever message holds
+  // the caret. A rebuild of the thread with focus elsewhere used to leave it
+  // in the discarded subtree, taking every formatting control off the page.
+  // Near the top-left, on the text: the middle of this message is the picture,
+  // and clicking that follows the link rather than placing a caret.
+  await fAlice.click('.blip .editor', { position: { x: 6, y: 8 } });
+  await fAlice.waitForTimeout(300);
+  check('the toolbar follows the caret into the message',
+    (await fAlice.locator('.blip-tools .tool-bold').count()) === 1);
+  await fAlice.click('.search-input');
+  // A new *message* rebuilds the whole thread; an edit does not.
+  await fBob.click('.thread-foot .btn.primary');
+  await fAlice.waitForTimeout(1800);
+  check('and survives a thread rebuild with the caret elsewhere',
+    (await fAlice.locator('.toolbar .tool-bold').count()) === 1);
 
   // --- surviving an outage ----------------------------------------------
 

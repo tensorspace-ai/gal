@@ -47,6 +47,10 @@ function renderEmbed(value) {
   node.className = 'embed';
   node.contentEditable = 'false';
   node.dataset.embed = '1';
+  // The browser will happily drag one of these to another point in the same
+  // message, which moves the *element* behind the model's back. onInput has a
+  // backstop for that; this stops it being offered in the first place.
+  node.draggable = false;
 
   const attachment = value && typeof value === 'object' ? value.attachment : null;
   if (!attachment || typeof attachment.id !== 'string') {
@@ -463,14 +467,17 @@ export class Editor {
   onPaste(event) {
     event.preventDefault();
     const data = event.clipboardData || window.clipboardData;
-    // A screenshot on the clipboard arrives as a file with no text beside it,
-    // which is how pasting a picture into a message works everywhere else.
+    const text = data ? data.getData('text/plain') : '';
     const files = data && data.files ? Array.from(data.files) : [];
-    if (files.length > 0 && this.onFiles) {
+
+    // Text wins when the clipboard has both. A screenshot arrives as a file
+    // and nothing else, but copying a spreadsheet range or a region of a page
+    // puts a bitmap *beside* the text — taking the file there would silently
+    // throw away what the person actually copied.
+    if (!text && files.length > 0 && this.onFiles) {
       this.onFiles(files, this.getSelection());
       return;
     }
-    const text = data.getData('text/plain');
     if (text) this.replaceSelection(text.replace(/\r\n?/g, '\n'));
   }
 
@@ -491,7 +498,34 @@ export class Editor {
     // Only now: letting the browser handle a file drop into a contenteditable
     // splices a copy of it into the DOM that the model knows nothing about.
     event.preventDefault();
-    this.onFiles(files, null);
+    this.onFiles(files, this.pointToSelection(event.clientX, event.clientY));
+  }
+
+  /**
+   * Where a pointer landed, as a document offset.
+   *
+   * A file dropped into the middle of a paragraph should go there, not at the
+   * end. Returns null when the browser will not say, which puts it at the
+   * caret or the end — the old behaviour, and a reasonable one.
+   */
+  pointToSelection(x, y) {
+    let node = null;
+    let offset = 0;
+    if (document.caretPositionFromPoint) {
+      const position = document.caretPositionFromPoint(x, y);
+      if (position) {
+        node = position.offsetNode;
+        offset = position.offset;
+      }
+    } else if (document.caretRangeFromPoint) {
+      const range = document.caretRangeFromPoint(x, y);
+      if (range) {
+        node = range.startContainer;
+        offset = range.startOffset;
+      }
+    }
+    if (!node || !this.root.contains(node)) return null;
+    return { index: domToIndex(this.root, node, offset), length: 0 };
   }
 
   /** Read the DOM after the browser edited it, and turn it into an op. */
@@ -503,6 +537,20 @@ export class Editor {
     if (before === after) return;
 
     const { index, removed, inserted } = textChange(before, after);
+
+    // An embed only ever enters the document through `insertEmbed`, which
+    // re-renders rather than going through this path — so U+FFFC turning up in
+    // *typed* text means the browser moved or copied an embed element itself,
+    // and the diff is about to replace an attachment with a literal
+    // replacement character. That op would be broadcast, and everyone's copy
+    // of the picture would become an empty box. Put the DOM back instead.
+    if (inserted.includes(EMBED_CHAR)) {
+      const caret = this.getSelection();
+      renderDelta(this.root, this.doc);
+      if (caret) this.setSelection(caret.index, caret.length);
+      return;
+    }
+
     const delta = new Delta().retain(index).delete(removed);
 
     if (inserted) {
@@ -556,20 +604,23 @@ export class Editor {
    * the bytes come back.
    */
   insertEmbed(value, at = null) {
-    const selection = at ||
-      this.getSelection() || { index: this.doc.toPlainText().length, length: 0 };
+    const total = this.doc.toPlainText().length;
+    const selection = at || this.getSelection() || { index: total, length: 0 };
+    // `at` was measured before the upload started, and the document may have
+    // been emptied or rewritten since. An op that retains past the end is not
+    // a document any more: the server refuses the whole message, and the
+    // draft and the file that was just uploaded both go with it.
+    const index = Math.max(0, Math.min(selection.index, total));
+    const length = Math.max(0, Math.min(selection.length, total - index));
 
-    const delta = new Delta()
-      .retain(selection.index)
-      .delete(selection.length)
-      .insert(value);
+    const delta = new Delta().retain(index).delete(length).insert(value);
 
     this.pendingFormat = null;
     this.doc = this.doc.apply(delta);
     this.onChange(delta);
     renderDelta(this.root, this.doc);
     // An embed is one unit wide, whatever it draws.
-    this.setSelection(selection.index + 1);
+    this.setSelection(index + 1);
     this.reportSelection();
   }
 
