@@ -35,6 +35,42 @@ export function clear(node) {
   return node;
 }
 
+/**
+ * An inline SVG icon.
+ *
+ * Built as DOM rather than as markup, so icons need no exception to the rule
+ * that nothing in this client is assembled by string concatenation. They also
+ * inherit `currentColor`, which is what lets one icon sit in a toolbar button
+ * and light up with it.
+ */
+export function icon(path, { size = 15 } = {}) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  for (const [name, value] of Object.entries({
+    viewBox: '0 0 24 24',
+    width: String(size),
+    height: String(size),
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.9',
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+    'aria-hidden': 'true',
+  })) {
+    svg.setAttribute(name, value);
+  }
+  const shape = document.createElementNS(NS, 'path');
+  shape.setAttribute('d', path);
+  svg.appendChild(shape);
+  return svg;
+}
+
+export const ICONS = {
+  link: 'M10.6 13.4a4 4 0 0 0 5.7 0l3.1-3.1a4 4 0 0 0-5.7-5.7l-1.7 1.8M13.4 10.6a4 4 0 0 0-5.7 0l-3.1 3.1a4 4 0 1 0 5.7 5.7l1.7-1.8',
+  paperclip:
+    'M20 10.5 11.6 19a4.6 4.6 0 0 1-6.5-6.5l8.5-8.4a3 3 0 1 1 4.3 4.3l-8.5 8.4a1.5 1.5 0 1 1-2.1-2.1l7.6-7.6',
+};
+
 /** Colour derived from the hue the server assigned to a user. */
 export function userColor(user, lightness = 45) {
   const hue = user && typeof user.color === 'number' ? user.color : 210;

@@ -236,6 +236,9 @@ try {
   check('bold produces real markup', (await alice.locator('.editor strong').count()) > 0);
   await bob.waitForTimeout(700);
   check('formatting replicates', (await bob.locator('.editor strong').count()) > 0);
+  check('the controls are with the message being written, not in the wave header',
+    (await alice.locator('.blip .blip-tools .toolbar').count()) === 1 &&
+      (await alice.locator('.wave-head .toolbar').count()) === 0);
 
   // --- threading --------------------------------------------------------
 
@@ -250,6 +253,20 @@ try {
   await bob.waitForTimeout(600);
   check('the reply is delivered live',
     (await bob.textContent('.blip-children .editor')).includes('Replying in a thread'));
+
+  // Bob is mid-sentence when Alice adds a message. Every node in the thread is
+  // rebuilt underneath him; the caret has to survive that, or a busy wave is
+  // unwritable.
+  await bob.click('.blip .editor');
+  await bob.keyboard.press('End');
+  await bob.keyboard.type(' —bob');
+  await bob.waitForTimeout(300);
+  await alice.click('.thread-foot .btn.primary');
+  await alice.waitForTimeout(1200);
+  await bob.keyboard.type('!');
+  await bob.waitForTimeout(500);
+  check('a message arriving does not throw you out of the one you are writing',
+    (await bob.locator('.blip .editor').first().textContent()).includes('—bob!'));
 
   // --- private replies --------------------------------------------------
 
@@ -387,9 +404,18 @@ try {
   check('the composer clears', (await mAlice.textContent('.composer-input')).trim() === '');
   check('no stray newline is inserted',
     !(await mAlice.locator('.blip .editor').last().textContent()).includes('\n'));
+  check('the composer carries its own controls',
+    (await mAlice.locator('.composer .toolbar').count()) === 1);
 
-  await mAlice.click('.composer-input');
+  // Deliberately no click first: after Enter the caret must still be in the
+  // composer. It used to be pulled into the message that had just been sent, so
+  // the next thing typed silently edited a message already delivered.
   await mAlice.keyboard.type('draft kept');
+  await mAlice.waitForTimeout(400);
+  check('typing after Enter stays in the composer',
+    (await mAlice.textContent('.composer-input')).includes('draft kept'));
+  check('and does not edit the message just sent',
+    (await mAlice.locator('.blip .editor').last().textContent()).trim() === 'sent with enter');
   await mBob.click('.composer-input');
   await mBob.keyboard.type('from bob');
   await mBob.keyboard.press('Enter');

@@ -64,8 +64,12 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* `select` belongs here too: without it the mode picker is the only control on
+   the page drawn in the browser's default UI font. */
 button,
-input {
+input,
+select,
+textarea {
   font: inherit;
   color: inherit;
 }
@@ -367,6 +371,12 @@ input {
   margin-top: 1px;
 }
 
+/* The unread badge is positioned over this line; leave it room rather than
+   letting it sit on top of the words. */
+.inbox-row.unread .inbox-snippet {
+  padding-right: 34px;
+}
+
 .inbox-snippet mark {
   background: color-mix(in srgb, var(--accent) 26%, transparent);
   color: inherit;
@@ -570,16 +580,51 @@ input {
 
 /* --- toolbar --- */
 
+/* One toolbar, moved to whichever input holds the caret: the composer's own
+   control row in a channel, the message being written in every other mode.
+   `.blip-tools` and `.foot-tools` are the sockets it docks into, and both
+   collapse when it is somewhere else. */
+
 .toolbar {
   display: flex;
+  align-items: center;
   gap: 1px;
   background: var(--surface-2);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 2px;
-  margin-right: 4px;
+}
+
+.blip-tools,
+.foot-tools {
+  display: flex;
+}
+
+.blip-tools:empty,
+.foot-tools:empty {
+  display: none;
+}
+
+.blip-tools {
+  margin-top: 6px;
+}
+
+/* Inside a message the toolbar is chrome, not content: quiet until the message
+   is being written in, which is the only time it is there at all. */
+.blip-tools .toolbar {
+  background: transparent;
+  border-color: transparent;
+  padding: 0;
+  margin-left: -3px;
+}
+
+.blip-tools .tool:hover {
+  background: var(--surface-2);
 }
 
 .tool {
+  display: inline-grid;
+  place-items: center;
   min-width: 27px;
   height: 25px;
   border: none;
@@ -618,6 +663,10 @@ input {
   text-decoration: line-through;
 }
 
+.tool svg {
+  display: block;
+}
+
 /* --- mode --- */
 
 .mode-select,
@@ -647,25 +696,33 @@ input {
 
 /* --- composer --- */
 
+/* The controls sit inside the composer's box, under the line being typed —
+   close enough that reaching for bold does not mean leaving the message. */
 .composer {
   display: flex;
-  align-items: flex-end;
-  gap: 8px;
+  flex-direction: column;
+  gap: 6px;
   background: var(--surface);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  padding: 8px 8px 8px 12px;
+  padding: 9px 9px 8px 12px;
   box-shadow: var(--shadow-1);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.composer:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border-strong));
+  box-shadow: var(--shadow-1), 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .composer-input {
-  flex: 1;
   outline: none;
   white-space: pre-wrap;
   overflow-wrap: break-word;
   max-height: 40vh;
   overflow-y: auto;
   min-height: 1.55em;
+  padding-top: 2px;
   caret-color: var(--accent);
 }
 
@@ -675,8 +732,25 @@ input {
   pointer-events: none;
 }
 
+.composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .composer-send {
   flex-shrink: 0;
+  margin-left: auto;
+}
+
+/* The toolbar's resting place beside whatever the mode offers as an input. */
+.foot-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .compose-note {
@@ -685,6 +759,7 @@ input {
   color: var(--text-faint);
   font-size: 13px;
   text-align: center;
+  flex: 1;
 }
 
 /* The composer sits below the scroller rather than inside it, so it is always
@@ -1176,13 +1251,17 @@ input {
 
 /* --- toasts --- */
 
+/* Above the conversation rather than below it: the bottom of the pane is where
+   the composer lives, and a toast that lands on the box you are typing into
+   hides the thing it is telling you about. */
 #toasts {
   position: fixed;
-  bottom: 18px;
+  top: 16px;
   left: 50%;
   transform: translateX(-50%);
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 7px;
   z-index: 200;
   pointer-events: none;
@@ -1210,7 +1289,7 @@ input {
 @keyframes rise {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(-8px);
   }
 }
 
@@ -1237,8 +1316,8 @@ input {
     display: inline-flex;
   }
 
-  /* The toolbar, the mode picker and the wave's buttons do not fit on one
-     line at this width; let them stack rather than run off the edge. */
+  /* The mode picker and the wave's buttons do not always fit on one line at
+     this width; let them stack rather than run off the edge. */
   .wave-actions {
     flex-wrap: wrap;
     justify-content: flex-end;

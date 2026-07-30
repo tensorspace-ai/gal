@@ -13,6 +13,8 @@ import {
   dayLabel,
   el,
   fullTime,
+  icon,
+  ICONS,
   relativeTime,
   sameDay,
   shortClockTime,
@@ -77,6 +79,10 @@ const state = {
   remoteCursors: new Map(),
   cursorLayer: null,
   activeEditor: null,
+  /// The one formatting toolbar, and where it sits when no editor has the
+  /// caret. Both are rebuilt with the wave.
+  toolbar: null,
+  toolbarHome: null,
   playback: null,
   search: null,
   filter: 'all',
@@ -281,10 +287,14 @@ function renderInbox() {
         class: 'inbox-row',
         onClick: () => openWave(hit.waveId),
       }, [
-        el('div', { class: 'inbox-title', text: hit.title }),
+        // Same shape as an inbox row, so the timestamp lines up in the same
+        // place rather than dropping onto a line of its own.
+        el('div', { class: 'inbox-row-top' }, [
+          el('div', { class: 'inbox-title', text: hit.title }),
+          el('div', { class: 'inbox-time', text: relativeTime(hit.timestamp) }),
+        ]),
         // The snippet arrives pre-escaped from SQLite with <mark> highlights.
         el('div', { class: 'inbox-snippet', html: hit.snippet }),
-        el('div', { class: 'inbox-time', text: relativeTime(hit.timestamp) }),
       ]));
     }
     return;
@@ -369,6 +379,8 @@ function teardownWave() {
   state.activeEditor = null;
   state.cursorLayer = null;
   state.composer = null;
+  state.toolbar = null;
+  state.toolbarHome = null;
 }
 
 function rootWavelet() {
@@ -416,7 +428,6 @@ function renderWave() {
       ]),
     ]),
     el('div', { class: 'wave-actions' }, [
-      formatToolbar(),
       modeControl(),
       el('button', {
         class: 'btn ghost',
@@ -447,6 +458,9 @@ function renderWave() {
   pane.appendChild(el('div', { class: 'thread-foot', id: 'thread-foot' }));
 
   state.cursorLayer = new CursorLayer(scroller);
+  // Nothing here can be written to during playback, and a frozen wave refuses
+  // every edit, so in both cases the controls would only ever be decoration.
+  state.toolbar = state.playback || mode.is('frozen') ? null : buildToolbar();
   renderParticipants();
   renderPresence();
   renderThread();
@@ -468,8 +482,15 @@ function renderComposer() {
   // that is no longer on the page.
   if (state.activeEditor === state.composer) state.activeEditor = null;
   state.composer = null;
+  state.toolbarHome = null;
   const root = rootWavelet();
   if (!root || state.playback) return;
+
+  // Where the formatting controls rest when no editor holds the caret. It is
+  // always beside whatever this mode offers as an input, so the controls are
+  // never further from the writing than the button that starts it.
+  const tools = el('div', { class: 'foot-tools' });
+  state.toolbarHome = state.toolbar ? tools : null;
 
   if (!mode.allowsNewMessage()) {
     const why = mode.is('frozen')
@@ -477,32 +498,41 @@ function renderComposer() {
       : mode.is('notepad')
         ? 'This wave is a single shared page — edit it directly above.'
         : 'Only the person who started this wave can post here.';
-    host.appendChild(el('p', { class: 'compose-note', text: why }));
+    host.appendChild(el('div', { class: 'foot-row' }, [
+      tools,
+      el('p', { class: 'compose-note', text: why }),
+    ]));
+    dockToolbar();
     return;
   }
 
   // Outside chat, a message is created empty and typed into in place.
   if (!mode.is('chat')) {
-    host.appendChild(
+    host.appendChild(el('div', { class: 'foot-row' }, [
+      tools,
       el('button', {
         class: 'btn primary',
         text: 'Add message',
         onClick: () => conn.send({ type: 'createBlip', waveletId: root.id }),
       }),
-    );
+    ]));
+    dockToolbar();
     return;
   }
 
   const field = el('div', { class: 'composer-input' });
   const box = el('div', { class: 'composer' }, [
     field,
-    el('button', {
-      class: 'btn primary composer-send',
-      text: 'Send',
-      title: 'Enter',
-      onMousedown: (e) => e.preventDefault(),
-      onClick: () => send(),
-    }),
+    el('div', { class: 'composer-bar' }, [
+      tools,
+      el('button', {
+        class: 'btn primary composer-send',
+        text: 'Send',
+        title: 'Enter',
+        onMousedown: (e) => e.preventDefault(),
+        onClick: () => send(),
+      }),
+    ]),
   ]);
   host.appendChild(box);
 
@@ -515,9 +545,10 @@ function renderComposer() {
     // thing being typed into is the composer.
     onSelectionChange: () => {
       state.activeEditor = composer;
-      updateToolbar();
+      dockToolbar();
     },
   });
+  composer.toolsHost = tools;
   state.composer = composer;
 
   const send = () => {
@@ -537,6 +568,7 @@ function renderComposer() {
     return false;
   };
   composer.root.setAttribute('data-placeholder', `Message #${root.title}`);
+  dockToolbar();
 }
 
 /// The mode indicator. Only the creator can change it, so everyone else sees a
@@ -664,6 +696,11 @@ function renderThread() {
   // off-screen.
   const scroller = host.closest('.thread-scroll');
   const pinned = threadAtBottom();
+  // Every node below is rebuilt, including the one being typed into. The
+  // documents survive — they live in `state.docs` — so the caret can be put
+  // back where it was, which is the difference between someone else adding a
+  // message and someone else throwing you out of your sentence.
+  const focused = captureFocus();
 
   clear(host);
 
@@ -743,7 +780,28 @@ function renderThread() {
   const root = rootWavelet();
   if (root) renderInto(host, `root:${root.id}`, 0);
 
+  restoreFocus(focused);
   if (chat && pinned) scroller.scrollTop = scroller.scrollHeight;
+}
+
+/// Which message the caret is in, and where, before the thread is rebuilt.
+///
+/// The composer is deliberately not covered: it lives outside `#thread` and is
+/// never rebuilt from here, so it keeps its caret on its own.
+function captureFocus() {
+  const editor = state.activeEditor;
+  if (!editor || !editor.blipId || !editor.root.isConnected) return null;
+  const active = document.activeElement;
+  if (active !== editor.root && !editor.root.contains(active)) return null;
+  return { blipId: editor.blipId, selection: editor.getSelection() };
+}
+
+function restoreFocus(saved) {
+  if (!saved) return;
+  const editor = state.editors.get(saved.blipId);
+  if (!editor) return;
+  editor.root.focus();
+  if (saved.selection) editor.setSelection(saved.selection.index, saved.selection.length);
 }
 
 function blipElement(blip, depth, { grouped = false } = {}) {
@@ -859,11 +917,15 @@ function blipElement(blip, depth, { grouped = false } = {}) {
     editorRoot.classList.add('read-only');
     renderDelta(editorRoot, doc.doc);
   } else {
+    // The formatting controls dock here while this message holds the caret.
+    const tools = el('div', { class: 'blip-tools' });
+    body.appendChild(tools);
+
     const editor = new Editor(editorRoot, doc.doc, {
       onChange: (delta) => onLocalEdit(blip.id, delta),
       onSelectionChange: (selection) => {
         state.activeEditor = editor;
-        updateToolbar();
+        dockToolbar();
         conn.send({
           type: 'cursor',
           waveId: state.waveId,
@@ -875,6 +937,8 @@ function blipElement(blip, depth, { grouped = false } = {}) {
     });
     // Keep the model and the editor pointing at the same document object.
     editor.doc = doc.doc;
+    editor.blipId = blip.id;
+    editor.toolsHost = tools;
     state.editors.set(blip.id, editor);
   }
 
@@ -1020,31 +1084,66 @@ const FORMATS = [
   ['code', '‹›', 'Code'],
 ];
 
-function formatToolbar() {
-  const bar = el('div', { class: 'toolbar', id: 'toolbar' });
+/**
+ * Build the wave's one set of formatting controls.
+ *
+ * There is exactly one, and it is moved to whichever input holds the caret
+ * rather than copied into each of them. It used to sit in the wave's header,
+ * which put it a long way from the text it acts on — in a channel, the whole
+ * height of the transcript away from the composer.
+ */
+function buildToolbar() {
+  const bar = el('div', { class: 'toolbar' });
   for (const [name, label, title] of FORMATS) {
     bar.appendChild(el('button', {
       class: `tool tool-${name}`,
+      type: 'button',
       text: label,
       title,
+      'aria-label': title.split('  ')[0],
       // Keep focus in the editor so the selection survives the click.
       onMousedown: (e) => e.preventDefault(),
       onClick: () => applyFormat(name),
     }));
   }
   bar.appendChild(el('button', {
-    class: 'tool',
-    text: '🔗',
+    class: 'tool tool-link',
+    type: 'button',
     title: 'Add a link',
+    'aria-label': 'Add a link',
     onMousedown: (e) => e.preventDefault(),
     onClick: async () => {
-      if (!state.activeEditor) return;
+      const editor = state.activeEditor;
+      if (!editor) return;
       const url = await askFor('Link', { placeholder: 'https://…', confirmLabel: 'Link' });
-      if (url) state.activeEditor.format('link', url);
+      if (url) editor.format('link', url);
       updateToolbar();
     },
-  }));
+  }, [icon(ICONS.link)]));
   return bar;
+}
+
+/**
+ * Move the toolbar to the input that has the caret, or back to its home beside
+ * the composer when none does.
+ *
+ * Re-parenting rather than showing and hiding several copies means the active
+ * states below are computed once, and there is never a second toolbar lit up
+ * for a selection it does not own.
+ */
+function dockToolbar() {
+  const bar = state.toolbar;
+  if (!bar) return;
+  const editor = state.activeEditor;
+  const host =
+    (editor && editor.toolsHost && editor.toolsHost.isConnected && editor.toolsHost) ||
+    state.toolbarHome;
+  if (!host || !host.isConnected) {
+    bar.remove();
+    return;
+  }
+  if (bar.parentNode !== host) host.appendChild(bar);
+  updateToolbar();
 }
 
 function applyFormat(name) {
@@ -1055,11 +1154,14 @@ function applyFormat(name) {
 }
 
 function updateToolbar() {
-  const bar = document.getElementById('toolbar');
-  if (!bar || !state.activeEditor) return;
+  const bar = state.toolbar;
+  if (!bar) return;
+  const editor = state.activeEditor;
   for (const [name] of FORMATS) {
     const button = bar.querySelector(`.tool-${name}`);
-    if (button) button.classList.toggle('active', state.activeEditor.isActive(name));
+    // Without the `editor` guard the buttons keep whatever they were showing
+    // for an editor that is no longer being written to.
+    if (button) button.classList.toggle('active', Boolean(editor) && editor.isActive(name));
   }
 }
 
@@ -1259,8 +1361,11 @@ conn.on('blipAdded', (message) => {
   renderThread();
   if (watched) conn.send({ type: 'markRead', waveId: state.waveId });
 
-  // Focus a message we just created ourselves.
-  if (message.blip.author === state.me.id) {
+  // Focus a message we just created ourselves — but never in a channel, where
+  // a message is *sent*, not created empty and filled in. There the caret
+  // belongs in the composer, and pulling it into the message that just left
+  // meant the next thing typed silently edited the message already sent.
+  if (message.blip.author === state.me.id && !state.composer) {
     const editor = state.editors.get(message.blip.id);
     if (editor) {
       editor.root.focus();
