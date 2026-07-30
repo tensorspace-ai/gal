@@ -687,6 +687,21 @@ input {
   text-align: center;
 }
 
+/* The composer sits below the scroller rather than inside it, so it is always
+   in reach. It has no chrome of its own — the box it holds provides that — and
+   collapses entirely when a mode offers nothing to put here. */
+.thread-foot {
+  max-width: 780px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 10px 24px 16px;
+  flex-shrink: 0;
+}
+
+.thread-foot:empty {
+  display: none;
+}
+
 /* A message nobody may edit should not look like an input. */
 .editor.read-only {
   caret-color: transparent;
@@ -708,11 +723,6 @@ input {
 .thread {
   max-width: 780px;
   margin: 0 auto;
-}
-
-.thread-foot {
-  max-width: 780px;
-  margin: 14px auto 0;
 }
 
 .blip {
@@ -863,6 +873,191 @@ input {
 
 .editor .embed {
   color: var(--text-faint);
+}
+
+/* --- chat --- */
+
+/* Chat is the one mode that is not a document, and it should not look like
+   one. The stack of cards becomes a channel: full-bleed rows on the page
+   itself, an avatar gutter, days marked off, and a run of messages from one
+   author collapsed under a single header. Everything here is scoped to
+   `.chat`, so the other modes keep the card layout unchanged. */
+
+.wave-pane.chat .thread-scroll {
+  display: flex;
+  flex-direction: column;
+  /* Rows carry their own horizontal padding so the hover highlight can run the
+     full width of the pane, the way a channel's does. */
+  padding: 0;
+}
+
+/* A near-empty channel reads from the bottom, like the full one it will
+   become. `margin-top: auto` rather than `justify-content`, which puts
+   overflowing content out of the scroller's reach. */
+.wave-pane.chat .thread {
+  max-width: none;
+  margin: auto 0 0;
+  padding: 12px 0 8px;
+  width: 100%;
+}
+
+.wave-pane.chat .thread-foot {
+  max-width: none;
+  padding: 4px 20px 16px;
+}
+
+.blip.chat {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  column-gap: 10px;
+  align-items: start;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  margin: 0;
+  padding: 5px 20px 4px;
+  transition: background 120ms ease;
+}
+
+/* The author stripe belongs to a card; here the avatar carries the colour. */
+.blip.chat::before {
+  display: none;
+}
+
+.blip.chat.grouped {
+  padding-top: 1px;
+  padding-bottom: 1px;
+}
+
+.blip.chat:hover,
+.blip.chat:focus-within {
+  background: var(--surface-2);
+}
+
+.blip.chat.unread {
+  background: color-mix(in srgb, var(--unread) 7%, transparent);
+  box-shadow: inset 2px 0 0 0 var(--unread);
+}
+
+.blip.chat > .blip-gutter {
+  grid-column: 1;
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 2px;
+}
+
+.blip.chat > .blip-main {
+  grid-column: 2;
+  min-width: 0;
+}
+
+.blip.chat > .blip-children {
+  grid-column: 2;
+  margin-left: 0;
+}
+
+.blip.chat .blip-head {
+  align-items: baseline;
+  gap: 7px;
+  margin-bottom: 0;
+}
+
+.blip.chat .blip-author {
+  font-size: 14.5px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+}
+
+.blip.chat .blip-time {
+  font-variant-numeric: tabular-nums;
+}
+
+.blip-edited {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* The timestamp that stands in for the avatar on a grouped row. It keeps its
+   space at all times so that revealing it on hover shifts nothing. */
+.blip.chat.grouped .blip-gutter {
+  padding-top: 0;
+}
+
+.blip.chat.grouped .blip-time {
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--text-faint);
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.blip.chat.grouped:hover .blip-time,
+.blip.chat.grouped:focus-within .blip-time {
+  opacity: 1;
+}
+
+/* A message is never empty here — it is sent, not created and then filled in —
+   so the editor's prompt would only ever be noise. */
+.blip.chat .editor:empty::before {
+  content: '';
+}
+
+/* Actions float over the row's top-right corner instead of taking a place in
+   the header, which a grouped row does not have. They must not swallow clicks
+   meant for the message above while invisible. */
+.blip.chat > .blip-actions {
+  position: absolute;
+  top: -10px;
+  right: 16px;
+  margin-left: 0;
+  padding: 2px;
+  gap: 1px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-1);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.blip.chat:hover > .blip-actions,
+.blip.chat:focus-within > .blip-actions {
+  pointer-events: auto;
+}
+
+.day-sep {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px 8px;
+}
+
+.day-sep::before,
+.day-sep::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.day-label {
+  padding: 2px 11px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--surface);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.channel-hash {
+  color: var(--text-faint);
+  font-weight: 500;
+  margin-right: 2px;
 }
 
 /* --- private replies --- */
@@ -1042,12 +1237,37 @@ input {
     display: inline-flex;
   }
 
+  /* The toolbar, the mode picker and the wave's buttons do not fit on one
+     line at this width; let them stack rather than run off the edge. */
+  .wave-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
   .thread-scroll {
     padding: 14px 12px 32px;
+  }
+
+  .thread-foot {
+    padding: 8px 12px 12px;
   }
 
   .blip-children {
     margin-left: 10px;
     padding-left: 8px;
+  }
+
+  .blip.chat,
+  .day-sep {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .wave-pane.chat .thread-foot {
+    padding: 4px 12px 12px;
+  }
+
+  .blip.chat > .blip-actions {
+    right: 8px;
   }
 }

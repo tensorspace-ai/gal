@@ -402,6 +402,24 @@ try {
     authors.includes('Mode_alice') || authors.includes('mode_alice'), authors.join(', '));
   check('no message is attributed to Unknown', !authors.some((a) => a === 'Unknown'));
 
+  // A channel is not a stack of cards. Three messages are on screen here:
+  // two from Alice in a row, then one from Bob.
+  check('chat lays its messages out as a channel',
+    (await mAlice.locator('.blip.chat').count()) === 3);
+  check('the day is marked off once', (await mAlice.locator('.day-sep').count()) === 1);
+  check('a run from one author shares a header',
+    (await mAlice.locator('.blip.chat.grouped').count()) === 1);
+  check('and does not repeat the avatar',
+    (await mAlice.locator('.blip.chat.grouped .avatar').count()) === 0);
+  check('the composer stays out of the scroller, so it cannot scroll away',
+    (await mAlice.locator('.thread-scroll .composer').count()) === 0 &&
+      (await mAlice.locator('.thread-foot .composer').count()) === 1);
+  // Bob's message landed while Alice was watching the bottom of the channel.
+  check('a message read as it arrives is not left marked new',
+    (await mAlice.locator('.blip.unread').count()) === 0);
+  check('nor counted in the inbox of the room you are sitting in',
+    (await mAlice.locator('.inbox-row .badge').count()) === 0);
+
   await setMode(mAlice, 'frozen');
   await mBob.waitForTimeout(900);
   check('frozen makes everything read-only', !(await editable(mAlice, '.blip .editor')));

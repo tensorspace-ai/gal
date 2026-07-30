@@ -91,6 +91,54 @@ export function fullTime(timestamp) {
   });
 }
 
+/** Wall-clock time, as a chat shows beside a message. */
+export function clockTime(timestamp) {
+  return new Date(timestamp).toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+/**
+ * The same time without the meridiem, for the narrow gutter beside a grouped
+ * message.
+ *
+ * Dropping the part rather than forcing a 24-hour clock keeps whatever hour
+ * cycle the reader's locale uses; the full timestamp is still on the title.
+ */
+export function shortClockTime(timestamp) {
+  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' })
+    .formatToParts(new Date(timestamp))
+    .filter((part) => part.type !== 'dayPeriod')
+    .map((part) => part.value)
+    .join('')
+    .trim();
+}
+
+export function sameDay(a, b) {
+  const x = new Date(a);
+  const y = new Date(b);
+  return (
+    x.getFullYear() === y.getFullYear() &&
+    x.getMonth() === y.getMonth() &&
+    x.getDate() === y.getDate()
+  );
+}
+
+/** Heading for a day's worth of messages. */
+export function dayLabel(timestamp) {
+  const now = Date.now();
+  if (sameDay(timestamp, now)) return 'Today';
+  if (sameDay(timestamp, now - DAY)) return 'Yesterday';
+  const date = new Date(timestamp);
+  return date.toLocaleDateString(undefined, {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    year: date.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+  });
+}
+
 /** Transient message in the corner. */
 export function toast(message, kind = 'info') {
   const host = document.getElementById('toasts');

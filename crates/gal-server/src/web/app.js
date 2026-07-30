@@ -7,11 +7,15 @@ import {
   askFor,
   avatar,
   clear,
+  clockTime,
   confirmAction,
   CursorLayer,
+  dayLabel,
   el,
   fullTime,
   relativeTime,
+  sameDay,
+  shortClockTime,
   toast,
   userColor,
 } from './ui.js';
@@ -336,6 +340,7 @@ function updateStatus(status) {
 
 function renderEmptyWave() {
   const pane = clear(document.getElementById('wave-pane'));
+  pane.classList.remove('chat');
   pane.appendChild(el('div', { class: 'empty-wave' }, [
     el('h2', { text: 'Pick a wave' }),
     el('p', { text: 'Or start a new one. Everyone in a wave can edit every message in it, live.' }),
@@ -382,6 +387,9 @@ function renderWave() {
   const title = root ? root.title : 'Wave';
 
   state.blipNodes.clear();
+  // Chat is laid out as a channel rather than a stack of cards; the switch is
+  // made once here so the stylesheet can do the rest.
+  pane.classList.toggle('chat', mode.is('chat'));
 
   const header = el('header', { class: 'wave-head' }, [
     el('button', {
@@ -393,13 +401,15 @@ function renderWave() {
     el('div', { class: 'wave-head-main' }, [
       el('h1', {
         class: 'wave-title',
-        text: title,
         title: 'Click to rename',
         onClick: async () => {
           const next = await askFor('Rename wave', { value: title, confirmLabel: 'Rename' });
           if (next && root) conn.send({ type: 'setTitle', waveletId: root.id, title: next });
         },
-      }),
+      }, [
+        mode.is('chat') ? el('span', { class: 'channel-hash', text: '#' }) : null,
+        el('span', { class: 'wave-title-text', text: title }),
+      ]),
       el('div', { class: 'wave-sub' }, [
         el('span', { class: 'presence', id: 'presence' }),
         el('span', { class: 'participants', id: 'participants' }),
@@ -427,13 +437,14 @@ function renderWave() {
   ]);
 
   const thread = el('div', { class: 'thread', id: 'thread' });
-  const scroller = el('div', { class: 'thread-scroll' }, [
-    thread,
-    el('div', { class: 'thread-foot', id: 'thread-foot' }),
-  ]);
+  const scroller = el('div', { class: 'thread-scroll' }, [thread]);
 
   pane.appendChild(header);
   pane.appendChild(scroller);
+  // A sibling of the scroller, not a child of it: a composer that scrolls out
+  // of reach is no use in a channel, and in the other modes "Add message"
+  // should not need a trip to the bottom of a long document either.
+  pane.appendChild(el('div', { class: 'thread-foot', id: 'thread-foot' }));
 
   state.cursorLayer = new CursorLayer(scroller);
   renderParticipants();
@@ -452,6 +463,11 @@ function renderComposer() {
   const host = document.getElementById('thread-foot');
   if (!host) return;
   clear(host);
+  // The old composer, if there was one, has just been detached along with the
+  // rest of the footer. Anything still holding it would be writing into a node
+  // that is no longer on the page.
+  if (state.activeEditor === state.composer) state.activeEditor = null;
+  state.composer = null;
   const root = rootWavelet();
   if (!root || state.playback) return;
 
@@ -495,6 +511,12 @@ function renderComposer() {
   // touch it.
   const composer = new Editor(field, new Delta(), {
     onChange: () => {},
+    // Without this the toolbar and ⌘B have nothing to act on while the only
+    // thing being typed into is the composer.
+    onSelectionChange: () => {
+      state.activeEditor = composer;
+      updateToolbar();
+    },
   });
   state.composer = composer;
 
@@ -514,7 +536,7 @@ function renderComposer() {
     send();
     return false;
   };
-  composer.root.setAttribute('data-placeholder', 'Write a message…');
+  composer.root.setAttribute('data-placeholder', `Message #${root.title}`);
 }
 
 /// The mode indicator. Only the creator can change it, so everyone else sees a
@@ -620,10 +642,29 @@ function renderPresence() {
   }
 }
 
+/// Consecutive messages from one author inside this window share a header.
+const GROUP_WINDOW = 5 * 60 * 1000;
+
+/// Whether the thread is showing its newest content. A little slack, so that
+/// resting a few pixels short of the end still counts as being there.
+function threadAtBottom() {
+  const scroller = document.querySelector('.thread-scroll');
+  if (!scroller) return false;
+  return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+}
+
 /** Build the blip tree, reusing existing nodes so editors keep their state. */
 function renderThread() {
   const host = document.getElementById('thread');
   if (!host) return;
+
+  // A channel reads from the bottom. Follow the newest message only when the
+  // reader is already there — moving the viewport under someone who scrolled
+  // up to read something older is worse than letting a message arrive
+  // off-screen.
+  const scroller = host.closest('.thread-scroll');
+  const pinned = threadAtBottom();
+
   clear(host);
 
   const blips = allBlips();
@@ -649,10 +690,34 @@ function renderThread() {
     }
   }
 
+  const chat = mode.is('chat');
+
   const renderInto = (container, key, depth) => {
+    // Only meaningful in chat, where messages arrive in one flat run: the
+    // previous message decides whether this one repeats its header and whether
+    // a new day has started. The two are tracked apart because a run of
+    // messages can be broken without the day changing.
+    let previous = null;
+    let previousDay = null;
+
     for (const blip of byParent.get(key) || []) {
-      const node = blipElement(blip, depth);
+      if (chat && (previousDay === null || !sameDay(previousDay, blip.createdAt))) {
+        container.appendChild(el('div', { class: 'day-sep' }, [
+          el('span', { class: 'day-label', text: dayLabel(blip.createdAt) }),
+        ]));
+        previous = null;
+      }
+      const grouped = Boolean(
+        chat &&
+          previous &&
+          previous.author === blip.author &&
+          blip.createdAt - previous.createdAt < GROUP_WINDOW,
+      );
+
+      const node = blipElement(blip, depth, { grouped });
       container.appendChild(node);
+      previous = blip;
+      previousDay = blip.createdAt;
 
       const children = el('div', { class: 'blip-children' });
       node.appendChild(children);
@@ -668,77 +733,118 @@ function renderThread() {
         ]);
         children.appendChild(aside);
         renderInto(aside, `root:${wavelet.id}`, depth + 1);
+        // The aside breaks the run of messages, so the next one starts fresh.
+        previous = null;
       }
     }
   };
 
   const root = rootWavelet();
   if (root) renderInto(host, `root:${root.id}`, 0);
+
+  if (chat && pinned) scroller.scrollTop = scroller.scrollHeight;
 }
 
-function blipElement(blip, depth) {
+function blipElement(blip, depth, { grouped = false } = {}) {
   const author = lookupUser(blip.author);
+  const chat = mode.is('chat');
 
   const doc = state.docs.get(blip.id) || new BlipDoc(blip.id, blip.content, blip.revision);
   state.docs.set(blip.id, doc);
 
   const body = el('div', { class: 'blip-body' });
   const article = el('article', {
-    class: `blip ${blip.unread ? 'unread' : ''}`,
+    class: `blip ${chat ? 'chat' : ''} ${grouped ? 'grouped' : ''} ${blip.unread ? 'unread' : ''}`,
     dataset: { blipId: blip.id, depth: String(depth) },
   });
 
   const contributors = (blip.contributors || []).filter((id) => id !== blip.author);
-  const head = el('div', { class: 'blip-head' }, [
-    avatar(author, { size: 26 }),
-    el('span', { class: 'blip-author', text: author.displayName }),
-    el('time', {
-      class: 'blip-time',
-      text: relativeTime(blip.lastModified),
-      title: fullTime(blip.lastModified),
+  const actions = el('div', { class: 'blip-actions' }, [
+    mode.allowsReplies() &&
+      actionButton('Reply', 'Reply below this message', () => {
+      conn.send({ type: 'createBlip', waveletId: blip.waveletId, parent: blip.id });
     }),
-    contributors.length
-      ? el('span', {
-          class: 'blip-contributors',
-          title: 'Also edited by others',
-          text: `+${contributors.length}`,
+    mode.allowsPrivateReply() &&
+      actionButton('Privately', 'Start a private side conversation', async () => {
+      const name = await askFor('Private reply', {
+        placeholder: 'username',
+        description: 'Only you and the people you name will see this thread.',
+        confirmLabel: 'Start',
+      });
+      if (name) {
+        conn.send({
+          type: 'privateReply',
+          waveletId: blip.waveletId,
+          anchor: blip.id,
+          participants: [name],
+        });
+      }
+    }),
+    blip.author === state.me.id && mode.allowsDelete()
+      ? actionButton('Delete', 'Delete this message', async () => {
+          const ok = await confirmAction('Delete message', 'This cannot be undone.', {
+            confirmLabel: 'Delete',
+            danger: true,
+          });
+          if (ok) conn.send({ type: 'deleteBlip', blipId: blip.id });
         })
       : null,
-    el('div', { class: 'blip-actions' }, [
-      mode.allowsReplies() &&
-        actionButton('Reply', 'Reply below this message', () => {
-        conn.send({ type: 'createBlip', waveletId: blip.waveletId, parent: blip.id });
-      }),
-      mode.allowsPrivateReply() &&
-        actionButton('Privately', 'Start a private side conversation', async () => {
-        const name = await askFor('Private reply', {
-          placeholder: 'username',
-          description: 'Only you and the people you name will see this thread.',
-          confirmLabel: 'Start',
-        });
-        if (name) {
-          conn.send({
-            type: 'privateReply',
-            waveletId: blip.waveletId,
-            anchor: blip.id,
-            participants: [name],
-          });
-        }
-      }),
-      blip.author === state.me.id && mode.allowsDelete()
-        ? actionButton('Delete', 'Delete this message', async () => {
-            const ok = await confirmAction('Delete message', 'This cannot be undone.', {
-              confirmLabel: 'Delete',
-              danger: true,
-            });
-            if (ok) conn.send({ type: 'deleteBlip', blipId: blip.id });
-          })
-        : null,
-    ]),
   ]);
 
-  article.appendChild(head);
-  article.appendChild(body);
+  const contributorTag = contributors.length
+    ? el('span', {
+        class: 'blip-contributors',
+        title: 'Also edited by others',
+        text: `+${contributors.length}`,
+      })
+    : null;
+
+  if (chat) {
+    // A channel row: the author's face in a gutter, the message beside it, and
+    // repeated headers collapsed away so a run of messages reads as one turn.
+    // The timestamp is when the message was sent — a chat is a record of what
+    // was said when, so a later edit is marked rather than backdating the line.
+    const sent = el('time', {
+      class: 'blip-time',
+      text: grouped ? shortClockTime(blip.createdAt) : clockTime(blip.createdAt),
+      title: fullTime(blip.createdAt),
+    });
+
+    article.appendChild(el('div', { class: 'blip-gutter' }, [
+      grouped ? sent : avatar(author, { size: 34 }),
+    ]));
+    article.appendChild(el('div', { class: 'blip-main' }, [
+      grouped
+        ? null
+        : el('div', { class: 'blip-head' }, [
+            el('span', { class: 'blip-author', text: author.displayName }),
+            sent,
+            wasEdited(blip)
+              ? el('span', {
+                  class: 'blip-edited',
+                  text: 'edited',
+                  title: `Last edited ${fullTime(blip.lastModified)}`,
+                })
+              : null,
+            contributorTag,
+          ]),
+      body,
+    ]));
+    article.appendChild(actions);
+  } else {
+    article.appendChild(el('div', { class: 'blip-head' }, [
+      avatar(author, { size: 26 }),
+      el('span', { class: 'blip-author', text: author.displayName }),
+      el('time', {
+        class: 'blip-time',
+        text: relativeTime(blip.lastModified),
+        title: fullTime(blip.lastModified),
+      }),
+      contributorTag,
+      actions,
+    ]));
+    article.appendChild(body);
+  }
   article.style.setProperty('--author-color', userColor(author));
 
   const editorRoot = el('div', { class: 'editor' });
@@ -798,6 +904,17 @@ function lookupUser(userId) {
       color: 0,
     }
   );
+}
+
+/// Whether a message has been changed since it was sent.
+///
+/// A blip's two timestamps are set together at creation and the content sent
+/// with it is committed under the creation time, so anything later is a real
+/// edit. The minute of slack covers a message that was created empty and typed
+/// into — how every mode but chat writes one, and what a wave switched into
+/// chat is full of.
+function wasEdited(blip) {
+  return blip.lastModified - blip.createdAt > 60 * 1000;
 }
 
 function actionButton(label, title, handler) {
@@ -1072,11 +1189,16 @@ conn.on('waveState', (message) => {
   showInbox(false);
   conn.send({ type: 'markRead', waveId: wave.id });
 
-  // Put the caret in the first empty message, which is where a new wave lands.
-  const empty = allBlips().find((b) => (b.content.ops || []).length === 0);
-  if (empty) {
-    const editor = state.editors.get(empty.id);
-    if (editor) editor.root.focus();
+  // In a channel the caret belongs in the composer. Elsewhere, put it in the
+  // first empty message, which is where a new wave lands.
+  if (state.composer) {
+    state.composer.root.focus();
+  } else {
+    const empty = allBlips().find((b) => (b.content.ops || []).length === 0);
+    if (empty) {
+      const editor = state.editors.get(empty.id);
+      if (editor) editor.root.focus();
+    }
   }
 });
 
@@ -1114,8 +1236,17 @@ conn.on('blipAdded', (message) => {
   const wavelet = state.wave.wavelets.find((w) => w.id === message.blip.waveletId);
   if (!wavelet || wavelet.blips.some((b) => b.id === message.blip.id)) return;
 
+  // A message that lands while you are looking at the newest part of the wave
+  // has been read by the time it is drawn. Without this the inbox goes on
+  // counting messages that are on the screen in front of you, and a channel
+  // ends up with everything said since it was opened marked as new. Read from
+  // the DOM before the render below moves the scroller.
+  const watched = document.visibilityState === 'visible' && threadAtBottom();
+  if (watched) message.blip.unread = false;
+
   wavelet.blips.push(message.blip);
   renderThread();
+  if (watched) conn.send({ type: 'markRead', waveId: state.waveId });
 
   // Focus a message we just created ourselves.
   if (message.blip.author === state.me.id) {
@@ -1179,8 +1310,12 @@ conn.on('titleChanged', (message) => {
   if (state.wave && message.waveId === state.waveId) {
     const wavelet = state.wave.wavelets.find((w) => w.id === message.waveletId);
     if (wavelet) wavelet.title = message.title;
-    const heading = document.querySelector('.wave-title');
+    // The text node only: in chat the heading also carries the channel's hash.
+    const heading = document.querySelector('.wave-title-text');
     if (heading) heading.textContent = message.title;
+    if (state.composer) {
+      state.composer.root.setAttribute('data-placeholder', `Message #${message.title}`);
+    }
   }
 });
 
