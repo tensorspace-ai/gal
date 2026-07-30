@@ -184,7 +184,12 @@ async fn dispatch(
             delta,
             op_id,
         } => {
-            check_embeds(&delta).map_err(|e| *e)?;
+            // Named, like every other refusal of an op: a bare one leaves the
+            // client holding work it retries forever, and everything typed
+            // afterwards piles up behind it.
+            if let Err(refusal) = check_embeds(&delta) {
+                return Err(name_blip(*refusal, &blip_id));
+            }
             let (_, wave) = find_blip(state, session, &blip_id).await?;
             let mut live = wave.lock().await;
             state
@@ -1063,6 +1068,18 @@ fn seed_content(content: Option<Delta>) -> Result<Option<Delta>, Box<ServerMessa
 /// is a few hundred bytes; this leaves room for that and no room for using a
 /// document as general-purpose storage.
 const MAX_EMBED_BYTES: usize = 1024;
+
+/// Attach a blip id to a refusal, so the client knows which document to drop.
+fn name_blip(mut refusal: ServerMessage, blip_id: &BlipId) -> ServerMessage {
+    if let ServerMessage::Error {
+        blip_id: ref mut target,
+        ..
+    } = refusal
+    {
+        *target = Some(blip_id.clone());
+    }
+    refusal
+}
 
 /// Reject embeds that are not small JSON objects.
 ///

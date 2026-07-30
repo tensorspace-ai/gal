@@ -1702,6 +1702,53 @@ async fn seed_content_that_is_not_a_document_is_rejected() {
 }
 
 #[tokio::test]
+async fn an_oversized_embed_is_refused_by_name_and_leaves_the_blip_usable() {
+    // An embed is one unit of a document however much JSON it carries, so the
+    // length limits say nothing about its size. The refusal has to name the
+    // blip: a bare one leaves the client retrying an op the server will never
+    // take, and everything typed afterwards queues behind it forever.
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, _, blip_id) = create_wave(&mut alice, "Embeds", vec![]).await;
+
+    alice
+        .send(ClientMessage::Submit {
+            blip_id: blip_id.clone(),
+            revision: 0,
+            delta: Delta::new().embed(serde_json::json!({ "junk": "x".repeat(4096) })),
+            op_id: Some("op-1".into()),
+        })
+        .await;
+
+    let named = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, blip_id, .. } => Some((*code, blip_id.clone())),
+            ServerMessage::Ack { .. } => panic!("an oversized embed was accepted"),
+            _ => None,
+        })
+        .await;
+    assert_eq!(named.0, ErrorCode::BadRequest);
+    assert_eq!(named.1.as_ref(), Some(&blip_id));
+
+    // An ordinary attachment reference is fine, and the blip still works.
+    let mut fresh = server.connect(&cookie).await;
+    let (_, blip_id) = fresh.open(&wave_id).await;
+    fresh
+        .edit(
+            &blip_id,
+            Delta::new().embed(serde_json::json!({
+                "attachment": { "id": "a-1", "name": "plan.png", "mime": "image/png", "size": 12 }
+            })),
+        )
+        .await;
+    fresh
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    assert_eq!(fresh.text(&blip_id), "\u{fffc}");
+}
+
+#[tokio::test]
 async fn only_the_creator_can_remove_someone_else() {
     // Any participant removing any other made a hostile takeover trivial.
     let server = start_server().await;

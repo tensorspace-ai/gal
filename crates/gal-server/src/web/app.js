@@ -1625,9 +1625,12 @@ conn.on('searchResults', (message) => {
 
 conn.on('error', (message) => {
   // A refused edit names the message it applies to. Reset that document to the
-  // server's version: retrying is pointless while the rule stands, and holding
-  // the op would block everything typed afterwards.
-  if (message.code === 'forbidden' && message.blipId) {
+  // server's version: retrying is pointless while the reason stands, and
+  // holding the op would block everything typed afterwards.
+  //
+  // Any named refusal, not just a mode refusal: an op the server will not take
+  // is an op the client must stop holding, whatever the reason was.
+  if (message.blipId && message.code !== 'resync') {
     toast(message.message, 'error');
     // Reopen rather than reconstructing locally: the client's copy of the blip
     // is the snapshot from when the wave was opened, so it is not a safe source
