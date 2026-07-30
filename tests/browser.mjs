@@ -547,6 +547,16 @@ try {
     served.type === 'application/octet-stream' && served.disposition.startsWith('attachment;'),
     `${served.type} / ${served.disposition}`);
 
+  // PNG magic bytes and then nothing a decoder will take. The server is right
+  // to call it an image — that is all its bytes say — and the client has to
+  // cope with the picture never arriving.
+  writeFileSync(join(dataDir, 'truncated.png'), Buffer.concat([PNG.subarray(0, 8), Buffer.alloc(64)]));
+  await fAlice.setInputFiles('.file-picker', join(dataDir, 'truncated.png'));
+  await fAlice.waitForTimeout(1500);
+  check('an image that will not decode becomes a download rather than a broken icon',
+    (await fAlice.locator('.embed-file').count()) === 3 &&
+      (await fAlice.textContent('.blip .editor')).includes('truncated.png'));
+
   const imageHref = await fAlice.locator('.embed-image a').getAttribute('href');
   const outsiderStatus = await outsider.evaluate(async (href) => {
     const response = await fetch(href);
@@ -560,7 +570,7 @@ try {
   await fAlice.waitForTimeout(800);
   check('attachments survive a reload, because they are part of the document',
     (await fAlice.locator('.embed-image img').count()) === 1 &&
-      (await fAlice.locator('.embed-file').count()) === 2);
+      (await fAlice.locator('.embed-file').count()) === 3);
   check('and the inbox names the file rather than showing a blank box',
     !(await fAlice.textContent('.inbox-snippet')).includes('￼'));
 

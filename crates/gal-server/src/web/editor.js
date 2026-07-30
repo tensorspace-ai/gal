@@ -58,37 +58,56 @@ function renderEmbed(value) {
 
   const href = `/api/attachments/${encodeURIComponent(attachment.id)}`;
   const name = typeof attachment.name === 'string' ? attachment.name : 'file';
-  const link = document.createElement('a');
-  link.href = href;
-  link.target = '_blank';
-  link.rel = 'noopener noreferrer';
 
   if (typeof attachment.mime === 'string' && attachment.mime.startsWith('image/')) {
+    const link = document.createElement('a');
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
     node.classList.add('embed-image');
+
     const image = document.createElement('img');
     image.src = href;
     image.alt = name;
     image.loading = 'lazy';
+    // A file can pass the server's magic-byte check and still be a picture no
+    // decoder will take, and an attachment can outlive the wave it came from.
+    // A broken-image icon with the filename spilling out from under it is
+    // worse than the download it turns into here.
+    image.addEventListener('error', () => {
+      node.classList.replace('embed-image', 'embed-file');
+      node.textContent = '';
+      node.appendChild(fileChip(href, name, attachment.size));
+    });
     link.appendChild(image);
     node.appendChild(link);
     return node;
   }
 
   node.classList.add('embed-file');
+  node.appendChild(fileChip(href, name, attachment.size));
+  return node;
+}
+
+/** A named, downloadable file, for anything that is not shown in place. */
+function fileChip(href, name, size) {
+  const link = document.createElement('a');
+  link.href = href;
   link.download = name;
   link.appendChild(icon(ICONS.paperclip, { size: 14 }));
+
   const label = document.createElement('span');
   label.className = 'embed-name';
   label.textContent = name;
   link.appendChild(label);
-  if (typeof attachment.size === 'number') {
-    const size = document.createElement('span');
-    size.className = 'embed-size';
-    size.textContent = fileSize(attachment.size);
-    link.appendChild(size);
+
+  if (typeof size === 'number') {
+    const bytes = document.createElement('span');
+    bytes.className = 'embed-size';
+    bytes.textContent = fileSize(size);
+    link.appendChild(bytes);
   }
-  node.appendChild(link);
-  return node;
+  return link;
 }
 
 /**
