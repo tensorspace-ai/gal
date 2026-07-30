@@ -110,7 +110,7 @@ upgrading.
   | Mode | Who posts | Who edits | Shape |
   |---|---|---|---|
   | **Document** *(default)* | anyone | anyone edits anything | threaded |
-  | **Chat** | anyone | only your own messages | flat, composer at the bottom |
+  | **Chat** | anyone | only your own messages | a channel: flat, with a composer |
   | **Announcement** | the creator | only the author | a notice with replies |
   | **Notepad** | nobody | anyone edits everything | one shared page |
   | **Frozen** | nobody | nobody | read-only |
@@ -120,13 +120,17 @@ upgrading.
   restores the thread exactly. Every rule is enforced by the server, so hiding a
   button is a convenience and never the actual protection.
 
-  ![The same wave in Chat mode: flat messages and a composer at the
-  bottom](docs/screenshots/mode-chat.png)
+  ![A wave in Chat mode, laid out as a channel: an avatar gutter, a run of
+  messages from one person under a single header, and a composer pinned below
+  the thread](docs/screenshots/mode-chat.png)
 
-  The same wave in **Chat**, seen by a participant who did not create it. The
-  nesting is gone, there is a composer at the bottom, and the other people's
-  messages are no longer editable — the mode shows as a badge rather than a
-  picker, because only the creator may change it.
+  A wave in **Chat**, seen by a participant who did not create it. Chat is drawn
+  as a channel rather than a stack of cards: the day is marked off, consecutive
+  messages from one person collapse under a single header and show their send
+  time on hover, and the composer stays below the thread instead of scrolling
+  away with it. The nesting is gone, the other people's messages are not
+  editable, and the mode shows as a badge rather than a picker, because only the
+  creator may change it.
 
   ![The same wave in Frozen mode: read-only, with a note explaining
   why](docs/screenshots/mode-frozen.png)
@@ -144,10 +148,10 @@ upgrading.
 - **Playback.** Scrub through a wave's entire edit history and watch it get
   written. This is a real replay of the op log, not a diff of saved versions.
 
-  ![Playback scrubbed to frame 96 of 275, showing the wave mid-sentence with
+  ![Playback scrubbed to frame 102 of 291, showing the wave mid-sentence with
   later replies not yet written](docs/screenshots/playback.png)
 
-  Frame 96 of 275 for the wave above. The first message stops mid-word, and the
+  Frame 102 of 291 for the wave above. The first message stops mid-word, and the
   replies that had not been written yet are empty — this is the op log replayed,
   so the granularity is a keystroke, not a save.
 - **Presence and remote cursors.** See who is in a wave and where their caret is.

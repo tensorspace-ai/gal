@@ -51,6 +51,22 @@ project's history where a plausible-looking test proved nothing:
 - The server drains one WebSocket sequentially, so flooding a single socket
   measures the socket, not the server. Use many sockets.
 
+## The README's screenshots are part of the UI
+
+`docs/screenshots/` holds four images the README leans on to describe the client.
+They are captures of a real client driven through three browser sessions, not
+drawings, which is the only reason they are worth anything — and it also means a
+UI change can quietly falsify them. If you change how the client looks,
+regenerate them and reread the prose around them:
+
+```sh
+cargo build --release -p gal-server   # the web client is compiled in
+node tools/screenshots.mjs
+```
+
+The frame numbers in the playback caption come from that run's op log, so they
+change with it. Update the text to whatever the script printed.
+
 ## Invariants that must not be broken
 
 These are load-bearing. Breaking one corrupts user data, usually silently.
@@ -171,6 +187,7 @@ crates/gal-ot/       operational transformation — the concurrency core
 crates/gal-core/     domain model (Wave → Wavelet → Blip) and wire protocol
 crates/gal-server/   axum + WebSockets + SQLite; web client under src/web/
 tests/               cross-language OT conformance + browser tests
+tools/               regenerates the README's screenshots
 ```
 
 ## Style
