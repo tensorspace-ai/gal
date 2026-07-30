@@ -420,6 +420,44 @@ pub struct WaveFlags {
     pub muted: bool,
 }
 
+// --- attachments --------------------------------------------------------
+
+id_type!(/// Identifies an uploaded file.
+    AttachmentId, "a-");
+
+/// An uploaded file, without its bytes.
+///
+/// Attachments belong to a *wavelet*, not to a wave, and that is what makes
+/// them safe: the same membership row that decides who may read a private
+/// reply decides who may fetch a file uploaded into it. A file dropped into a
+/// private thread is no more visible than the sentence next to it.
+///
+/// The whole of this struct is what a client embeds in a document, so it must
+/// stay small — an embed is one unit of a delta no matter how much JSON it
+/// carries.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub id: AttachmentId,
+    pub wavelet_id: WaveletId,
+    /// The name the uploader's file had, sanitised for display.
+    pub name: String,
+    /// What the server will actually serve this back as — never what the
+    /// uploader claimed. See `http::sniff_image`.
+    pub mime: String,
+    pub size: u64,
+    pub uploader: UserId,
+    pub created_at: Timestamp,
+}
+
+impl Attachment {
+    /// Whether this is an image the server is willing to serve inline, and a
+    /// client should therefore render rather than list.
+    pub fn is_image(&self) -> bool {
+        self.mime.starts_with("image/")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

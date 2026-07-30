@@ -946,8 +946,95 @@ textarea {
   border-radius: 4px;
 }
 
-.editor .embed {
+/* --- attachments --- */
+
+/* An embed is one indivisible character of the document, so it is `inline-block`
+   rather than a block: the caret sits before it or after it, never inside. */
+.embed {
+  display: inline-block;
+  vertical-align: bottom;
+  max-width: 100%;
   color: var(--text-faint);
+  user-select: none;
+}
+
+/* A picture takes its own line. Still one character of the document — the
+   caret goes before it or after it — but laying it out in the middle of a
+   sentence makes for a line the height of a photograph. */
+.embed-image {
+  display: block;
+  margin: 6px 0;
+}
+
+.embed-image a {
+  display: block;
+  line-height: 0;
+}
+
+.embed-image img {
+  max-width: min(420px, 100%);
+  max-height: 320px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  object-fit: contain;
+}
+
+.embed-file a {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  margin: 2px 0;
+  padding: 5px 11px 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--surface-2);
+  color: var(--text);
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.embed-file a:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.embed-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.embed-size {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* A file may be dropped anywhere in a message, and it should be obvious which
+   one is about to receive it. */
+.drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: 3px;
+  border-radius: var(--radius-sm);
+}
+
+.file-picker {
+  display: none;
+}
+
+/* Uploading takes long enough to need saying so. */
+.toolbar.busy .tool-attach {
+  color: var(--accent);
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.toolbar.busy .tool-attach,
+.toolbar.busy .file-picker {
+  pointer-events: none;
 }
 
 /* --- chat --- */

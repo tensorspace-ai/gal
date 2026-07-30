@@ -7,6 +7,7 @@
 // the model and then re-rendered.
 
 import { Delta, diffText } from './ot.js';
+import { fileSize, icon, ICONS } from './ui.js';
 
 /** Attributes that map to a wrapping element, innermost first. */
 const INLINE_TAGS = [
@@ -16,6 +17,79 @@ const INLINE_TAGS = [
   ['underline', 'u'],
   ['strike', 's'],
 ];
+
+/**
+ * What an embed contributes to the document's text.
+ *
+ * U+FFFC OBJECT REPLACEMENT CHARACTER, one UTF-16 code unit, which is exactly
+ * what an embed measures in both OT engines. The DOM walkers below hand this
+ * back for an embed node instead of descending into it, so an attachment is a
+ * single indivisible character as far as every offset in this file is
+ * concerned — including the ones sent to the server.
+ */
+const EMBED_CHAR = '￼';
+
+/** Is this node an embed — an attachment, or anything else atomic? */
+function isEmbed(node) {
+  return node.nodeType === Node.ELEMENT_NODE && node.dataset && node.dataset.embed === '1';
+}
+
+/**
+ * Build the DOM for one embed.
+ *
+ * `contenteditable="false"` is what makes it atomic: the browser will move the
+ * caret over it and delete it whole, but never put a caret inside it, so its
+ * internals can be as elaborate as they like without the text-diffing path
+ * ever seeing them.
+ */
+function renderEmbed(value) {
+  const node = document.createElement('span');
+  node.className = 'embed';
+  node.contentEditable = 'false';
+  node.dataset.embed = '1';
+
+  const attachment = value && typeof value === 'object' ? value.attachment : null;
+  if (!attachment || typeof attachment.id !== 'string') {
+    // Something a later version knows how to draw and this one does not. Show
+    // that it is there rather than silently rendering nothing.
+    node.textContent = EMBED_CHAR;
+    return node;
+  }
+
+  const href = `/api/attachments/${encodeURIComponent(attachment.id)}`;
+  const name = typeof attachment.name === 'string' ? attachment.name : 'file';
+  const link = document.createElement('a');
+  link.href = href;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+
+  if (typeof attachment.mime === 'string' && attachment.mime.startsWith('image/')) {
+    node.classList.add('embed-image');
+    const image = document.createElement('img');
+    image.src = href;
+    image.alt = name;
+    image.loading = 'lazy';
+    link.appendChild(image);
+    node.appendChild(link);
+    return node;
+  }
+
+  node.classList.add('embed-file');
+  link.download = name;
+  link.appendChild(icon(ICONS.paperclip, { size: 14 }));
+  const label = document.createElement('span');
+  label.className = 'embed-name';
+  label.textContent = name;
+  link.appendChild(label);
+  if (typeof attachment.size === 'number') {
+    const size = document.createElement('span');
+    size.className = 'embed-size';
+    size.textContent = fileSize(attachment.size);
+    link.appendChild(size);
+  }
+  node.appendChild(link);
+  return node;
+}
 
 /**
  * Only allow link schemes that cannot execute script. An attacker who can type
@@ -60,14 +134,7 @@ export function renderDelta(root, delta) {
 
   for (const op of delta.ops) {
     if (typeof op.insert !== 'string') {
-      if (op.insert !== undefined) {
-        // Embeds are not produced by this build, but render defensively rather
-        // than dropping content silently.
-        const span = document.createElement('span');
-        span.className = 'embed';
-        span.textContent = '￼';
-        root.appendChild(span);
-      }
+      if (op.insert !== undefined) root.appendChild(renderEmbed(op.insert));
       continue;
     }
     const lines = op.insert.split('\n');
@@ -95,6 +162,10 @@ export function readText(root) {
         text += child.data;
       } else if (child.nodeName === 'BR') {
         if (!child.dataset || !child.dataset.trailing) text += '\n';
+      } else if (isEmbed(child)) {
+        // One character, whatever it contains. Descending would read an
+        // image's alt text or a filename back as if it were typed.
+        text += EMBED_CHAR;
       } else {
         walk(child);
       }
@@ -113,6 +184,16 @@ export function domToIndex(root, node, offset) {
     if (found) return;
     for (const child of current.childNodes) {
       if (found) return;
+      if (isEmbed(child)) {
+        // A selection that lands anywhere inside an embed is at its start:
+        // there are no positions within one.
+        if (child === node || child.contains(node)) {
+          found = true;
+          return;
+        }
+        index += 1;
+        continue;
+      }
       if (child === node && child.nodeType !== Node.TEXT_NODE) {
         // Selection anchored to an element: offset counts child nodes.
         for (let i = 0; i < offset && i < child.childNodes.length; i += 1) {
@@ -149,6 +230,7 @@ export function domToIndex(root, node, offset) {
 function lengthOf(node) {
   if (node.nodeType === Node.TEXT_NODE) return node.data.length;
   if (node.nodeName === 'BR') return node.dataset && node.dataset.trailing ? 0 : 1;
+  if (isEmbed(node)) return 1;
   let total = 0;
   for (const child of node.childNodes) total += lengthOf(child);
   return total;
@@ -179,6 +261,13 @@ export function indexToDom(root, index) {
           }
           remaining -= 1;
         }
+      } else if (isEmbed(child)) {
+        if (remaining === 0) {
+          const parent = child.parentNode;
+          result = { node: parent, offset: Array.prototype.indexOf.call(parent.childNodes, child) };
+          return;
+        }
+        remaining -= 1;
       } else {
         walk(child);
       }
@@ -235,11 +324,15 @@ function isLowSurrogate(code) {
  * responsible for sending it; call `applyRemote` to fold in other people's ops.
  */
 export class Editor {
-  constructor(element, doc, { onChange, onSelectionChange, readOnly = false } = {}) {
+  constructor(element, doc, { onChange, onSelectionChange, onFiles, readOnly = false } = {}) {
     this.root = element;
     this.doc = doc; // a Delta
     this.onChange = onChange || (() => {});
     this.onSelectionChange = onSelectionChange || (() => {});
+    /// Called with a FileList's worth of files dropped or pasted in. The owner
+    /// uploads them and calls `insertEmbed`; the editor has no idea what a
+    /// server is.
+    this.onFiles = onFiles || null;
     this.composing = false;
     this.pendingFormat = null;
     this.destroyed = false;
@@ -263,6 +356,9 @@ export class Editor {
       keyup: () => this.reportSelection(),
       mouseup: () => this.reportSelection(),
       focus: () => this.reportSelection(),
+      dragover: (e) => this.onDragOver(e),
+      dragleave: () => this.root.classList.remove('drop-target'),
+      drop: (e) => this.onDrop(e),
     };
     for (const [event, handler] of Object.entries(this.handlers)) {
       this.root.addEventListener(event, handler);
@@ -347,8 +443,36 @@ export class Editor {
 
   onPaste(event) {
     event.preventDefault();
-    const text = (event.clipboardData || window.clipboardData).getData('text/plain');
+    const data = event.clipboardData || window.clipboardData;
+    // A screenshot on the clipboard arrives as a file with no text beside it,
+    // which is how pasting a picture into a message works everywhere else.
+    const files = data && data.files ? Array.from(data.files) : [];
+    if (files.length > 0 && this.onFiles) {
+      this.onFiles(files, this.getSelection());
+      return;
+    }
+    const text = data.getData('text/plain');
     if (text) this.replaceSelection(text.replace(/\r\n?/g, '\n'));
+  }
+
+  /** Only claim a drag that is actually carrying files. */
+  onDragOver(event) {
+    if (!this.onFiles || !event.dataTransfer) return;
+    if (!Array.from(event.dataTransfer.types || []).includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    this.root.classList.add('drop-target');
+  }
+
+  onDrop(event) {
+    this.root.classList.remove('drop-target');
+    if (!this.onFiles || !event.dataTransfer) return;
+    const files = Array.from(event.dataTransfer.files || []);
+    if (files.length === 0) return;
+    // Only now: letting the browser handle a file drop into a contenteditable
+    // splices a copy of it into the DOM that the model knows nothing about.
+    event.preventDefault();
+    this.onFiles(files, null);
   }
 
   /** Read the DOM after the browser edited it, and turn it into an op. */
@@ -402,6 +526,31 @@ export class Editor {
     this.onChange(delta);
     renderDelta(this.root, this.doc);
     this.setSelection(selection.index + text.length);
+    this.reportSelection();
+  }
+
+  /**
+   * Insert an embed at `at`, or at the caret, as one op.
+   *
+   * `at` exists because uploading takes a moment and opening a file picker
+   * takes the focus: the caret is captured when the file is chosen, not when
+   * the bytes come back.
+   */
+  insertEmbed(value, at = null) {
+    const selection = at ||
+      this.getSelection() || { index: this.doc.toPlainText().length, length: 0 };
+
+    const delta = new Delta()
+      .retain(selection.index)
+      .delete(selection.length)
+      .insert(value);
+
+    this.pendingFormat = null;
+    this.doc = this.doc.apply(delta);
+    this.onChange(delta);
+    renderDelta(this.root, this.doc);
+    // An embed is one unit wide, whatever it draws.
+    this.setSelection(selection.index + 1);
     this.reportSelection();
   }
 

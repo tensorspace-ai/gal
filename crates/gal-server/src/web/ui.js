@@ -99,6 +99,20 @@ export function avatar(user, { size = 28, title = true } = {}) {
   });
 }
 
+/** A file size a person would read out loud. */
+export function fileSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['kB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;

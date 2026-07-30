@@ -98,7 +98,12 @@ someone types an emoji.
 
 A wave can contain a private reply that only some participants may see. Any code
 path that returns content must filter by *wavelet* participation — live updates,
-snapshots, search, inbox summaries, playback, **and presence**.
+snapshots, search, inbox summaries, playback, presence, **and attachments**.
+
+Attachments are the reason `attachments.wavelet_id` exists rather than a
+`wave_id`: `Storage::attachment_for` joins through `participants`, so there is no
+way to get the bytes without the membership test. A wave-scoped check would hand
+a file uploaded into a private reply to everyone else in the wave.
 
 Presence is the easy one to miss: an unscoped presence list names the blip each
 person is editing, which reveals that a private thread exists and when it is
@@ -177,6 +182,13 @@ other request, WebSockets included.
   same-*site*, so a sibling subdomain still qualifies.
 - Do not expose a full user directory. `/api/users` returns only people the
   caller already shares a wave with.
+- An uploaded file is served inline only when its own bytes identify it as a
+  PNG, JPEG, GIF or WebP. Everything else — including a file *named* `.png`, and
+  including SVG, which can carry script — goes out as
+  `application/octet-stream` with `Content-Disposition: attachment`. Do not
+  widen this to trust the uploader's `Content-Type` or the extension: `script-src
+  'self'` allows same-origin scripts, so a stored file served inline as HTML runs
+  in every participant's session.
 - Report security-relevant findings rather than quietly fixing them in a large
   unrelated change.
 

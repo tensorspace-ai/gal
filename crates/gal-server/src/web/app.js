@@ -541,6 +541,7 @@ function renderComposer() {
   // touch it.
   const composer = new Editor(field, new Delta(), {
     onChange: () => {},
+    onFiles: (files, at) => uploadInto(composer, files, at),
     // Without this the toolbar and ⌘B have nothing to act on while the only
     // thing being typed into is the composer.
     onSelectionChange: () => {
@@ -549,6 +550,7 @@ function renderComposer() {
     },
   });
   composer.toolsHost = tools;
+  composer.waveletId = root.id;
   state.composer = composer;
 
   const send = () => {
@@ -923,6 +925,7 @@ function blipElement(blip, depth, { grouped = false } = {}) {
 
     const editor = new Editor(editorRoot, doc.doc, {
       onChange: (delta) => onLocalEdit(blip.id, delta),
+      onFiles: (files, at) => uploadInto(editor, files, at),
       onSelectionChange: (selection) => {
         state.activeEditor = editor;
         dockToolbar();
@@ -938,6 +941,7 @@ function blipElement(blip, depth, { grouped = false } = {}) {
     // Keep the model and the editor pointing at the same document object.
     editor.doc = doc.doc;
     editor.blipId = blip.id;
+    editor.waveletId = blip.waveletId;
     editor.toolsHost = tools;
     state.editors.set(blip.id, editor);
   }
@@ -1120,7 +1124,99 @@ function buildToolbar() {
       updateToolbar();
     },
   }, [icon(ICONS.link)]));
+
+  // Hidden, and clicked by the button beside it: a bare file input cannot be
+  // styled to match anything.
+  const picker = el('input', {
+    class: 'file-picker',
+    type: 'file',
+    multiple: true,
+    onChange: (event) => {
+      const files = Array.from(event.target.files || []);
+      // Cleared so that choosing the same file twice running still fires.
+      event.target.value = '';
+      const editor = bar.pendingEditor || state.activeEditor;
+      const at = bar.pendingSelection;
+      bar.pendingEditor = null;
+      bar.pendingSelection = null;
+      if (files.length > 0) uploadInto(editor, files, at);
+    },
+  });
+
+  bar.appendChild(el('button', {
+    class: 'tool tool-attach',
+    type: 'button',
+    title: 'Attach a file',
+    'aria-label': 'Attach a file',
+    onMousedown: (e) => e.preventDefault(),
+    onClick: () => {
+      const editor = state.activeEditor;
+      if (!editor || !editor.waveletId) {
+        toast('Put the caret in a message first.');
+        return;
+      }
+      // Opening the picker takes the focus and the upload takes a moment, so
+      // where the file should land is decided now rather than on the way back.
+      bar.pendingEditor = editor;
+      bar.pendingSelection = editor.getSelection();
+      picker.click();
+    },
+  }, [icon(ICONS.paperclip)]));
+  bar.appendChild(picker);
   return bar;
+}
+
+// --- attachments --------------------------------------------------------
+
+async function uploadFile(waveletId, file) {
+  const path =
+    `/api/wavelets/${encodeURIComponent(waveletId)}/attachments` +
+    `?name=${encodeURIComponent(file.name || 'file')}`;
+  // The body is the file itself. What the browser calls it is a hint the server
+  // does not trust — it identifies images by their bytes.
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    body: file,
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || 'That file could not be uploaded.');
+  return { id: body.id, name: body.name, mime: body.mime, size: body.size };
+}
+
+/**
+ * Upload files and embed them in `editor`, starting at `at`.
+ *
+ * One at a time, so several files land in the order they were chosen rather
+ * than in the order the network happened to finish them.
+ */
+async function uploadInto(editor, files, at) {
+  if (!editor || !editor.waveletId) return;
+  const bar = state.toolbar;
+  if (bar) bar.classList.add('busy');
+  let selection = at || editor.getSelection();
+
+  try {
+    for (const file of files) {
+      const attachment = await uploadFile(editor.waveletId, file);
+      // The editor may have been rebuilt underneath us while the bytes were in
+      // flight; writing into a detached node would lose the file silently.
+      const target = editor.blipId ? state.editors.get(editor.blipId) : editor;
+      if (!target || !target.root.isConnected) {
+        toast('That message went away while the file was uploading.', 'error');
+        return;
+      }
+      target.insertEmbed({ attachment }, selection);
+      // The next file goes after this one, not on top of it.
+      selection = selection ? { index: selection.index + 1, length: 0 } : null;
+    }
+  } catch (e) {
+    // A refusal is nearly always the size limit or the daily quota, and the
+    // rest of the batch would be refused for the same reason.
+    toast(e.message, 'error');
+  } finally {
+    if (bar) bar.classList.remove('busy');
+  }
 }
 
 /**

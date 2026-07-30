@@ -98,6 +98,26 @@ fn bad_request(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+fn not_found(message: impl Into<String>) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError {
+            error: message.into(),
+        }),
+    )
+        .into_response()
+}
+
+fn payload_too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(ApiError {
+            error: "That file is too large. The limit is 10 MB.".into(),
+        }),
+    )
+        .into_response()
+}
+
 fn server_error(e: anyhow::Error) -> Response {
     tracing::error!(error = %e, "request failed");
     (
@@ -364,6 +384,206 @@ async fn lookup(
     }
 }
 
+// --- attachments --------------------------------------------------------
+
+/// Largest single upload. Bytes live in the database, so this is also the
+/// largest row Gal will ever write.
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+/// How much one account may upload per day.
+const UPLOAD_QUOTA_BYTES: u64 = 200 * 1024 * 1024;
+const UPLOAD_QUOTA_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Images the server is willing to serve back with their real content type.
+///
+/// Recognised by magic bytes rather than by what the uploader called the file.
+/// Everything else — including SVG, which is a document that can carry script —
+/// is served as an opaque download, so there is no path from "upload a file" to
+/// "run script on this origin".
+fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    let starts = |prefix: &[u8]| bytes.starts_with(prefix);
+    if starts(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if starts(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if starts(b"GIF87a") || starts(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() > 12 && starts(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Reduce an uploaded filename to something safe to show and to echo back in a
+/// header: no directory components, no control characters, no quotes.
+fn clean_filename(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .take(120)
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Percent-encode for the `filename*` form of `Content-Disposition`, which is
+/// the only one that can carry a name that is not ASCII.
+fn encode_filename(name: &str) -> String {
+    let mut out = String::new();
+    for byte in name.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    #[serde(default)]
+    name: String,
+}
+
+/// Accept a file for one wavelet.
+///
+/// The body is the file itself rather than a multipart form: there is one field
+/// and no form to speak of, and a raw body needs no parser between the network
+/// and the bytes.
+async fn upload_attachment(
+    State(state): State<Arc<AppState>>,
+    identity: Identity,
+    axum::extract::Path(wavelet_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<UploadQuery>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let wavelet_id = gal_core::model::WaveletId(wavelet_id);
+
+    // The membership check comes first: a stranger must not be able to learn
+    // that a wavelet exists, or to spend the server's disk on one.
+    match state
+        .db
+        .is_wavelet_participant(&identity.user.id, &wavelet_id)
+        .await
+    {
+        Ok(true) => {}
+        // Same answer for "no such wavelet" and "not yours", so this cannot be
+        // used to probe for private replies.
+        Ok(false) => return not_found("No such conversation."),
+        Err(e) => return server_error(e),
+    }
+
+    if body.is_empty() {
+        return bad_request("That file is empty.");
+    }
+    if body.len() > MAX_ATTACHMENT_BYTES {
+        return payload_too_large();
+    }
+
+    let since = gal_core::model::now() - UPLOAD_QUOTA_WINDOW_MS;
+    match state
+        .db
+        .attachment_bytes_since(&identity.user.id, since)
+        .await
+    {
+        Ok(used) if used + body.len() as u64 > UPLOAD_QUOTA_BYTES => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ApiError {
+                    error: "You have uploaded too much today. Try again tomorrow.".into(),
+                }),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return server_error(e),
+    }
+
+    // What the file *is*, never what it was called or what the client declared.
+    // A name ending in .png proves nothing, and believing it is how an upload
+    // endpoint turns into a way to serve HTML from your own origin.
+    let mime = sniff_image(&body)
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let name = clean_filename(if query.name.is_empty() {
+        headers
+            .get("x-gal-filename")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("file")
+    } else {
+        &query.name
+    });
+
+    match state
+        .db
+        .create_attachment(
+            wavelet_id,
+            identity.user.id.clone(),
+            name,
+            mime,
+            body.into(),
+        )
+        .await
+    {
+        Ok(attachment) => (StatusCode::CREATED, Json(attachment)).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+/// Serve an attachment to someone in the wavelet it belongs to.
+async fn get_attachment(
+    State(state): State<Arc<AppState>>,
+    identity: Identity,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let id = gal_core::model::AttachmentId(id);
+    let (attachment, bytes) = match state.db.attachment_for(&identity.user.id, &id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return not_found("No such attachment."),
+        Err(e) => return server_error(e),
+    };
+
+    // Images were identified by their own bytes on the way in, so they can be
+    // rendered in place. Anything else is handed over as an opaque download,
+    // which is what stops an uploaded page from ever being a page on this
+    // origin.
+    let disposition = if attachment.is_image() {
+        format!(
+            "inline; filename=\"{}\"; filename*=UTF-8''{}",
+            attachment.name,
+            encode_filename(&attachment.name)
+        )
+    } else {
+        format!(
+            "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+            attachment.name,
+            encode_filename(&attachment.name)
+        )
+    };
+
+    let mut response_headers = HeaderMap::new();
+    if let Ok(value) = attachment.mime.parse() {
+        response_headers.insert(header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = disposition.parse() {
+        response_headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    // Immutable: the id names these exact bytes and nothing ever rewrites them.
+    if let Ok(value) = "private, max-age=31536000, immutable".parse() {
+        response_headers.insert(header::CACHE_CONTROL, value);
+    }
+    (response_headers, bytes).into_response()
+}
+
 /// Liveness and readiness. Touches the database, so it fails when the server
 /// cannot actually serve. Registered before the SPA fallback, which would
 /// otherwise answer every probe path with 200 and hide real outages.
@@ -496,6 +716,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/users", get(users))
         .route("/api/lookup", get(lookup))
         .route("/api/server", get(server_info))
+        .route(
+            "/api/wavelets/{wavelet_id}/attachments",
+            // The default body limit is 2 MB, which would reject most photographs
+            // long before the handler's own check could explain why.
+            post(upload_attachment).layer(axum::extract::DefaultBodyLimit::max(
+                MAX_ATTACHMENT_BYTES + 1024,
+            )),
+        )
+        .route("/api/attachments/{id}", get(get_attachment))
         // Before the fallback, so it is a real signal rather than the app shell.
         .route("/healthz", get(health))
         .route("/ws", get(crate::ws::handler))
@@ -520,6 +749,47 @@ mod tests {
         // unknown-user path would get measurably faster than the known-user one.
         assert!(argon2::password_hash::PasswordHash::new(DUMMY_HASH).is_ok());
         assert!(!auth::verify_password("anything", DUMMY_HASH));
+    }
+
+    #[test]
+    fn an_image_is_recognised_by_its_bytes_and_nothing_else() {
+        assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(sniff_image(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(sniff_image(b"GIF89a...."), Some("image/gif"));
+        assert_eq!(sniff_image(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+
+        // The whole point: a name proves nothing. Both of these would be served
+        // inline as HTML by anything that trusted the extension or the
+        // uploader's Content-Type, and both would then run script on this
+        // origin.
+        assert_eq!(sniff_image(b"<script>alert(1)</script>"), None);
+        assert_eq!(
+            sniff_image(b"<svg xmlns='http://www.w3.org/2000/svg'><script/></svg>"),
+            None
+        );
+        assert_eq!(sniff_image(b""), None);
+        assert_eq!(sniff_image(b"RIFF"), None, "a short prefix is not a match");
+    }
+
+    #[test]
+    fn filenames_are_stripped_of_paths_and_anything_a_header_cannot_carry() {
+        assert_eq!(clean_filename("plan.png"), "plan.png");
+        assert_eq!(clean_filename("../../etc/passwd"), "passwd");
+        assert_eq!(clean_filename("C:\\Users\\me\\notes.txt"), "notes.txt");
+        // A quote or a newline here would end the Content-Disposition value
+        // early and let the rest be read as further header content.
+        assert_eq!(clean_filename("a\"b\nc.txt"), "abc.txt");
+        assert_eq!(clean_filename("   "), "file");
+        assert_eq!(clean_filename(""), "file");
+        assert_eq!(clean_filename("...."), "file");
+        assert!(clean_filename(&"x".repeat(500)).chars().count() <= 120);
+    }
+
+    #[test]
+    fn non_ascii_filenames_survive_as_the_encoded_form() {
+        assert_eq!(encode_filename("plan.png"), "plan.png");
+        assert_eq!(encode_filename("a b"), "a%20b");
+        assert_eq!(encode_filename("é"), "%C3%A9");
     }
 
     #[test]

@@ -25,7 +25,14 @@ will bump the minor version and be listed here.
 - Playback of a wave's entire edit history, replayed from the op log.
 - Presence and remote cursors, scoped to what each viewer may see.
 - Rich text (bold, italic, underline, strikethrough, code, links) carried as
-  document attributes, so formatting survives concurrent edits.
+  document attributes, so formatting survives concurrent edits. The formatting
+  controls dock to whichever input holds the caret.
+- Attachments, by drag and drop, paste, or the paperclip. They are embedded
+  objects in the document rather than metadata beside it, so they transform
+  against concurrent edits; they belong to a wavelet, so a file in a private
+  reply is as private as its text; and they are stored in the database, so a
+  backup includes them. Images are identified by their magic bytes and
+  everything else is served as an opaque download.
 - Full-text search with highlighting, scoped to waves you participate in.
 - Per-revision unread tracking: editing a message you had read makes it unread
   again.

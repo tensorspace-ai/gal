@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 use gal_core::model::*;
 use gal_core::protocol::*;
-use gal_ot::Delta;
+use gal_ot::{Delta, Insert, OpKind};
 use std::sync::Arc as StdArc;
 use tokio::sync::{mpsc, Mutex, Notify};
 
@@ -184,6 +184,7 @@ async fn dispatch(
             delta,
             op_id,
         } => {
+            check_embeds(&delta).map_err(|e| *e)?;
             let (_, wave) = find_blip(state, session, &blip_id).await?;
             let mut live = wave.lock().await;
             state
@@ -1051,7 +1052,41 @@ fn seed_content(content: Option<Delta>) -> Result<Option<Delta>, Box<ServerMessa
             "That message is too large.",
         )));
     }
+    check_embeds(&content)?;
     Ok(Some(content))
+}
+
+/// Largest embed payload, serialised.
+///
+/// An embed counts as one unit of a document however much JSON it carries, so
+/// the length limits above say nothing about its size. An attachment reference
+/// is a few hundred bytes; this leaves room for that and no room for using a
+/// document as general-purpose storage.
+const MAX_EMBED_BYTES: usize = 1024;
+
+/// Reject embeds that are not small JSON objects.
+///
+/// Deltas accept an arbitrary JSON value as an embed, which is what lets one
+/// carry an attachment reference — and, unchecked, anything else a client cares
+/// to invent.
+fn check_embeds(delta: &Delta) -> Result<(), Box<ServerMessage>> {
+    for op in &delta.ops {
+        let OpKind::Insert(Insert::Embed(value)) = &op.kind else {
+            continue;
+        };
+        let too_big = !value.is_object()
+            || serde_json::to_string(value)
+                .map(|s| s.len())
+                .unwrap_or(usize::MAX)
+                > MAX_EMBED_BYTES;
+        if too_big {
+            return Err(Box::new(ServerMessage::error(
+                ErrorCode::BadRequest,
+                "That embedded object is not something this server accepts.",
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Reject commands naming a wave the caller does not participate in.
@@ -1106,5 +1141,29 @@ mod tests {
             "control characters are stripped"
         );
         assert_eq!(normalise_title(&"x".repeat(500)).chars().count(), 200);
+    }
+
+    #[test]
+    fn embeds_must_be_small_objects() {
+        let attachment = serde_json::json!({
+            "attachment": { "id": "a-1", "name": "plan.png", "mime": "image/png", "size": 4096 }
+        });
+        let ok = Delta::new().embed(attachment);
+        assert!(check_embeds(&ok).is_ok());
+
+        // An embed is one unit of a document however much it carries, so
+        // nothing else bounds this.
+        let huge = serde_json::json!({ "blob": "x".repeat(MAX_EMBED_BYTES) });
+        let too_big = Delta::new().embed(huge);
+        assert!(check_embeds(&too_big).is_err());
+
+        // A bare scalar is not something any client of this server produces.
+        let scalar = Delta::new().embed(serde_json::json!("hello"));
+        assert!(check_embeds(&scalar).is_err());
+    }
+
+    #[test]
+    fn ordinary_text_passes_the_embed_check() {
+        assert!(check_embeds(&Delta::document("just words")).is_ok());
     }
 }

@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use gal_core::model::*;
 use gal_core::protocol::{PlaybackFrame, SearchHit, WaveSummary};
-use gal_ot::Delta;
+use gal_ot::{Delta, Insert, OpKind};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
@@ -32,7 +32,7 @@ pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// table, so without this a new column would simply never be added: the server
 /// would start cleanly, then fail at query time in ways that look like data loss
 /// to the user.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The version `schema.sql` describes.
 ///
@@ -947,6 +947,134 @@ impl Storage {
         .await
     }
 
+    // --- attachments ----------------------------------------------------
+
+    /// Is this user a member of this specific wavelet?
+    ///
+    /// Wavelet-scoped, not wave-scoped, and deliberately so: a wave's other
+    /// participants must not be able to fetch a file uploaded into a private
+    /// reply they were left out of.
+    pub async fn is_wavelet_participant(
+        &self,
+        user_id: &UserId,
+        wavelet_id: &WaveletId,
+    ) -> Result<bool> {
+        let (u, s) = (user_id.clone(), wavelet_id.clone());
+        self.run(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM participants
+                                WHERE wavelet_id = ?2 AND user_id = ?1)",
+                params![u.as_str(), s.as_str()],
+                |r| r.get::<_, i64>(0).map(|n| n != 0),
+            )?)
+        })
+        .await
+    }
+
+    /// Store an uploaded file and return its metadata.
+    ///
+    /// The bytes live in the database rather than beside it, which keeps the
+    /// promise that a deployment is one file: back Gal up by copying `gal.db`,
+    /// and the attachments come with it. It is also what makes the access check
+    /// on the way out a join rather than a second thing to keep in step.
+    pub async fn create_attachment(
+        &self,
+        wavelet_id: WaveletId,
+        uploader: UserId,
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+    ) -> Result<Attachment> {
+        let attachment = Attachment {
+            id: AttachmentId::new(),
+            wavelet_id,
+            name,
+            mime,
+            size: bytes.len() as u64,
+            uploader,
+            created_at: now(),
+        };
+        let stored = attachment.clone();
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO attachments
+                     (id, wavelet_id, uploader, name, mime, size, created_at, bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    stored.id.as_str(),
+                    stored.wavelet_id.as_str(),
+                    stored.uploader.as_str(),
+                    stored.name,
+                    stored.mime,
+                    stored.size as i64,
+                    stored.created_at,
+                    bytes,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?;
+        Ok(attachment)
+    }
+
+    /// Fetch an attachment, but only for someone who is in the wavelet it was
+    /// uploaded into.
+    ///
+    /// The membership test is part of the query rather than a separate call, so
+    /// there is no version of this that returns bytes without it.
+    pub async fn attachment_for(
+        &self,
+        user_id: &UserId,
+        id: &AttachmentId,
+    ) -> Result<Option<(Attachment, Vec<u8>)>> {
+        let (u, a) = (user_id.clone(), id.clone());
+        self.run(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT a.id, a.wavelet_id, a.uploader, a.name, a.mime, a.size,
+                            a.created_at, a.bytes
+                     FROM attachments a
+                     JOIN participants p ON p.wavelet_id = a.wavelet_id AND p.user_id = ?1
+                     WHERE a.id = ?2",
+                    params![u.as_str(), a.as_str()],
+                    |r| {
+                        Ok((
+                            Attachment {
+                                id: AttachmentId(r.get(0)?),
+                                wavelet_id: WaveletId(r.get(1)?),
+                                uploader: UserId(r.get(2)?),
+                                name: r.get(3)?,
+                                mime: r.get(4)?,
+                                size: r.get::<_, i64>(5)? as u64,
+                                created_at: r.get(6)?,
+                            },
+                            r.get::<_, Vec<u8>>(7)?,
+                        ))
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// How much this user has uploaded since `since`, in bytes.
+    ///
+    /// Uploads are the one place where an ordinary participant can make the
+    /// server spend disk, so there is a ceiling on it.
+    pub async fn attachment_bytes_since(&self, user_id: &UserId, since: Timestamp) -> Result<u64> {
+        let u = user_id.clone();
+        self.run(move |conn| {
+            let total: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(size), 0) FROM attachments
+                 WHERE uploader = ?1 AND created_at >= ?2",
+                params![u.as_str(), since],
+                |r| r.get(0),
+            )?;
+            Ok(total.max(0) as u64)
+        })
+        .await
+    }
+
     // --- playback and search --------------------------------------------
 
     /// Every op ever applied in a wave, oldest first, restricted to wavelets the
@@ -1134,6 +1262,34 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tracing::debug!("migrated database schema to v3");
     }
 
+    if version == 3 {
+        let tx = conn.transaction()?;
+        // Keyed to the wavelet, which is where access control lives: the join
+        // that fetches an attachment is the same membership test that decides
+        // who may read the private reply it was uploaded into. ON DELETE
+        // CASCADE means removing a wave takes its files with it rather than
+        // leaving unreachable blobs behind.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS attachments (
+                 id         TEXT PRIMARY KEY,
+                 wavelet_id TEXT NOT NULL REFERENCES wavelets(id) ON DELETE CASCADE,
+                 uploader   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 name       TEXT NOT NULL,
+                 mime       TEXT NOT NULL,
+                 size       INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 bytes      BLOB NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS attachments_wavelet ON attachments(wavelet_id);
+             CREATE INDEX IF NOT EXISTS attachments_uploader
+                 ON attachments(uploader, created_at);",
+        )?;
+        tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+        version = 4;
+        tracing::debug!("migrated database schema to v4");
+    }
+
     if version < SCHEMA_VERSION {
         anyhow::bail!(
             "no migration available from schema v{version} to v{SCHEMA_VERSION}; \
@@ -1259,10 +1415,12 @@ fn index_blip(tx: &rusqlite::Transaction<'_>, blip: &Blip) -> Result<()> {
     )?;
     tx.execute(
         "INSERT INTO blip_search (blip_id, wave_id, body) VALUES (?1, ?2, ?3)",
+        // Indexed as display text, so a file can be found by its name. Nothing
+        // reads offsets back out of this index, only snippets.
         params![
             blip.id.as_str(),
             blip.wave_id.as_str(),
-            blip.content.to_plain_text()
+            display_text(&blip.content)
         ],
     )?;
     Ok(())
@@ -1319,8 +1477,39 @@ fn highlight_snippet(raw: &str) -> String {
 }
 
 /// First meaningful line of a delta, for inbox snippets.
+/// Plain text for *reading*, as opposed to the projection offsets are measured
+/// against.
+///
+/// `Delta::to_plain_text` renders every embed as one object-replacement
+/// character, which is what keeps it aligned with the UTF-16 offsets an op
+/// addresses — and is also why a message that is nothing but a photograph shows
+/// up in an inbox as a single tofu box. Nothing here is used for offset
+/// arithmetic, so an attachment can be named instead.
+fn display_text(delta: &Delta) -> String {
+    let mut out = String::new();
+    for op in &delta.ops {
+        match &op.kind {
+            OpKind::Insert(Insert::Text(s)) => out.push_str(s),
+            OpKind::Insert(Insert::Embed(value)) => {
+                let name = value
+                    .get("attachment")
+                    .and_then(|a| a.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    out.push('\u{fffc}');
+                } else {
+                    out.push_str(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn snippet_of(delta: &Delta, max_chars: usize) -> String {
-    let text = delta.to_plain_text();
+    let text = display_text(delta);
     let line = text
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -1717,6 +1906,175 @@ mod tests {
         assert!(hits.is_empty(), "carol must not find a private reply");
         let hits = storage.search(&bob.id, "between us").await.unwrap();
         assert_eq!(hits.len(), 1, "bob is a participant and should find it");
+    }
+
+    #[tokio::test]
+    async fn an_attachment_is_readable_only_inside_the_wavelet_it_was_uploaded_to() {
+        let (storage, _dir) = temp_storage().await;
+        let alice = make_user(&storage, "alice").await;
+        let bob = make_user(&storage, "bob").await;
+        let carol = make_user(&storage, "carol").await;
+        let mallory = make_user(&storage, "mallory").await;
+
+        let (wave, root) = storage
+            .create_wave(
+                alice.id.clone(),
+                "Team".into(),
+                vec![alice.id.clone(), bob.id.clone(), carol.id.clone()],
+                WaveMode::Document,
+            )
+            .await
+            .unwrap();
+
+        let private = Wavelet {
+            id: WaveletId::new(),
+            wave_id: wave.id.clone(),
+            kind: WaveletKind::PrivateReply,
+            title: "aside".into(),
+            participants: vec![alice.id.clone(), bob.id.clone()],
+            anchor_blip: None,
+            created_at: now(),
+            last_modified: now(),
+        };
+        storage.create_wavelet(private.clone()).await.unwrap();
+
+        let shared = storage
+            .create_attachment(
+                root.id.clone(),
+                alice.id.clone(),
+                "plan.png".into(),
+                "image/png".into(),
+                b"public bytes".to_vec(),
+            )
+            .await
+            .unwrap();
+        let secret = storage
+            .create_attachment(
+                private.id.clone(),
+                alice.id.clone(),
+                "salary.pdf".into(),
+                "application/octet-stream".into(),
+                b"secret bytes".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        // Everyone in the conversation can read what was uploaded into it.
+        for user in [&alice, &bob, &carol] {
+            let found = storage.attachment_for(&user.id, &shared.id).await.unwrap();
+            assert_eq!(
+                found.map(|(_, bytes)| bytes),
+                Some(b"public bytes".to_vec())
+            );
+        }
+
+        // Carol is a full participant in the wave and still must not reach a
+        // file uploaded into a private reply she is not in. This is the whole
+        // reason attachments hang off a wavelet rather than a wave.
+        assert!(storage
+            .attachment_for(&carol.id, &secret.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .attachment_for(&bob.id, &secret.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        // And a stranger reaches nothing at all.
+        for id in [&shared.id, &secret.id] {
+            assert!(storage
+                .attachment_for(&mallory.id, id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn uploads_count_towards_a_daily_total() {
+        let (storage, _dir) = temp_storage().await;
+        let alice = make_user(&storage, "alice").await;
+        let bob = make_user(&storage, "bob").await;
+        let (_, root) = storage
+            .create_wave(
+                alice.id.clone(),
+                "Team".into(),
+                vec![alice.id.clone(), bob.id.clone()],
+                WaveMode::Document,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.attachment_bytes_since(&alice.id, 0).await.unwrap(),
+            0
+        );
+        storage
+            .create_attachment(
+                root.id.clone(),
+                alice.id.clone(),
+                "a.bin".into(),
+                "application/octet-stream".into(),
+                vec![0u8; 512],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.attachment_bytes_since(&alice.id, 0).await.unwrap(),
+            512
+        );
+        // Per uploader, not per server: Bob's allowance is his own.
+        assert_eq!(storage.attachment_bytes_since(&bob.id, 0).await.unwrap(), 0);
+        // And bounded by the window, or a quota would never refill.
+        assert_eq!(
+            storage
+                .attachment_bytes_since(&alice.id, now() + 60_000)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attached_file_is_findable_by_its_name() {
+        let (storage, _dir) = temp_storage().await;
+        let alice = make_user(&storage, "alice").await;
+        let (wave, wavelet) = storage
+            .create_wave(
+                alice.id.clone(),
+                "Notes".into(),
+                vec![alice.id.clone()],
+                WaveMode::Document,
+            )
+            .await
+            .unwrap();
+
+        let mut blip = Blip::new(
+            wave.id.clone(),
+            wavelet.id.clone(),
+            alice.id.clone(),
+            None,
+            0,
+        );
+        blip.content = Delta::new().insert("see ").embed(serde_json::json!({
+            "attachment": { "id": "a-1", "name": "quarterly-plan.pdf", "mime": "text/plain", "size": 12 }
+        }));
+        blip.revision = 1;
+        storage.insert_blip(blip).await.unwrap();
+
+        let hits = storage.search(&alice.id, "quarterly").await.unwrap();
+        assert_eq!(hits.len(), 1, "a file's name is part of the message");
+
+        // And the inbox names it rather than showing a replacement character.
+        let summary = &storage.inbox(&alice.id).await.unwrap()[0];
+        assert!(
+            summary.snippet.contains("quarterly-plan.pdf"),
+            "snippet was {:?}",
+            summary.snippet
+        );
+        assert!(!summary.snippet.contains('\u{fffc}'));
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@
 
 import { chromium } from 'playwright-core';
 import { spawn, execSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -470,6 +470,99 @@ try {
   await mAlice.waitForTimeout(500);
   check('notepad stays editable by everyone', await editable(mAlice, '.blip .editor'));
   check('notepad adds no new messages', !(await mAlice.isVisible('.thread-foot .btn')));
+
+  // --- attachments ------------------------------------------------------
+
+  section('Attachments');
+  // A real 4×4 PNG. The server identifies images by their magic bytes, so a
+  // fabricated file would be served back as a download and prove nothing.
+  const PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEUlEQVR4nGP8z4AAT' +
+      'AxDkw0AV/oCAxTgLGcAAAAASUVORK5CYII=',
+    'base64',
+  );
+  writeFileSync(join(dataDir, 'diagram.png'), PNG);
+  writeFileSync(join(dataDir, 'notes.txt'), 'the migration plan, in full\n');
+  // HTML wearing a .png extension. Believing the name is how an upload
+  // endpoint becomes a way to serve script from your own origin.
+  writeFileSync(join(dataDir, 'trojan.png'), '<script>window.__pwned = 1;</script>');
+
+  const fAlice = await signUp('files_alice');
+  const fBob = await signUp('files_bob');
+  const outsider = await signUp('files_nemo');
+  await createWave(fAlice, 'With files');
+  await addParticipant(fAlice, 'files_bob');
+  await fBob.waitForSelector('.inbox-row', { timeout: 15000 });
+  await fBob.click('.inbox-row:has-text("With files")');
+  await fBob.waitForSelector('.blip .editor', { timeout: 15000 });
+
+  await fAlice.click('.editor');
+  await fAlice.keyboard.type('Here it is:');
+  await fAlice.setInputFiles('.file-picker', join(dataDir, 'diagram.png'));
+  await fAlice.waitForSelector('.embed-image img', { timeout: 15000 });
+  const drawn = await fAlice.evaluate(() => {
+    const img = document.querySelector('.embed-image img');
+    return img && img.complete && img.naturalWidth > 0;
+  });
+  check('an image attachment is rendered, and really loads', drawn);
+
+  await fBob.waitForTimeout(1200);
+  check('it reaches the other participant live',
+    (await fBob.locator('.embed-image img').count()) === 1);
+
+  // The embed is one character of the document. If the DOM walkers disagreed
+  // with the model about that, this typing would splice text at the wrong
+  // offset and the picture would vanish.
+  await fAlice.click('.editor');
+  await fAlice.keyboard.press('End');
+  await fAlice.keyboard.type(' — signed off');
+  await fAlice.waitForTimeout(700);
+  check('typing around an embed leaves it alone',
+    (await fAlice.locator('.embed-image img').count()) === 1 &&
+      (await fAlice.textContent('.editor')).includes('signed off'));
+  await fBob.waitForTimeout(900);
+  check('and the other side agrees',
+    (await fBob.locator('.embed-image img').count()) === 1 &&
+      (await fBob.textContent('.editor')).includes('signed off'));
+
+  await fAlice.setInputFiles('.file-picker', join(dataDir, 'notes.txt'));
+  await fAlice.waitForSelector('.embed-file', { timeout: 15000 });
+  check('a file that is not an image is listed rather than drawn',
+    (await fAlice.textContent('.embed-file')).includes('notes.txt'));
+
+  await fAlice.setInputFiles('.file-picker', join(dataDir, 'trojan.png'));
+  await fAlice.waitForTimeout(1500);
+  check('a name is not evidence: HTML called .png is not treated as an image',
+    (await fAlice.locator('.embed-file').count()) === 2 &&
+      (await fAlice.locator('.embed-image').count()) === 1);
+  const served = await fAlice.evaluate(async () => {
+    const links = document.querySelectorAll('.embed-file a');
+    const response = await fetch(links[links.length - 1].getAttribute('href'));
+    return {
+      type: response.headers.get('content-type'),
+      disposition: response.headers.get('content-disposition') || '',
+    };
+  });
+  check('and is served as an opaque download',
+    served.type === 'application/octet-stream' && served.disposition.startsWith('attachment;'),
+    `${served.type} / ${served.disposition}`);
+
+  const imageHref = await fAlice.locator('.embed-image a').getAttribute('href');
+  const outsiderStatus = await outsider.evaluate(async (href) => {
+    const response = await fetch(href);
+    return response.status;
+  }, imageHref);
+  check('someone outside the wave cannot fetch the file', outsiderStatus === 404,
+    `status ${outsiderStatus}`);
+
+  await fAlice.reload();
+  await fAlice.waitForSelector('.blip .editor', { timeout: 15000 });
+  await fAlice.waitForTimeout(800);
+  check('attachments survive a reload, because they are part of the document',
+    (await fAlice.locator('.embed-image img').count()) === 1 &&
+      (await fAlice.locator('.embed-file').count()) === 2);
+  check('and the inbox names the file rather than showing a blank box',
+    !(await fAlice.textContent('.inbox-snippet')).includes('￼'));
 
   // --- surviving an outage ----------------------------------------------
 

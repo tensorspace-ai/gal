@@ -157,7 +157,26 @@ upgrading.
 - **Presence and remote cursors.** See who is in a wave and where their caret is.
 - **Rich text** — bold, italic, underline, strikethrough, code, links — carried
   as attributes on the document, so formatting transforms correctly against
-  concurrent edits instead of being clobbered by them.
+  concurrent edits instead of being clobbered by them. The controls travel to
+  whichever message you are writing in rather than sitting in a header.
+- **Attachments.** Drop a file into a message, paste a screenshot, or use the
+  paperclip. Images render in place; anything else becomes a download. Up to
+  10 MB a file and 200 MB per person per day.
+
+  An attachment is part of the *document*, not metadata beside it: it is an
+  embedded object occupying exactly one position in the text, so it transforms
+  against concurrent edits like everything else — two people typing on either
+  side of a photograph both keep it, in the right place. Files belong to the
+  **wavelet** they were uploaded into, so one dropped in a private reply is
+  exactly as private as the sentence next to it, and the bytes live in the
+  database, so a backup of `gal.db` includes them.
+
+  Images are recognised by their magic bytes and nothing else. A file is served
+  back inline only if it really is a PNG, JPEG, GIF or WebP; everything else,
+  including anything merely *named* `.png`, is handed over as
+  `application/octet-stream` with `Content-Disposition: attachment`. That is
+  what keeps an upload endpoint from becoming a way to serve script from your
+  own origin.
 - **Unread tracking that understands editing.** Read state is per *revision*, so
   a message you have already read becomes unread again when somebody revises it.
 - **Full-text search** across every wave you participate in, with highlights.
