@@ -1,6 +1,6 @@
 # Gal
 
-A Google Wave–style collaboration server, in Rust.
+An Apache Wave–style collaboration server, in Rust.
 
 Wave's idea was that a conversation is a *shared document*, not a log of messages
 you send at each other. Everyone in a wave can edit every message in it, live,

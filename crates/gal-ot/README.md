@@ -3,7 +3,7 @@
 Operational transformation for collaborative rich-text editing.
 
 This is the concurrency-control core of [Gal](https://github.com/tensorspace-ai/gal),
-a Google Wave-style collaboration server, published separately because it is
+an Apache Wave-style collaboration server, published separately because it is
 useful on its own.
 
 A `Delta` is a sequence of `insert` / `retain` / `delete` operations carrying

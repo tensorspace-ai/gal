@@ -1,6 +1,6 @@
 //! The Wave domain model.
 //!
-//! The hierarchy is the one Google Wave introduced, and it is what separates a
+//! The hierarchy is the one Apache Wave introduced, and it is what separates a
 //! wave from a chat room:
 //!
 //! ```text

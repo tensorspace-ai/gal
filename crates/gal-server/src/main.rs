@@ -1,4 +1,4 @@
-//! Gal — a Google Wave-style collaboration server.
+//! Gal — an Apache Wave-style collaboration server.
 
 mod auth;
 mod config;

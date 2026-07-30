@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Gal — a Google Wave-style real-time collaboration server"
+description = "Gal — an Apache Wave-style real-time collaboration server"
 # An application rather than a library, but published all the same so it can be
 # installed with `cargo install gal-server`. It depends on both library crates,
 # so the release order is gal-ot, then gal-core, then this.

@@ -1,7 +1,7 @@
 # gal-core
 
-Domain model and wire protocol for [Gal](https://github.com/tensorspace-ai/gal), a
-Google Wave-style collaboration server.
+Domain model and wire protocol for [Gal](https://github.com/tensorspace-ai/gal), an
+Apache Wave-style collaboration server.
 
 ```text
 Wave                  a conversation; the unit that appears in your inbox

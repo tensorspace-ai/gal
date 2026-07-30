@@ -1,6 +1,6 @@
 //! Operational transformation for collaborative rich-text editing.
 //!
-//! This crate implements the concurrency-control core that made Google Wave
+//! This crate implements the concurrency-control core that made Apache Wave
 //! work: many people typing into the same document at the same time, with every
 //! participant converging on identical content without locking.
 //!
