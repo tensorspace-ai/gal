@@ -81,12 +81,27 @@ These are load-bearing. Breaking one corrupts user data, usually silently.
 implement the same algorithms and transform the same operations. Any
 disagreement is silent document corruption, not a crash you would notice.
 
-If you touch either, touch both, then regenerate and replay the vectors:
+If you touch either, touch both. `tests/vectors.json` is a **checked-in golden
+file**, and both engines are replayed against it: `cargo test -p gal-ot` for the
+Rust half, `node tests/ot.test.js` for the JavaScript half. Neither test
+regenerates it.
+
+That is deliberate, and it is the whole reason the file is committed. The
+vectors used to be regenerated from the Rust engine immediately before being
+replayed, which meant they could only detect JavaScript drifting away from Rust.
+A change to Rust's own transform semantics rewrote its expectations on the way
+past and the suite stayed green — the file was decorative.
+
+So: **do not regenerate the vectors to make a test pass.** If a change to the
+algebra is intended, regenerate them as a deliberate step and commit the diff
+with the change, so the new behaviour is reviewed rather than absorbed:
 
 ```sh
 cargo run -p gal-ot --example gen_vectors > tests/vectors.json
-node tests/ot.test.js
 ```
+
+A diff that changes vectors and is not accompanied by an explanation of *why*
+the algebra changed is a bug report.
 
 This has already caught real divergences that every other test missed — a
 surrogate pair sliced in half, and an empty op one engine dropped and the other

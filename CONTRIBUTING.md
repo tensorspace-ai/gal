@@ -35,17 +35,20 @@ conformance vectors, and the browser tests if a browser is available.
 algorithms. Both transform the same operations, so any disagreement between them
 is silent data corruption in a user's document — not a crash you would notice.
 
-If you touch either one, you must touch both, and you must regenerate the
-conformance vectors:
+If you touch either one, you must touch both. `tests/vectors.json` holds 1,505
+randomised cases with the expected results attached, and **both** engines are
+replayed against it — `cargo test -p gal-ot` for Rust, `node tests/ot.test.js`
+for JavaScript. It has caught real bugs that every other test missed.
+
+The file is checked in and neither test regenerates it, so a change to either
+engine that alters what the algebra does will fail. **Do not regenerate the
+vectors to make a test pass**; that is how the check was quietly disabled
+before. If you have deliberately changed the algebra, regenerate them and
+explain why in the commit message:
 
 ```sh
 cargo run -p gal-ot --example gen_vectors > tests/vectors.json
-node tests/ot.test.js
 ```
-
-That test replays 1,500 randomised cases produced by the Rust engine and asserts
-the JavaScript engine reproduces every one byte-for-byte. It has caught real
-bugs that every other test missed.
 
 Related invariants worth knowing before you change the core:
 

@@ -11,6 +11,10 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 description = "Operational Transformation engine for rich-text collaborative editing"
+# The conformance suite replays a vector file that lives at the repository root
+# and is shared with the JavaScript engine's tests, so it cannot travel inside
+# the packaged crate. Run it from a checkout.
+exclude = ["tests/conformance.rs"]
 
 [dependencies]
 serde = { workspace = true }

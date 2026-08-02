@@ -347,13 +347,15 @@ The interesting parts:
   revision log across 500 rounds of clients submitting against deliberately
   stale revisions. (That last one exercises `ServerDoc` directly; the full
   request path is covered by the end-to-end tests below.)
-- **Cross-language conformance.** `cargo run -p gal-ot --example gen_vectors`
-  emits 1,500 randomised cases with the Rust engine's results attached, and
-  `tests/ot.test.js` asserts the JavaScript engine reproduces every one exactly.
-  Both engines transform the same ops, so a divergence between them is silent
-  data corruption; this catches it. It has already caught two real bugs — a
-  surrogate pair sliced in half, and an empty op that one engine dropped and the
-  other did not.
+- **Cross-language conformance.** `tests/vectors.json` is a checked-in golden
+  file of 1,505 randomised cases with the expected results attached, and *both*
+  engines are replayed against it — `cargo test -p gal-ot` for Rust,
+  `tests/ot.test.js` for JavaScript. Both engines transform the same ops, so a
+  divergence between them is silent data corruption; this catches it, and
+  because the file is frozen rather than regenerated on each run, it also
+  catches either engine changing what it does. It has already caught two real
+  bugs — a surrogate pair sliced in half, and an empty op that one engine
+  dropped and the other did not.
 - **End-to-end tests** drive a real server over real WebSockets with a test
   client that runs the same OT state machine as the browser, so a protocol change
   that would break the client breaks the tests too.

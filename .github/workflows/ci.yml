@@ -32,11 +32,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # The browser client ships its own OT engine; it must agree with Rust's
-      # exactly, so the conformance vectors are regenerated and replayed.
+      # exactly. tests/vectors.json is a checked-in golden file that both engines
+      # are replayed against — `cargo test` covers the Rust half. It is
+      # deliberately not regenerated here: doing so let a change to the Rust
+      # engine rewrite its own expectations and still pass.
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: cargo run -q -p gal-ot --example gen_vectors > tests/vectors.json
       - run: node tests/ot.test.js
       # Browser tests need a real Chromium; playwright-core does not fetch one.
       - run: npm install --prefix tests
