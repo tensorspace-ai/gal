@@ -422,9 +422,12 @@ Disclosed rather than hidden, because some of these matter for how you deploy it
 - **No moderation surface.** No way to suspend an account or audit participant
   changes.
 - **Comments do not overlap.** A range carries one anchor, so a second comment
-  cannot cover words a first already covers; the client says so rather than
-  quietly detaching the older one. Nor can a comment be deleted — resolving is
-  how one is retracted, and it keeps the record.
+  cannot cover words a first already covers — including a wider selection that
+  swallows one; the client says so rather than quietly detaching the older
+  thread. A comment is also never deleted on its own: resolving is how one is
+  retracted, and it keeps the record. Deleting the message a thread is about
+  does take the thread with it, since a remark that outlived what it referred
+  to could no longer be read against anything.
 - **No federation** between servers.
 - **No end-to-end encryption.** The server can read everything; private replies
   are enforced by the server, not by cryptography.

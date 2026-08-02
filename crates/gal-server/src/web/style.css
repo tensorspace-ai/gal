@@ -1447,6 +1447,12 @@ textarea {
   transition: top 160ms ease, border-color 140ms ease, box-shadow 140ms ease;
 }
 
+/* Playback: nothing to sit beside, so the cards simply follow one another. */
+.comment-rail.stacked .comment-card {
+  position: static;
+  margin-bottom: 8px;
+}
+
 .comment-card.active {
   border-color: color-mix(in srgb, #e5a83c 65%, var(--border));
   box-shadow: var(--shadow-2);

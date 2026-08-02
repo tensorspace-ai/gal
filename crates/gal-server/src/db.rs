@@ -497,10 +497,13 @@ impl Storage {
 
     /// Open a comment thread and store its first remark in one transaction.
     ///
-    /// Together, because a thread with nothing in it is a row no reader knows
-    /// how to draw and no writer would ever create on purpose. If either half
-    /// failed alone the client would show a marked-up range that opens onto
-    /// nothing, and there is no path in the protocol to repair that.
+    /// Together — including the remark's seed op — because a thread with nothing
+    /// in it is a row no reader knows how to draw and no writer would ever
+    /// create on purpose. If any part failed alone the client would show a
+    /// marked-up range that opens onto nothing, and there is no path in the
+    /// protocol to repair that. Compensating afterwards is not good enough
+    /// either: `delete_blip` is a *soft* delete and does not touch `comments`,
+    /// so an empty thread row would survive it.
     pub async fn create_comment(&self, thread: CommentThread, blip: Blip) -> Result<()> {
         self.run(move |conn| {
             let tx = conn.transaction()?;
@@ -535,6 +538,28 @@ impl Storage {
                     blip.comment.as_ref().map(|c| c.0.clone()),
                 ],
             )?;
+            // Seeded content is recorded in the op log here rather than through
+            // a following `commit_op`, so playback starts this remark from empty
+            // like every other document and cannot be left disagreeing with the
+            // row above it.
+            if blip.revision > 0 {
+                tx.execute(
+                    "INSERT INTO ops (blip_id, revision, wave_id, author, timestamp, delta, op_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                    params![
+                        blip.id.as_str(),
+                        blip.revision,
+                        blip.wave_id.as_str(),
+                        blip.author.as_str(),
+                        blip.created_at,
+                        serde_json::to_string(&blip.content)?,
+                    ],
+                )?;
+            }
+            tx.execute(
+                "UPDATE wavelets SET last_modified = ?2 WHERE id = ?1",
+                params![blip.wavelet_id.as_str(), blip.last_modified],
+            )?;
             index_blip(&tx, &blip)?;
             tx.commit()?;
             Ok(())
@@ -553,6 +578,20 @@ impl Storage {
                 .query_map(params![id.as_str()], row_to_comment)?
                 .collect::<Result<_, _>>()?;
             Ok(threads)
+        })
+        .await
+    }
+
+    /// Remove a thread outright.
+    ///
+    /// Only ever reached by deleting the blip it annotates — a comment has no
+    /// deletion of its own. Its remarks are soft-deleted separately, like any
+    /// other blip, so the op log they contributed to playback stays intact.
+    pub async fn delete_comment(&self, comment_id: &CommentId) -> Result<()> {
+        let id = comment_id.clone();
+        self.run(move |conn| {
+            conn.execute("DELETE FROM comments WHERE id = ?1", params![id.as_str()])?;
+            Ok(())
         })
         .await
     }
@@ -733,11 +772,18 @@ impl Storage {
             // 3. Blip count and most recent blip per wave. SQLite's bare-column
             //    rule returns the row that produced MAX(last_modified), giving
             //    the count and the latest snippet from a single scan.
+            //
+            //    Comment remarks are excluded. They are blips, and they are the
+            //    newest ones whenever someone comments, so counting them made a
+            //    notepad's "one shared page" grow a message count, and showing
+            //    them made the inbox preview a note *about* the page instead of
+            //    the page. The wavelet's `last_modified` still moves, so a wave
+            //    with a new comment still rises in the inbox.
             let mut stmt = conn.prepare(
                 "SELECT b.wave_id, COUNT(*), b.author, b.content, MAX(b.last_modified)
                  FROM blips b
                  JOIN participants p ON p.wavelet_id = b.wavelet_id AND p.user_id = ?1
-                 WHERE b.deleted = 0
+                 WHERE b.deleted = 0 AND b.comment IS NULL
                  GROUP BY b.wave_id",
             )?;
             let rows = stmt.query_map(params![me], |r| {
@@ -868,9 +914,11 @@ impl Storage {
 
             if let Some((count, author, content, last)) = conn
                 .query_row(
+                    // Remarks excluded, as in `inbox`: the preview is of the
+                    // conversation, not of the notes in its margin.
                     "SELECT COUNT(*), b.author, b.content, MAX(b.last_modified) FROM blips b
                      JOIN participants p ON p.wavelet_id = b.wavelet_id AND p.user_id = ?1
-                     WHERE b.wave_id = ?2 AND b.deleted = 0",
+                     WHERE b.wave_id = ?2 AND b.deleted = 0 AND b.comment IS NULL",
                     params![me, wave],
                     |r| {
                         Ok((

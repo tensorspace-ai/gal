@@ -54,6 +54,28 @@ function inheritable(attributes) {
 }
 
 /**
+ * Put the anchor back when the text is being typed *inside* a commented run.
+ *
+ * `inheritable` strips anchors so that typing at the end of a commented phrase
+ * does not drag the next words into it. Strictly inside, the opposite is
+ * wanted: leaving the anchor off would punch a hole through the middle of the
+ * highlight and split one anchor into two runs, which is how a comment ends up
+ * pointing at half the phrase it was made about.
+ *
+ * Inside means the character before the insertion and the character after the
+ * text being replaced both carry the same thread. `index`/`removed` are in the
+ * document as it was before the change.
+ */
+function interiorComment(doc, attributes, index, removed) {
+  const total = doc.toPlainText().length;
+  if (index === 0 || index + removed >= total) return attributes;
+  const before = doc.attributesAt(index - 1, 1)[COMMENT_ATTR];
+  const after = doc.attributesAt(index + removed, 1)[COMMENT_ATTR];
+  if (!before || before !== after) return attributes;
+  return { ...attributes, [COMMENT_ATTR]: before };
+}
+
+/**
  * Every range of `delta` that is anchored to a comment, as
  * `{ id, index, length }` in UTF-16 code units.
  *
@@ -619,8 +641,11 @@ export class Editor {
     if (inserted) {
       // Typed text inherits the formatting of the character it follows, which
       // is what makes typing at the end of a bold run stay bold.
-      const attributes = inheritable(
-        this.pendingFormat || (index > 0 ? this.doc.attributesAt(index - 1, 1) : {}),
+      const attributes = interiorComment(
+        this.doc,
+        inheritable(this.pendingFormat || (index > 0 ? this.doc.attributesAt(index - 1, 1) : {})),
+        index,
+        removed,
       );
       delta.insert(inserted, attributes);
     }
@@ -642,9 +667,14 @@ export class Editor {
   /** Replace the current selection with `text`, as one op. */
   replaceSelection(text) {
     const selection = this.getSelection() || { index: this.doc.toPlainText().length, length: 0 };
-    const attributes = inheritable(
-      this.pendingFormat ||
-        (selection.index > 0 ? this.doc.attributesAt(selection.index - 1, 1) : {}),
+    const attributes = interiorComment(
+      this.doc,
+      inheritable(
+        this.pendingFormat ||
+          (selection.index > 0 ? this.doc.attributesAt(selection.index - 1, 1) : {}),
+      ),
+      selection.index,
+      selection.length,
     );
 
     const delta = new Delta()

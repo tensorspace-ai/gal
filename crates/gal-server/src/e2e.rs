@@ -67,6 +67,8 @@ struct TestClient {
     docs: std::collections::HashMap<BlipId, ClientDoc>,
     /// Every presence entry received, so tests can assert on what leaked.
     presence: Vec<PresenceEntry>,
+    /// The inbox this connection was greeted with.
+    inbox: Vec<WaveSummary>,
     op_counter: u64,
 }
 
@@ -126,12 +128,16 @@ impl TestServer {
             },
             docs: Default::default(),
             presence: Vec::new(),
+            inbox: Vec::new(),
             op_counter: 0,
         };
 
         // The first message is always the greeting.
         match client.recv().await {
-            ServerMessage::Welcome { user, .. } => client.user = user,
+            ServerMessage::Welcome { user, inbox } => {
+                client.user = user;
+                client.inbox = inbox;
+            }
             other => panic!("expected welcome, got {other:?}"),
         }
         client
@@ -2491,18 +2497,83 @@ async fn a_remark_cannot_be_deleted_out_from_under_its_thread() {
         "deleting the only remark would leave a thread nothing can draw"
     );
 
-    // Nor can the page be deleted while a comment hangs off it.
+    // The message it annotates *can* still be deleted, and takes the thread with
+    // it. Counting remarks as replies made a commented message undeletable for
+    // ever: the reply rule refused the parent and the rule above refused the
+    // only thing that would have satisfied it.
     alice
-        .send(ClientMessage::DeleteBlip { blip_id: page })
+        .send(ClientMessage::DeleteBlip {
+            blip_id: page.clone(),
+        })
         .await;
-    let code = alice
+    alice
         .recv_until(|m| match m {
-            ServerMessage::Error { code, .. } => Some(*code),
-            ServerMessage::BlipRemoved { .. } => Some(ErrorCode::Internal),
+            ServerMessage::BlipRemoved { blip_id, .. } if blip_id == &page => Some(()),
             _ => None,
         })
         .await;
-    assert_eq!(code, ErrorCode::BadRequest);
+
+    let mut fresh = server.connect(&cookie).await;
+    let state = fresh.open_state(&wave_id).await;
+    let wavelet = &state.wavelets[0];
+    assert!(
+        wavelet.comments.is_empty(),
+        "a thread about a message that no longer exists is a remark about nothing"
+    );
+    assert!(
+        !wavelet.blips.iter().any(|b| b.comment.is_some()),
+        "and its remarks go with it"
+    );
+}
+
+#[tokio::test]
+async fn a_remark_does_not_become_the_inbox_preview() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, wavelet_id, page) = create_wave_in(
+        &mut alice,
+        "Release notes",
+        vec!["bob".into()],
+        Some(WaveMode::Notepad),
+    )
+    .await;
+    alice
+        .edit(&page, Delta::new().insert("Q3 launch plan"))
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+
+    let thread = CommentId::new();
+    comment_on(
+        &mut alice,
+        &wavelet_id,
+        &page,
+        &thread,
+        0,
+        2,
+        "this line reads oddly",
+    )
+    .await;
+    alice.drain().await;
+    bob.drain().await;
+
+    // The margin is a note *about* the page, so it must not replace the page in
+    // Bob's inbox — nor make a wave whose whole premise is one shared document
+    // report a growing message count.
+    let fresh = server.connect(&bob_cookie).await;
+    let summary = fresh
+        .inbox
+        .iter()
+        .find(|s| s.id == wave_id)
+        .expect("wave missing from inbox");
+    assert_eq!(summary.snippet, "Q3 launch plan");
+    assert_eq!(summary.snippet_author.as_ref(), Some(&alice.user.id));
+    assert_eq!(summary.blip_count, 1, "one shared page, one blip");
 }
 
 /// Leaving Notepad must not strand open threads, and freezing must stop them.

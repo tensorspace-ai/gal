@@ -20,8 +20,12 @@ the sentence on every client. Deleting the sentence leaves the thread
 *detached*, keeping the remarks rather than pointing them at unrelated words.
 
 The remarks are ordinary blips, so they are co-edited live and carry
-contributors, unread marks, search and playback. A thread is never deleted;
-resolving takes it out of the margin and can be undone. Existing threads stay
+contributors, unread marks, search and playback — though they stay out of the
+inbox preview and message count, so a notepad still reads as the one shared
+page it is. A comment is never deleted on its own; resolving takes it out of
+the margin and can be undone. Deleting the message a thread annotates does
+remove it, since there would be nothing left to read the remark against.
+Existing threads stay
 visible and settleable in every mode, so switching a commented page to another
 mode still destroys nothing — only *starting* a thread is a notepad's
 privilege, and a frozen wave refuses even to resolve.

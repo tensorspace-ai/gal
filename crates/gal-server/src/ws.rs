@@ -637,29 +637,15 @@ async fn create_comment(
         blip.revision = 1;
     }
 
+    // Thread, remark and its seed op in one transaction. Unlike `create_blip`
+    // there is no useful compensating action here: `delete_blip` is a soft
+    // delete and leaves the `comments` row, so a half-written thread would
+    // survive as a card with an author, a timestamp and nothing in it.
     state
         .db
         .create_comment(thread.clone(), blip.clone())
         .await
         .map_err(internal)?;
-    if blip.revision > 0 {
-        if let Err(e) = state
-            .db
-            .commit_op(
-                blip.clone(),
-                blip.content.clone(),
-                session.user.id.clone(),
-                blip.created_at,
-                None,
-            )
-            .await
-        {
-            // As in `create_blip`: a row whose seed op is missing would make
-            // playback rebuild the wrong document, so take it back out.
-            let _ = state.db.delete_blip(&blip.id).await;
-            return Err(internal(e));
-        }
-    }
 
     live.comments.insert(thread.id.clone(), thread.clone());
     live.blips
@@ -792,6 +778,19 @@ async fn resolve_comment(
     } else {
         (None, None)
     };
+
+    // Written before anyone is told, and before the resident copy moves. The
+    // in-memory flip is also what the idempotent short-circuit above reads, so
+    // announcing first and failing to write would leave every client showing a
+    // settled thread, the database showing an open one, and a retry returning
+    // `Ok` without ever reaching storage. The lock is held across the write, as
+    // it is in `create_blip`, so nothing can race between the two.
+    state
+        .db
+        .set_comment_resolved(&comment_id, resolved_by.clone(), resolved_at)
+        .await
+        .map_err(internal)?;
+
     if let Some(thread) = live.comments.get_mut(&comment_id) {
         thread.resolved_by = resolved_by.clone();
         thread.resolved_at = resolved_at;
@@ -800,19 +799,12 @@ async fn resolve_comment(
         &thread.wavelet_id,
         None,
         ServerMessage::CommentResolved {
-            wave_id: wave_id.clone(),
-            comment_id: comment_id.clone(),
-            resolved_by: resolved_by.clone(),
+            wave_id,
+            comment_id,
+            resolved_by,
             resolved_at,
         },
     );
-    drop(live);
-
-    state
-        .db
-        .set_comment_resolved(&comment_id, resolved_by, resolved_at)
-        .await
-        .map_err(internal)?;
     Ok(())
 }
 
@@ -831,15 +823,16 @@ async fn delete_blip(
     if !live.may_access(&session.user.id, &wavelet_id) {
         return Err(not_found());
     }
-    // A remark is not deletable, in any mode. Deleting the first one would leave
-    // a thread with nothing in it — a state the client cannot draw and the
-    // protocol has no way to repair — and the wave may since have left Notepad,
-    // where `allows_delete` would otherwise wave this through. Resolving is what
-    // retracts a comment, and it keeps the record.
+    // A remark is not deletable on its own, in any mode. Deleting the first one
+    // would leave a thread with nothing in it — a state the client cannot draw
+    // and the protocol has no way to repair — and the wave may since have left
+    // Notepad, where `allows_delete` would otherwise wave this through.
+    // Resolving retracts a comment and keeps the record; deleting the message it
+    // is about takes the whole thread with it, below.
     if blip.meta.comment.is_some() {
         return Err(ServerMessage::error(
             ErrorCode::Forbidden,
-            "Comments are not deleted. Resolve the thread instead.",
+            "A comment is not deleted on its own. Resolve the thread instead.",
         ));
     }
     if blip.meta.author != session.user.id {
@@ -849,11 +842,14 @@ async fn delete_blip(
         ));
     }
     live.permit(&session.user.id, Action::Delete)?;
-    // Keep the thread intact: a blip with replies would orphan them.
+    // Keep the thread intact: a blip with replies would orphan them. Remarks are
+    // not replies for this purpose — they are annotations *on* this message, and
+    // counting them here made a commented message undeletable for good, since
+    // the refusal above means the remarks could never be cleared either.
     if live
         .blips
         .values()
-        .any(|b| b.meta.parent.as_ref() == Some(&blip_id))
+        .any(|b| b.meta.parent.as_ref() == Some(&blip_id) && b.meta.comment.is_none())
     {
         return Err(ServerMessage::error(
             ErrorCode::BadRequest,
@@ -861,7 +857,47 @@ async fn delete_blip(
         ));
     }
 
+    // Comments go with the text they were about. A thread that outlived the
+    // message it annotated would be a remark about nothing, and unlike a
+    // detached anchor — where the message is still there and the words are not —
+    // there would be no way left to read what it referred to.
+    let threads: Vec<CommentId> = live
+        .comments
+        .values()
+        .filter(|c| c.blip_id == blip_id)
+        .map(|c| c.id.clone())
+        .collect();
+    let remarks: Vec<BlipId> = live
+        .blips
+        .values()
+        .filter(|b| {
+            b.meta
+                .comment
+                .as_ref()
+                .is_some_and(|id| threads.contains(id))
+        })
+        .map(|b| b.meta.id.clone())
+        .collect();
+
     live.blips.remove(&blip_id);
+    for remark in &remarks {
+        live.blips.remove(remark);
+    }
+    for thread in &threads {
+        live.comments.remove(thread);
+    }
+    // Remarks first, so no client is briefly holding a thread whose anchor blip
+    // has gone but whose remarks have not.
+    for remark in &remarks {
+        live.broadcast(
+            &wavelet_id,
+            None,
+            ServerMessage::BlipRemoved {
+                wave_id: wave_id.clone(),
+                blip_id: remark.clone(),
+            },
+        );
+    }
     live.broadcast(
         &wavelet_id,
         None,
@@ -872,6 +908,12 @@ async fn delete_blip(
     );
     drop(live);
 
+    for remark in &remarks {
+        state.db.delete_blip(remark).await.map_err(internal)?;
+    }
+    for thread in &threads {
+        state.db.delete_comment(thread).await.map_err(internal)?;
+    }
     state.db.delete_blip(&blip_id).await.map_err(internal)?;
     state.schedule_inbox_update(&wave_id);
     Ok(())

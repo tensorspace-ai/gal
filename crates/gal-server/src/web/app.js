@@ -835,15 +835,17 @@ function renderThread() {
   const root = rootWavelet();
   if (root) renderInto(host, `root:${root.id}`, 0);
 
+  // Before restoring the caret, not after: the cards hang off the text that was
+  // just rebuilt, so their anchors and their editors are rebuilt with it — and a
+  // caret restored into a remark first would be dropped again the moment the
+  // margin replaced the editor holding it.
+  renderComments();
   restoreFocus(focused);
   // The toolbar was docked inside one of the nodes just discarded. Without
   // this it stays in the detached subtree whenever the caret was not in an
   // editor — clicking the search box and then having someone post was enough
   // to take bold, links and the paperclip off the page entirely.
   dockToolbar();
-  // The cards hang off the text that was just rebuilt, so their anchors and
-  // their editors have to be rebuilt with it.
-  renderComments();
   restoreCommentFocus();
   if (chat && pinned) scroller.scrollTop = scroller.scrollHeight;
 }
@@ -1059,7 +1061,17 @@ function anchorsByComment() {
     const doc = state.docs.get(blip.id);
     if (!doc) continue;
     for (const range of commentRanges(doc.doc)) {
-      if (!anchors.has(range.id)) anchors.set(range.id, { blipId: blip.id, ...range });
+      const found = anchors.get(range.id);
+      if (!found) {
+        anchors.set(range.id, { blipId: blip.id, index: range.index, length: range.length });
+      } else if (found.blipId === blip.id) {
+        // One thread can end up as several runs — pasting into the middle of a
+        // commented phrase will do it. Span them, so the card sits beside the
+        // whole phrase instead of beside whichever fragment came first.
+        const end = Math.max(found.index + found.length, range.index + range.length);
+        found.index = Math.min(found.index, range.index);
+        found.length = end - found.index;
+      }
     }
   }
   return anchors;
@@ -1144,10 +1156,21 @@ function startComment() {
   }
   // One comment per range: the anchor is a single attribute, so a second id
   // over the same words would overwrite the first and silently detach it.
-  const existing = editor.doc.attributesAt(selection.index, selection.length)[COMMENT_ATTR];
-  if (existing) {
+  //
+  // Tested by overlap rather than with `attributesAt`, which intersects across
+  // the selection and so reports *nothing* for a range that covers a commented
+  // phrase plus a word either side — the case that would do the overwriting.
+  // Only threads this client knows about count: an anchor naming a thread that
+  // does not exist is already invisible, and must not lock the words under it
+  // out of ever being commented on.
+  const known = new Set(allComments().map((t) => t.id));
+  const end = selection.index + selection.length;
+  const clash = commentRanges(editor.doc).find(
+    (r) => known.has(r.id) && r.index < end && selection.index < r.index + r.length,
+  );
+  if (clash) {
     toast('That text already has a comment.');
-    setActiveComment(existing);
+    setActiveComment(clash.id);
     return;
   }
 
@@ -1191,11 +1214,27 @@ function renderComments() {
   if (!rail) return;
   clear(rail);
 
-  const threads = allComments();
+  // A thread whose blip has gone — deleted along with the message it annotated
+  // — has nothing left to be about. The rows are removed server-side too; this
+  // covers the moment before the next snapshot.
+  const pages = new Set(allBlips().filter((b) => !b.comment).map((b) => b.id));
+  const threads = allComments().filter((t) => pages.has(t.blipId));
   const anchors = anchorsByComment();
   const pane = document.getElementById('wave-pane');
   const resolvedCount = threads.filter((t) => t.resolvedBy).length;
   const shown = threads.filter((t) => state.showResolved || !t.resolvedBy);
+
+  // Every remark gets a document, including those in threads that are not on
+  // show. `state.docs` is what the `op` handler applies incoming edits to, so a
+  // remark without one has its edits dropped on the floor — and is then built
+  // from the stale snapshot content when its thread is finally revealed, so the
+  // next thing typed into it is submitted against a revision the server left
+  // behind long ago.
+  for (const blip of allBlips()) {
+    if (blip.comment && !state.docs.has(blip.id)) {
+      state.docs.set(blip.id, new BlipDoc(blip.id, blip.content, blip.revision));
+    }
+  }
 
   if (pane) pane.classList.toggle('has-comments', threads.length > 0);
   markAnchors(threads);
@@ -1327,6 +1366,11 @@ function commentRemark(blip, first) {
     editorRoot,
   ]);
 
+  // Registered like any other blip's node. That is what lets playback rewind a
+  // remark's text along with the page, and what lets a remote edit reach one
+  // that is rendered read-only and so has no editor to apply it.
+  state.blipNodes.set(blip.id, row);
+
   if (state.playback || !mode.allowsEdit(blip)) {
     editorRoot.contentEditable = 'false';
     editorRoot.classList.add('read-only');
@@ -1435,7 +1479,15 @@ function layoutComments() {
 
   // On a narrow screen the margin becomes an ordinary list under the page, and
   // the stylesheet says so by taking the rail out of absolute positioning.
-  if (getComputedStyle(rail).position === 'static') {
+  //
+  // Playback stacks them too. The page is showing a rewound document while the
+  // anchors are read from the live one, so there is no honest line to put a
+  // card beside — better a list in the margin than cards pointing confidently
+  // at the wrong words. The class takes the *cards* out of absolute
+  // positioning, not the rail, so reading `position` back below still reports
+  // what the stylesheet decided about the screen width.
+  rail.classList.toggle('stacked', Boolean(state.playback));
+  if (state.playback || getComputedStyle(rail).position === 'static') {
     for (const { card } of placed) card.style.top = '';
     rail.style.height = '';
     return;

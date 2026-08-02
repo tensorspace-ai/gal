@@ -175,15 +175,27 @@ consequences follow and both are load-bearing:
   them out of the delta and the client's layout pass re-reads them each time.
   Cards did cache their anchor at first, and the highlight then moved with its
   sentence while the card stayed where the sentence used to be.
-- Typed text must not inherit it. Formatting is inherited from the character
-  before the caret, which is what keeps typing at the end of a bold word bold;
-  applied to a comment it silently drags the next words into somebody else's
-  thread. `inheritable()` in `editor.js` is the one place that strips it, and
-  every path that inherits attributes goes through it.
+- Typed text must not inherit it *at the edges*, and must inherit it *inside*.
+  Formatting is inherited from the character before the caret, which keeps
+  typing at the end of a bold word bold; applied to a comment at the end of a
+  phrase it drags the next words into somebody else's thread, and withheld in
+  the middle of one it punches a hole through the anchor and splits it in two.
+  `inheritable()` strips it and `interiorComment()` puts it back when the
+  characters on both sides belong to the same thread; every path that inherits
+  attributes goes through the pair.
+
+Testing this from the client's own DOM proves nothing. The typing fast path
+deliberately leaves the browser's edit in place without re-rendering, so the
+author's markup can show one unbroken highlight over a model that has already
+been split. Assert on a *second* client, whose DOM is built from the operation.
 
 A thread always has at least one remark, which is why a remark cannot be deleted
-in any mode. Deleting the first would leave a thread nothing can draw and the
-protocol cannot repair. Resolving is the retraction, and it keeps the record.
+on its own in any mode. Deleting the first would leave a thread nothing can draw
+and the protocol cannot repair. Resolving is the retraction, and it keeps the
+record. Deleting the blip a thread annotates removes the whole thread, remarks
+included — and the "blip with replies" rule must ignore remarks, or a commented
+message becomes undeletable for ever: the parent is refused for having replies
+and the replies are refused for being comments.
 
 ### 8. Schema changes need a version bump and a migration
 

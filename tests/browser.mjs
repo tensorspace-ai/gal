@@ -490,30 +490,37 @@ try {
   check('a notepad offers the comment control', await cAlice.isVisible('.tool-comment'));
 
   /// Select `word` inside the page editor, the way a person would.
+  ///
+  /// Deliberately able to span text nodes: once a phrase is commented it sits in
+  /// its own element, so any selection *containing* a comment crosses a
+  /// boundary — and that is exactly the case worth testing.
   const selectWord = async (page, word) =>
     page.evaluate((needle) => {
       const root = document.querySelector('.blip .editor');
-      const text = root.textContent;
-      const at = text.indexOf(needle);
+      const at = root.textContent.indexOf(needle);
       if (at < 0) return false;
-      // Walk to the text node holding the match. The page is one run here.
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       let seen = 0;
-      while (walker.nextNode()) {
+      let start = null;
+      let end = null;
+      while (walker.nextNode() && !(start && end)) {
         const node = walker.currentNode;
-        if (seen + node.data.length >= at + needle.length) {
-          const range = document.createRange();
-          range.setStart(node, at - seen);
-          range.setEnd(node, at - seen + needle.length);
-          const selection = window.getSelection();
-          selection.removeAllRanges();
-          selection.addRange(range);
-          root.dispatchEvent(new Event('mouseup', { bubbles: true }));
-          return true;
+        const len = node.data.length;
+        if (!start && seen + len >= at) start = { node, offset: at - seen };
+        if (!end && seen + len >= at + needle.length) {
+          end = { node, offset: at + needle.length - seen };
         }
-        seen += node.data.length;
+        seen += len;
       }
-      return false;
+      if (!start || !end) return false;
+      const range = document.createRange();
+      range.setStart(start.node, start.offset);
+      range.setEnd(end.node, end.offset);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      root.dispatchEvent(new Event('mouseup', { bubbles: true }));
+      return true;
     }, word);
 
   check('the phrase can be selected', await selectWord(cAlice, 'Friday'));
@@ -557,6 +564,41 @@ try {
   await cAlice.waitForTimeout(300);
   await cAlice.keyboard.press('End');
   check('a comment does not spread into text typed after it',
+    (await cAlice.textContent('.commented')) === 'Friday');
+
+  // But typing *inside* the phrase must stay inside it. Leaving the anchor off
+  // punches a hole through the middle of the highlight and splits one anchor
+  // into two runs, which puts the card beside half the phrase it is about.
+  //
+  // Checked on Bob's screen, not Alice's. The typing fast path deliberately
+  // leaves the browser's own DOM edit in place without re-rendering, so Alice's
+  // markup would show one unbroken span even when the model underneath had been
+  // split in two. Bob's copy is built from the operation, so it is the model.
+  await selectWord(cAlice, 'day');
+  await cAlice.keyboard.press('ArrowLeft');
+  await cAlice.keyboard.type('nal-');
+  await cBob.waitForTimeout(1400);
+  check('an edit inside a commented phrase stays inside the comment',
+    (await cBob.textContent('.commented')) === 'Frinal-day',
+    await cBob.textContent('.commented'));
+  check('and the phrase stays one unbroken highlight',
+    (await cBob.locator('.commented').count()) === 1);
+  for (let i = 0; i < 4; i += 1) await cAlice.keyboard.press('Backspace');
+  await cBob.waitForTimeout(1400);
+  check('undoing it leaves the anchor as it was',
+    (await cBob.textContent('.commented')) === 'Friday');
+
+  // A wider selection that swallows an existing anchor must be refused, not
+  // silently overwrite it. attributesAt() reports nothing for a range that is
+  // partly commented, so the obvious guard lets this straight through and
+  // detaches the older thread while its words are still on the page.
+  check('a range containing a comment can be selected',
+    await selectWord(cAlice, 'on Friday and'));
+  await cAlice.click('.tool-comment');
+  await cAlice.waitForTimeout(900);
+  check('commenting over an existing comment is refused',
+    (await cAlice.locator('.comment-card').count()) === 1);
+  check('and the original anchor survives',
     (await cAlice.textContent('.commented')) === 'Friday');
 
   await cBob.click('.comment-card');
