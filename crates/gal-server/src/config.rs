@@ -63,10 +63,10 @@ impl Config {
             config.database = PathBuf::from(path);
         }
         if let Ok(value) = std::env::var("GAL_SECURE_COOKIES") {
-            config.secure_cookies = is_truthy(&value);
+            config.secure_cookies = parse_bool("GAL_SECURE_COOKIES", &value)?;
         }
         if let Ok(value) = std::env::var("GAL_OPEN_REGISTRATION") {
-            config.open_registration = is_truthy(&value);
+            config.open_registration = parse_bool("GAL_OPEN_REGISTRATION", &value)?;
         }
         if let Ok(value) = std::env::var("GAL_ALLOWED_ORIGINS") {
             config.allowed_origins = value
@@ -76,20 +76,32 @@ impl Config {
                 .collect();
         }
         if let Ok(value) = std::env::var("GAL_TRUST_FORWARDED_FOR") {
-            config.trust_forwarded_for = is_truthy(&value);
+            config.trust_forwarded_for = parse_bool("GAL_TRUST_FORWARDED_FOR", &value)?;
         }
         if let Ok(value) = std::env::var("GAL_HSTS") {
-            config.hsts = is_truthy(&value);
+            config.hsts = parse_bool("GAL_HSTS", &value)?;
         }
         Ok(config)
     }
 }
 
-fn is_truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+/// Reads a boolean setting, refusing a spelling that is neither on nor off.
+///
+/// Treating an unrecognised value as false is how `GAL_SECURE_COOKIES=ture` and
+/// `GAL_HSTS=enabled` started a server with the protection the operator was
+/// asking for switched off, and said nothing. `GAL_HOST` and `GAL_PORT` already
+/// refuse a value they cannot read; these matter more, not less.
+///
+/// An empty value stays false, which is documented and deliberate: it is how a
+/// setting is turned off without unsetting the variable.
+fn parse_bool(name: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        other => Err(anyhow::anyhow!(
+            "{name} must be one of 1/true/yes/on or 0/false/no/off, got {other:?}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -99,10 +111,25 @@ mod tests {
     #[test]
     fn truthiness_accepts_common_spellings() {
         for yes in ["1", "true", "TRUE", " yes ", "on"] {
-            assert!(is_truthy(yes), "{yes:?} should be true");
+            assert!(parse_bool("X", yes).unwrap(), "{yes:?} should be true");
         }
+        // Empty stays false: that is how a setting is turned off without
+        // unsetting the variable, and it is documented.
         for no in ["0", "false", "no", "off", ""] {
-            assert!(!is_truthy(no), "{no:?} should be false");
+            assert!(!parse_bool("X", no).unwrap(), "{no:?} should be false");
+        }
+    }
+
+    /// Falling back to false meant a typo started the server with the
+    /// protection the operator asked for switched off, silently.
+    #[test]
+    fn an_unrecognised_spelling_is_refused_rather_than_read_as_off() {
+        for bad in ["ture", "enabled", "y", "TRUE!", "2"] {
+            let err = parse_bool("GAL_SECURE_COOKIES", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("GAL_SECURE_COOKIES"),
+                "should name the variable: {err}"
+            );
         }
     }
 }

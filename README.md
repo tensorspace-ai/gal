@@ -41,8 +41,10 @@ binary, so deploying is copying one file.
 | `GAL_TRUST_FORWARDED_FOR`  | `0`         | Set to `1` **only** behind a proxy that overwrites `X-Forwarded-For`; otherwise clients can spoof it and evade rate limits |
 | `GAL_LOG`                  | `gal_server=info,tower_http=warn` | `tracing` filter. `GAL_LOG=tower_http=info` adds an access log |
 
-Boolean variables accept `1`, `true`, `yes`, or `on`. Anything else is false —
-including an empty value, so `GAL_SECURE_COOKIES=` means *off*.
+Boolean variables accept `1`, `true`, `yes`, `on` and their opposites `0`,
+`false`, `no`, `off`. An empty value is false, so `GAL_SECURE_COOKIES=` means
+*off*. Anything else refuses to start rather than guessing: `GAL_HSTS=enabled`
+would otherwise have quietly meant *off*.
 
 `gal-server --healthcheck` probes a running instance and exits 0 or 1, for
 container health checks. `GET /healthz` does the same over HTTP and touches the
