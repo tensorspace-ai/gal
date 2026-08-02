@@ -25,13 +25,17 @@ why. Do not delete, skip, or weaken a test to make a change pass.
 
 ## Commit policy
 
-- **Commit directly to `main`.** No feature branches, no pull requests for
-  routine work.
-- **Commit regularly** — at each coherent unit of work, not in one large batch at
+Human contributors should follow [CONTRIBUTING.md](CONTRIBUTING.md), which
+describes the pull request route.
+
+- **Commit as you go**, at each coherent unit of work, rather than one batch at
   the end. A commit should leave the tree green.
+- **Do not push.** Committing is the agent's job; publishing is the
+  maintainer's, and it is theirs to time.
+- **Commit to `main`.** No feature branches for routine work.
 - Write a message that explains *why*, not just what changed. Match the style of
   the existing history.
-- Push after committing unless asked not to.
+- Never force-push, amend or squash unless asked.
 
 ## Verify behaviour, not just compilation
 

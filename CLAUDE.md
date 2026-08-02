@@ -1,4 +1,4 @@
 # CLAUDE.md
 
-See [AGENTS.md](AGENTS.md). It applies in full — quality gate, commit policy, and
-the invariants that must not be broken.
+See [AGENTS.md](AGENTS.md). It is the instruction file for every agent working
+in this repository, and it applies in full.
