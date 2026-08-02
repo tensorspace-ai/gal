@@ -96,6 +96,21 @@ fn embeds_round_trip_and_occupy_one_unit() {
     assert_eq!(serde_json::from_str::<Delta>(&encoded).unwrap(), d);
 }
 
+/// `ops` defaults to empty, so a misspelled key parsed as an empty delta: the
+/// server accepted the submit, applied nothing, and acked a revision. The
+/// user's typing vanished and their client believed it had landed.
+#[test]
+fn a_delta_with_a_misspelled_key_is_rejected_rather_than_read_as_empty() {
+    assert!(serde_json::from_str::<Delta>(r#"{"opz":[{"retain":3}]}"#).is_err());
+    // Singular `attribute` silently dropped the formatting it carried.
+    assert!(serde_json::from_str::<Delta>(r#"{"ops":[{"retain":3,"attribute":{}}]}"#).is_err());
+    // An empty delta is still legitimate when it is what was actually sent.
+    assert_eq!(
+        serde_json::from_str::<Delta>(r#"{"ops":[]}"#).unwrap(),
+        Delta::new()
+    );
+}
+
 #[test]
 fn malformed_ops_are_rejected() {
     assert!(serde_json::from_str::<Delta>(r#"{"ops":[{}]}"#).is_err());

@@ -131,6 +131,7 @@ fn server_error(e: anyhow::Error) -> Response {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 struct SignupRequest {
     name: String,
     #[serde(default)]
@@ -141,6 +142,7 @@ struct SignupRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LoginRequest {
     name: String,
     password: String,
@@ -283,6 +285,7 @@ async fn logout(State(state): State<Arc<AppState>>, identity: Identity) -> Respo
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 struct PasswordChange {
     current_password: String,
     new_password: String,
@@ -352,6 +355,7 @@ async fn users(State(state): State<Arc<AppState>>, identity: Identity) -> Respon
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LookupQuery {
     name: String,
 }
@@ -448,6 +452,7 @@ fn encode_filename(name: &str) -> String {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UploadQuery {
     #[serde(default)]
     name: String,

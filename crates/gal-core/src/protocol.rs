@@ -127,7 +127,7 @@ pub struct SearchHit {
 // --- client to server ---------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ClientMessage {
     /// Start receiving live updates for a wave, and get its current state.
     #[serde(rename_all = "camelCase")]
@@ -560,6 +560,44 @@ mod tests {
     #[test]
     fn unknown_message_types_are_rejected_not_ignored() {
         assert!(serde_json::from_str::<ClientMessage>(r#"{"type":"dropTables"}"#).is_err());
+    }
+
+    /// An unknown *field* was dropped where an unknown *type* was refused, and
+    /// every one of these fields defaults — so the message succeeded and did
+    /// something other than what was asked. Nothing tells the sender.
+    #[test]
+    fn unknown_message_fields_are_rejected_too() {
+        for json in [
+            // Was: a wave created with only its creator in it.
+            r#"{"type":"createWave","title":"t","partcipants":["bob"]}"#,
+            // Was: a Document wave — fully editable — where Frozen was asked for.
+            r#"{"type":"createWave","title":"t","moed":"frozen"}"#,
+            // Was: idempotency silently off, so a reconnect applied the edit twice.
+            r#"{"type":"submit","waveId":"w-1","blipId":"b-1","revision":1,"delta":{"ops":[]},"op_id":"x"}"#,
+            // Was: a reply at root level instead of nested under its parent.
+            r#"{"type":"addBlip","waveId":"w-1","parnet":"b-1","content":{"ops":[]}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ClientMessage>(json).is_err(),
+                "should be refused: {json}"
+            );
+        }
+    }
+
+    /// The shipped client sends these, so the strictness must not cost the
+    /// spellings that were always right.
+    #[test]
+    fn correctly_spelled_messages_still_parse() {
+        for json in [
+            r#"{"type":"createWave","title":"t","participants":["bob"],"mode":"frozen"}"#,
+            r#"{"type":"createWave","title":"t"}"#,
+            r#"{"type":"open","waveId":"w-1"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ClientMessage>(json).is_ok(),
+                "should parse: {json}"
+            );
+        }
     }
 
     /// Collect every JSON object key appearing anywhere in a value.

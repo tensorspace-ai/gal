@@ -71,6 +71,7 @@ pub struct Op {
 
 /// Wire representation. Exactly one of the three action fields is present.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpRepr {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     insert: Option<Insert>,
@@ -199,6 +200,7 @@ impl Op {
 
 /// A sequence of ops describing a document or a change to one.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Delta {
     #[serde(default)]
     pub ops: Vec<Op>,
