@@ -6,6 +6,92 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **The CSP no longer permits a socket to anywhere.** `connect-src` read
+  `'self' ws: wss:`, and a bare scheme in a source list is a *scheme source*
+  that matches every host — so the one directive between a script and the
+  network allowed streaming a participant's inbox off the machine.
+- **Removing someone from a wave now removes them from its private replies.**
+  Access is per wavelet and `may_view` asks about *any* wavelet, so an eviction
+  from the main thread left every side conversation they were in — and the
+  creator usually could not reach into those to finish the job.
+- **The WebSocket is rate limited.** Every limiter was on an HTTP endpoint
+  while the socket carried twenty commands, including `requestPlayback`, which
+  reads up to twenty thousand op rows per call. Commands are charged against a
+  per-account allowance priced by what they cost. One account may hold 24
+  sockets open.
+- **Passwords are judged on more than length** — at least 12 characters, at
+  most 1024 (Argon2's cost grows with its input), not a common password, and
+  not one containing your username. The same rules now apply to changing a
+  password, which had a laxer check of its own.
+- **Repeated wrong guesses lock the account, not just the address**, which does
+  nothing about an attacker with a list of addresses.
+- **Registration no longer accepts an email address.** One was stored and never
+  read: unverified personal data held for no purpose. Values written by older
+  builds are left alone; clear them with `UPDATE users SET email = ''`.
+
+### Added — mentions
+
+Type `@` to name someone in the wave. The mention is a document attribute
+carrying their id, so it transforms like bold does and still means the same
+person after the words are edited. Only participants are offered. There are no
+notifications yet, so it is a highlight rather than a summons.
+
+### Added — undo
+
+⌘Z takes back *your* last edit, not the last edit, and keeps working after
+somebody else has written in the same message. The stack holds operations and
+rebases them over every change that arrives; restoring a saved state would
+discard whatever had been typed meanwhile.
+
+### Added — an operator can see what the server is doing
+
+`GET /metrics` serves Prometheus text, behind `GAL_METRICS_TOKEN` and off until
+one is set. Every request logs once with a request id, and `GAL_LOG_JSON=1`
+emits JSON. Until now every safety valve in the server — disconnecting a slow
+client, rolling back an edit that would not persist — fired silently.
+
+### Changed — stopping the server closes its sockets
+
+axum's graceful shutdown does not cover WebSockets, so a stop exited the
+process with every connection mid-frame. Sockets are now asked to close and
+given ten seconds. The server also pings a silent socket every 30 seconds and
+drops one that has said nothing for two minutes, which is what keeps a
+connection whose far end vanished from holding a wave in memory for ever.
+
+### Fixed — a panic no longer takes the whole server down
+
+`panic = "abort"` turned one bad edit in one wave into an outage for everyone
+on the machine, and made dead code of the `JoinError` handling written to
+recover from exactly that. A panicking command now closes its own connection;
+the waves it touched are evicted and reloaded from storage.
+
+### Fixed — the server has a 404
+
+Every unrouted path returned the app shell with a 200, so a `/metrics` scrape
+recorded a healthy scrape of HTML and a mistyped endpoint looked like it worked.
+
+### Fixed — the client can be used without a mouse, and read
+
+Dialogs declare themselves, trap Tab, close on Escape and restore focus.
+Renaming a wave and managing participants were click handlers on elements that
+cannot be focused. The message holding the caret is now visibly marked — the
+old indication was a two-per-cent shift in border luminance. `--text-faint`
+was 2.6:1 on white and is now 4.8:1; it draws timestamps and the
+Reply/Privately/Delete labels, not decoration. Errors are announced, and stay
+until dismissed instead of fading after six seconds from a container that could
+not be clicked. Being offline is a banner that says what it means for what you
+are typing, visible on a phone, where the old indicator was hidden entirely.
+
+### Fixed — the OT conformance vectors were decorative
+
+`tests/vectors.json` was gitignored and regenerated from the Rust engine
+immediately before being replayed against the JavaScript one, by both
+`run-tests.sh` and CI. A change to Rust's transform semantics rewrote its own
+expectations on the way past. The file is now checked in, both engines are
+replayed against it, and neither test regenerates it.
+
 ### Added — muting, leaving, and search that takes you to the message
 
 Three things the server already did and the client never offered.
