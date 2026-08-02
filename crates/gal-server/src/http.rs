@@ -644,10 +644,21 @@ const ASSETS: &[Asset] = &[
     ),
 ];
 
+/// Paths the client routes itself, which must survive a page reload.
+///
+/// `app.js` writes exactly two shapes into the address bar — `/` and
+/// `/wave/<id>` — so those are the only ones the shell answers for.
+fn is_client_route(path: &str) -> bool {
+    path == "/"
+        || path
+            .strip_prefix("/wave/")
+            .is_some_and(|id| !id.contains('/'))
+}
+
 async fn static_asset(uri: axum::http::Uri) -> Response {
     let path = uri.path();
-    match ASSETS.iter().find(|a| a.0 == path) {
-        Some(Asset(_, content_type, body)) => (
+    if let Some(Asset(_, content_type, body)) = ASSETS.iter().find(|a| a.0 == path) {
+        return (
             [
                 (header::CONTENT_TYPE, *content_type),
                 // The client is versioned with the binary, so revalidate rather
@@ -656,18 +667,26 @@ async fn static_asset(uri: axum::http::Uri) -> Response {
             ],
             *body,
         )
-            .into_response(),
-        // Unknown paths fall back to the app shell so client-side routes such
-        // as /wave/<id> survive a page reload.
-        None => (
+            .into_response();
+    }
+
+    // The shell is served for the client's own routes, and *only* for those.
+    // Answering every unrouted path with it meant the server had no 404 at all:
+    // a mistyped endpoint came back as 200 and a page of HTML, so a monitoring
+    // system scraping /metrics recorded a healthy scrape of nothing, and a
+    // client calling /api/wavelet by mistake parsed markup as its error body.
+    if is_client_route(path) {
+        return (
             [
                 (header::CONTENT_TYPE, "text/html; charset=utf-8"),
                 (header::CACHE_CONTROL, "no-cache"),
             ],
             ASSETS[0].2,
         )
-            .into_response(),
+            .into_response();
     }
+
+    not_found("No such endpoint.")
 }
 
 /// Headers applied to every response.
@@ -802,6 +821,21 @@ mod tests {
             assert!(!content_type.is_empty());
             assert!(paths.insert(*path), "{path} is routed twice");
         }
+    }
+
+    #[test]
+    fn the_shell_answers_for_client_routes_and_nothing_else() {
+        // Reloading a deep link has to work: these are the paths app.js writes.
+        assert!(is_client_route("/"));
+        assert!(is_client_route("/wave/w-1"));
+
+        // Everything else is a 404, so the server has one at all.
+        assert!(!is_client_route("/metrics"));
+        assert!(!is_client_route("/api/wavelet"));
+        assert!(!is_client_route("/api/attachments"));
+        assert!(!is_client_route("/wave"));
+        assert!(!is_client_route("/wave/w-1/extra"));
+        assert!(!is_client_route("/favicon.ico"));
     }
 
     /// A bare scheme in a CSP source list matches *every host* using that
