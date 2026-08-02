@@ -118,6 +118,22 @@ impl TestServer {
     }
 
     async fn connect(&self, cookie: &str) -> TestClient {
+        let mut client = self.connect_raw(cookie).await;
+
+        // The first message is always the greeting.
+        match client.recv().await {
+            ServerMessage::Welcome { user, inbox } => {
+                client.user = user;
+                client.inbox = inbox;
+            }
+            other => panic!("expected welcome, got {other:?}"),
+        }
+        client
+    }
+
+    /// Open a socket without insisting on a greeting, for the cases where the
+    /// server is expected to say no instead.
+    async fn connect_raw(&self, cookie: &str) -> TestClient {
         let url = self.base.replace("http://", "ws://") + "/ws";
         let mut request = url.into_client_request().unwrap();
         request
@@ -127,7 +143,7 @@ impl TestServer {
         let (socket, _) = connect_async(request)
             .await
             .expect("websocket upgrade failed");
-        let mut client = TestClient {
+        TestClient {
             socket,
             user: PublicUser {
                 id: UserId::from(""),
@@ -139,17 +155,7 @@ impl TestServer {
             presence: Vec::new(),
             inbox: Vec::new(),
             op_counter: 0,
-        };
-
-        // The first message is always the greeting.
-        match client.recv().await {
-            ServerMessage::Welcome { user, inbox } => {
-                client.user = user;
-                client.inbox = inbox;
-            }
-            other => panic!("expected welcome, got {other:?}"),
         }
-        client
     }
 }
 
@@ -1047,6 +1053,83 @@ async fn every_response_carries_a_request_id() {
         passed_through.headers().get("x-request-id").unwrap(),
         "from-the-proxy"
     );
+}
+
+/// The expensive commands are the point of this: playback reads the whole op
+/// log for a wave, and it was callable as fast as a client could write frames.
+#[tokio::test]
+async fn a_flood_of_expensive_commands_is_refused() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, _, _) = create_wave(&mut alice, "Replayed", vec![]).await;
+
+    // The allowance is 1200 with playback at 60, so this is comfortably past it
+    // even accounting for what creating the wave already spent.
+    for _ in 0..40 {
+        alice
+            .send(ClientMessage::RequestPlayback {
+                wave_id: wave_id.clone(),
+            })
+            .await;
+    }
+
+    let code = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        code,
+        ErrorCode::TooManyRequests,
+        "playback should be refused once the allowance is gone"
+    );
+}
+
+/// The limit is only worth having if it never touches anyone real. Typing is
+/// one op per acknowledgement, so this is what a fast typist looks like.
+#[tokio::test]
+async fn ordinary_typing_never_reaches_the_allowance() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (_, _, blip) = create_wave(&mut alice, "Typed", vec![]).await;
+
+    for i in 0..300 {
+        alice.edit(&blip, Delta::new().retain(i).insert("x")).await;
+        alice
+            .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+            .await;
+    }
+
+    assert_eq!(
+        alice.text(&blip),
+        "x".repeat(300),
+        "an edit was refused that should not have been"
+    );
+}
+
+#[tokio::test]
+async fn one_account_cannot_hold_unlimited_sockets() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+
+    // Held in a vec: dropping them would close the sockets and free the slots.
+    let mut held = Vec::new();
+    for _ in 0..24 {
+        held.push(server.connect(&cookie).await);
+    }
+
+    let mut refused = server.connect_raw(&cookie).await;
+    let code = refused
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::Welcome { .. } => panic!("the 25th connection was greeted"),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::TooManyRequests);
 }
 
 #[tokio::test]

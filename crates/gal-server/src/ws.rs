@@ -28,6 +28,14 @@ const OUTBOUND_CAPACITY: usize = 512;
 /// could be used to exhaust server memory.
 const MAX_FRAME_BYTES: usize = 1 << 20;
 
+/// Sockets one account may hold open at once.
+///
+/// Each one costs a task, a 512-slot queue, and keeps every wave it is watching
+/// resident. There was no cap at all, so a single account could open as many as
+/// it could afford file descriptors for. Well above a person with a lot of tabs
+/// and a phone, and far below anything that hurts.
+const MAX_CONNECTIONS_PER_USER: usize = 24;
+
 use crate::state::{MAX_BLIP_RUNS, MAX_BLIP_UNITS};
 
 pub async fn handler(
@@ -75,6 +83,26 @@ struct Session {
 
 async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
     let (mut sink, mut stream) = socket.split();
+
+    if state.connections_for(&user.id) >= MAX_CONNECTIONS_PER_USER {
+        tracing::warn!(
+            user = %user.id,
+            open = state.connections_for(&user.id),
+            "refusing a connection: too many already open for this account"
+        );
+        // Said in the protocol's own words rather than dropped, so the client
+        // reports it instead of reconnecting into the same wall for ever.
+        let refusal = ServerMessage::error(
+            ErrorCode::TooManyRequests,
+            "Too many connections open for this account. Close a tab and reload.",
+        );
+        if let Ok(json) = serde_json::to_string(&refusal) {
+            let _ = sink.send(Message::Text(json.into())).await;
+        }
+        let _ = sink.close().await;
+        return;
+    }
+
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(OUTBOUND_CAPACITY);
     let conn_id = state.register_conn(user.id.clone(), tx.clone());
     state.metrics.connection_opened();
@@ -146,6 +174,11 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
             Ok(command) => {
                 let name = command.name();
                 state.metrics.command(name);
+
+                if !state.check_command_rate(&session.user.id, &command) {
+                    let _ = session.tx.try_send(over_allowance(&command));
+                    continue;
+                }
                 // A panic in here is a bug, and it used to take the whole
                 // process with it — `panic = "abort"` made one malformed edit
                 // in one wave an outage for every other connection on the box,
@@ -207,6 +240,26 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
     state.metrics.connection_closed();
     tracing::debug!(conn = conn_id, user = %user.id, "websocket closed");
     writer.abort();
+}
+
+/// How to say "too fast" for a command that has been refused.
+///
+/// A refused *edit* must name the blip it was for. A bare refusal leaves the
+/// client holding an op it retries for ever, with everything typed afterwards
+/// queued behind it — the same rule the mode checks follow. Saying resync is
+/// how the client is told to reload that one document and carry on, rather than
+/// being left to guess which of them the server would not take.
+fn over_allowance(command: &ClientMessage) -> ServerMessage {
+    match command {
+        ClientMessage::Submit { blip_id, .. } => ServerMessage::resync(
+            blip_id.clone(),
+            "Edits are arriving faster than this server will take them; reloading this message.",
+        ),
+        _ => ServerMessage::error(
+            ErrorCode::TooManyRequests,
+            "You are doing that too fast. Wait a moment and try again.",
+        ),
+    }
 }
 
 /// The human-readable half of a panic payload, which is a `&str` or a `String`
@@ -1680,6 +1733,71 @@ fn internal(e: anyhow::Error) -> ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused edit must name the message it was for. A bare refusal leaves
+    /// the client holding an op it retries for ever, with everything typed
+    /// afterwards queued behind it — the same rule the mode checks follow, and
+    /// the reason this refusal is a resync rather than a plain error.
+    ///
+    /// Tested here rather than end-to-end because it is very hard to provoke
+    /// over a socket, and for a good reason: a refusal costs the sender
+    /// nothing, so an allowance emptied by expensive calls still refills fast
+    /// enough that a one-token Submit almost always gets through. Cheap
+    /// commands staying available while expensive ones throttle is the design,
+    /// which leaves this branch rare — and rare is exactly when a client
+    /// retrying for ever would go unnoticed.
+    #[test]
+    fn a_refused_edit_says_which_message_to_reload() {
+        let blip = BlipId::from("b-7");
+        let refusal = over_allowance(&ClientMessage::Submit {
+            blip_id: blip.clone(),
+            revision: 4,
+            delta: Delta::new().insert("x"),
+            op_id: None,
+        });
+        assert!(matches!(
+            refusal,
+            ServerMessage::Error {
+                code: ErrorCode::Resync,
+                blip_id: Some(ref id),
+                ..
+            } if id == &blip
+        ));
+
+        // Everything else is a plain refusal: there is no document waiting on
+        // it, and saying resync would send the client to reload for nothing.
+        let other = over_allowance(&ClientMessage::Search {
+            query: "anything".into(),
+        });
+        assert!(matches!(
+            other,
+            ServerMessage::Error {
+                code: ErrorCode::TooManyRequests,
+                blip_id: None,
+                ..
+            }
+        ));
+    }
+
+    /// Prices are only meaningful relative to each other, and the ordering is
+    /// the whole argument for having them: one flat price would have to be set
+    /// for playback and would then be no defence against a flood of cursors.
+    #[test]
+    fn a_command_that_reads_the_disk_costs_more_than_one_that_does_not() {
+        let playback = ClientMessage::RequestPlayback {
+            wave_id: WaveId::from("w-1"),
+        };
+        let search = ClientMessage::Search { query: "x".into() };
+        let cursor = ClientMessage::Cursor {
+            wave_id: WaveId::from("w-1"),
+            blip_id: BlipId::from("b-1"),
+            index: 0,
+            length: 0,
+        };
+        assert!(playback.cost() > search.cost());
+        assert!(search.cost() > cursor.cost());
+        assert_eq!(cursor.cost(), 1.0);
+    }
 
     #[test]
     fn titles_are_trimmed_bounded_and_never_empty() {

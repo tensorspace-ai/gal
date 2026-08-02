@@ -44,6 +44,20 @@ impl RateLimiter {
 
     /// Take one token. `false` means the caller is over their allowance.
     pub fn check(&self, key: &str) -> bool {
+        self.check_cost(key, 1.0)
+    }
+
+    /// Take `cost` tokens, for a surface where calls are not all worth the same.
+    ///
+    /// A WebSocket command can be a cursor position or it can be a replay of
+    /// twenty thousand rows off the disk; one bucket with one price per call
+    /// would have to be set for the second and would then be useless against a
+    /// flood of the first.
+    ///
+    /// A caller with fewer than `cost` tokens is refused *and charged nothing*,
+    /// so an expensive call it cannot afford does not also drain what it needs
+    /// for the cheap ones.
+    pub fn check_cost(&self, key: &str, cost: f64) -> bool {
         let now = Instant::now();
         let mut buckets = match self.buckets.lock() {
             Ok(b) => b,
@@ -68,8 +82,8 @@ impl RateLimiter {
         bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         bucket.last = now;
 
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
+        if bucket.tokens >= cost {
+            bucket.tokens -= cost;
             true
         } else {
             false

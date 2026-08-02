@@ -447,6 +447,15 @@ The interesting parts:
   login endpoint a denial-of-service amplifier: before this, 500 concurrent login
   attempts drove unrelated request latency from 0.2 ms to over a second.
   Hashing also runs off the async reactor so it cannot stall live editing.
+- **The WebSocket is metered too**, which for a long time it was not: every
+  limiter was on an HTTP endpoint while the socket carried twenty commands,
+  including the two that read the database hardest. Commands are now charged
+  against a per-*account* allowance — so opening more sockets buys none — and
+  priced by what they cost, because one flat price would have to be set for
+  replaying a wave's entire op log and would then be no defence against a flood
+  of cursor positions. A refusal costs nothing, so an expensive call a client
+  cannot afford does not also drain what it needs to keep typing. One account
+  may hold 24 sockets open at once.
 - **The member directory is not enumerable.** `/api/users` returns only people
   you already share a wave with; adding anyone else requires their exact
   username.
@@ -485,10 +494,12 @@ Disclosed rather than hidden, because some of these matter for how you deploy it
 - **No federation** between servers.
 - **No end-to-end encryption.** The server can read everything; private replies
   are enforced by the server, not by cryptography.
-- **Quotas are coarse.** Login, registration, and username lookup are rate
-  limited per client, and a single document is bounded in length, runs and
-  formatting, but an authenticated user can still create a large number of
-  waves and a large number of messages in them.
+- **Quotas are rates, not totals.** Every WebSocket command is charged against
+  a per-account allowance priced by what it costs the server, and a single
+  document is bounded in length, runs and formatting — but nothing caps the
+  *total* a patient account can accumulate. Someone willing to stay under the
+  rate can still make a great many waves over a great many days, and there is
+  no per-user storage quota.
 
 Gal suits a team or community that broadly trusts its members. Close
 registration (`GAL_OPEN_REGISTRATION=0`) on anything internet-facing.

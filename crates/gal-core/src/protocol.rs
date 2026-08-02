@@ -329,6 +329,47 @@ impl ClientMessage {
             Self::Ping => "ping",
         }
     }
+
+    /// What this command costs against a sender's allowance.
+    ///
+    /// Commands are nowhere near equal: a cursor position touches memory, a
+    /// playback request reads up to twenty thousand op rows off the disk,
+    /// deserialises every delta and serialises the lot back to one client. One
+    /// flat price per call would have to be set high enough for the second and
+    /// would then be no defence against a flood of the first.
+    ///
+    /// Written as a match with no wildcard arm, so adding a command is a
+    /// compile error here rather than a new way in that costs nothing.
+    pub fn cost(&self) -> f64 {
+        match self {
+            // Reads the whole op log for a wave.
+            Self::RequestPlayback { .. } => 60.0,
+            // A full-text query across everything the caller participates in.
+            Self::Search { .. } => 20.0,
+            // Writes: a row, a wavelet, or an invitation someone else has to
+            // live with. Bounded well above what a person does by hand.
+            Self::CreateWave { .. } | Self::PrivateReply { .. } => 20.0,
+            Self::CreateBlip { .. }
+            | Self::CreateComment { .. }
+            | Self::AddParticipant { .. }
+            | Self::RemoveParticipant { .. } => 5.0,
+            Self::DeleteBlip { .. }
+            | Self::ReplyToComment { .. }
+            | Self::ResolveComment { .. }
+            | Self::SetTitle { .. }
+            | Self::SetMode { .. }
+            | Self::SetFlags { .. }
+            | Self::Open { .. } => 3.0,
+            // The high-frequency ones. Typing produces these continuously and
+            // legitimately, so they have to stay cheap enough that a fast
+            // typist with several messages open is never near the limit.
+            Self::Submit { .. }
+            | Self::Cursor { .. }
+            | Self::MarkRead { .. }
+            | Self::Close { .. }
+            | Self::Ping => 1.0,
+        }
+    }
 }
 
 // --- server to client ---------------------------------------------------
@@ -515,6 +556,9 @@ pub enum ErrorCode {
     Resync,
     /// The action is not allowed for this user.
     Forbidden,
+    /// The sender is over their allowance and should slow down. Distinct from
+    /// `Forbidden` because it is temporary and retrying later will work.
+    TooManyRequests,
     Internal,
 }
 

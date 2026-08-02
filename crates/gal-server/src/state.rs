@@ -488,6 +488,11 @@ pub struct AppState {
     auth_limiter: RateLimiter,
     /// Username lookup, which is an existence oracle by nature.
     lookup_limiter: RateLimiter,
+    /// Every WebSocket command, priced by what it costs the server. Keyed by
+    /// *user* rather than by address or connection: the socket is authenticated,
+    /// so the account is the thing to hold to an allowance, and opening more
+    /// connections must not buy more of it.
+    command_limiter: RateLimiter,
     /// Makes the next dispatched command panic, so the containment around it can
     /// be tested with a real panic on a real connection rather than by trusting
     /// that it would work. There is no reachable panic to provoke on purpose,
@@ -512,6 +517,12 @@ impl AppState {
             // makes ten attempts a second.
             auth_limiter: RateLimiter::new(10.0, 0.5),
             lookup_limiter: RateLimiter::new(30.0, 2.0),
+            // Sized so that ordinary use never reaches it and abuse does.
+            // Typing is one op per acknowledgement per message, so a fast
+            // typist with several messages open runs at tens a second; this
+            // allows 200 a second sustained and a burst of six seconds' worth.
+            // At those prices it is 3 playbacks a second, or 10 searches.
+            command_limiter: RateLimiter::new(1200.0, 200.0),
             #[cfg(test)]
             panic_next_command: std::sync::atomic::AtomicBool::new(false),
         })
@@ -579,7 +590,35 @@ impl AppState {
         )
     }
 
+    /// Charge a command against its sender's allowance.
+    ///
+    /// `false` means refuse it. The whole WebSocket surface was unmetered:
+    /// every limiter this server had was on an HTTP endpoint, while the socket
+    /// carried twenty commands including the two that read the database
+    /// hardest, and an authenticated client could call any of them as fast as
+    /// it could write frames.
+    pub fn check_command_rate(&self, user_id: &UserId, command: &ClientMessage) -> bool {
+        if self
+            .command_limiter
+            .check_cost(user_id.as_str(), command.cost())
+        {
+            return true;
+        }
+        self.metrics.rate_limit("command");
+        tracing::warn!(
+            user = %user_id,
+            command = command.name(),
+            "over the command allowance"
+        );
+        false
+    }
+
     // --- connections ----------------------------------------------------
+
+    /// How many sockets this user currently has open.
+    pub fn connections_for(&self, user_id: &UserId) -> usize {
+        self.user_conns.get(user_id).map(|s| s.len()).unwrap_or(0)
+    }
 
     pub fn register_conn(&self, user_id: UserId, tx: mpsc::Sender<ServerMessage>) -> ConnId {
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
