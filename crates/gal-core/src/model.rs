@@ -6,10 +6,13 @@
 //! ```text
 //! Wave                       a conversation, the unit that appears in your inbox
 //! └── Wavelet                a participant set + a threaded document
-//!     ├── conv+root          the main conversation everyone in it can see
-//!     └── conv+<id>          a private reply: fewer participants, anchored to a blip
+//!     ├── conversation       the main thread everyone in it can see
+//!     └── privateReply       fewer participants, anchored to a blip
 //!         └── Blip           one message, itself a live collaborative document
 //! ```
+//!
+//! Ids are prefixed by kind of *object* — `w-`, `s-`, `b-` — and which sort of
+//! wavelet it is lives in [`Wavelet::kind`], not in its identifier.
 //!
 //! Access control lives on the *wavelet*, not the wave. That is what makes
 //! private replies work: a wave can hold a public thread and a side conversation

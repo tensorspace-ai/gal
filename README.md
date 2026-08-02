@@ -6,7 +6,8 @@ Wave's idea was that a conversation is a *shared document*, not a log of message
 you send at each other. Everyone in a wave can edit every message in it, live,
 character by character — and the history of how it got written is part of the
 document. Gal rebuilds that on modern foundations: WebSockets instead of long
-polling, one static binary instead of a Java stack, and no plugins in the browser.
+polling, a single Rust binary instead of a Java stack, and no plugins in the
+browser.
 
 ![A Gal wave: three participants, one message being co-edited, a threaded reply,
 and a private reply visible only to two of
@@ -21,13 +22,20 @@ because nothing has the caret; click into a message and they move into it.
 ## Running it
 
 ```sh
-cargo run --release -p gal-server
+cargo install gal-server     # or from a checkout: cargo run --release -p gal-server
+gal-server
 ```
+
+Binaries for Linux and macOS are attached to each
+[release](https://github.com/tensorspace-ai/gal/releases), and images are at
+`ghcr.io/tensorspace-ai/gal`. Building from source needs Rust 1.87 or newer and
+a C compiler, since SQLite is compiled in.
 
 Then open <http://127.0.0.1:8080> and sign up. The first account you create is
 just a normal account — there is no separate admin setup. Everything lives in one
-SQLite file (`gal.db` by default), and the web client is compiled into the
-binary, so deploying is copying one file.
+SQLite file (`gal.db` by default, plus its WAL sidecar — see
+[Backups](#backups)), and the web client is compiled into the binary, so
+deploying is copying one file.
 
 | Variable                   | Default     | Meaning                                              |
 | -------------------------- | ----------- | ---------------------------------------------------- |
@@ -105,8 +113,7 @@ upgrading.
 - **Live co-editing.** Any participant can edit any message. Multiple people can
   type into the same message at once and everyone converges, with no locking and
   no last-write-wins.
-- **Threaded conversations.** Reply under a message, or reply beside it. Threads
-  nest arbitrarily.
+- **Threaded conversations.** Reply under any message; threads nest arbitrarily.
 - **Modes.** A wave has a mode that decides what people can do in it, and its
   creator can change it at any time:
 
@@ -187,8 +194,12 @@ upgrading.
   the database and the URL still fetchable by the wavelet's participants. That
   is deliberate — playback replays the op log, so a file that was in a wave
   yesterday has to still resolve when you scrub back to yesterday — but it does
-  mean attachment storage only grows. Removing a wave *does* take its files with
-  it. If you need a retraction to be a deletion, it is not one yet.
+  mean attachment storage only grows. **There is no way to delete a wave**, so
+  there is currently no path that reclaims the space: the foreign keys cascade
+  correctly, but nothing in the server or the client issues the delete. Until
+  one exists, `gal.db` only grows, and reclaiming space means removing rows by
+  hand with `sqlite3`. If you need a retraction to be a deletion, it is not one
+  yet.
 - **Unread tracking that understands editing.** Read state is per *revision*, so
   a message you have already read becomes unread again when somebody revises it.
 - **Full-text search** across every wave you participate in, with highlights.
@@ -211,10 +222,14 @@ crates/
 ```
 Wave                  a conversation; the unit that appears in your inbox
 └── Wavelet           a participant set + a threaded document
-    ├── conv+root     the main conversation
-    └── conv+<id>     a private reply: fewer participants, anchored to a blip
+    ├── conversation  the main thread, which every participant can see
+    └── privateReply  fewer participants, anchored to a blip
         └── Blip      one message, itself a live collaborative document
 ```
+
+Ids are opaque and prefixed by kind of *object*, not kind of wavelet: `w-` for a
+wave, `s-` for a wavelet, `b-` for a blip. Which sort of wavelet it is lives in
+its `kind` column.
 
 Access control lives on the **wavelet**, not the wave. That is the whole trick
 behind private replies: one wave can hold a public thread and a side conversation

@@ -59,7 +59,7 @@ const vectorPath = join(here, 'vectors.json');
 if (!existsSync(vectorPath)) {
   console.error(
     'vectors.json missing — generate it with:\n' +
-      '  cargo run -p gal-ot --example gen_vectors > crates/gal-server/src/web/vectors.json',
+      '  cargo run -q -p gal-ot --example gen_vectors > tests/vectors.json',
   );
   process.exit(1);
 }

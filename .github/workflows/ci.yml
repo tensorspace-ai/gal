@@ -61,3 +61,29 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Advisories are one question; what a shipped binary is allowed to carry is
+  # another. An explicit licence allow-list, and no source but crates.io.
+  deny:
+    name: licences and sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
+  # The Dockerfile is only built by the release, so a change that breaks it
+  # would otherwise surface at the worst possible moment.
+  docker:
+    name: the image still builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

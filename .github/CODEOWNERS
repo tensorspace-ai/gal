@@ -1,0 +1,7 @@
+# Review falls to the maintainers by default.
+*       @tensorspace-ai/maintainers
+
+# The transformation engine and the wire protocol: a change here reaches every
+# connected client, and a wrong one corrupts documents rather than failing.
+/crates/gal-ot/     @tensorspace-ai/maintainers
+/crates/gal-core/   @tensorspace-ai/maintainers
