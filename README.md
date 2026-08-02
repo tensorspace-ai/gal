@@ -47,7 +47,9 @@ deploying is copying one file.
 | `GAL_HSTS`                 | `0`         | Set to `1` to send HSTS. HTTPS only — a browser that caches it cannot reach a plain-HTTP deployment afterwards |
 | `GAL_ALLOWED_ORIGINS`      | *(none)*    | Extra origins allowed to open a WebSocket, comma-separated. Same-origin always works |
 | `GAL_TRUST_FORWARDED_FOR`  | `0`         | Set to `1` **only** behind a proxy that overwrites `X-Forwarded-For`; otherwise clients can spoof it and evade rate limits |
-| `GAL_LOG`                  | `gal_server=info,tower_http=warn` | `tracing` filter. `GAL_LOG=tower_http=info` adds an access log |
+| `GAL_LOG`                  | `gal_server=info,tower_http=warn` | `tracing` filter                                      |
+| `GAL_LOG_JSON`             | `0`         | Set to `1` to emit one JSON object per line instead of the human format |
+| `GAL_METRICS_TOKEN`        | *(none)*    | Bearer token for `GET /metrics`. Unset disables the endpoint; must be at least 16 characters |
 
 Boolean variables accept `1`, `true`, `yes`, `on` and their opposites `0`,
 `false`, `no`, `off`. An empty value is false, so `GAL_SECURE_COOKIES=` means
@@ -86,6 +88,37 @@ compiled from source and linked in:
 docker build -t gal .
 docker run -p 8080:8080 -v gal-data:/data -e GAL_OPEN_REGISTRATION=0 gal
 ```
+
+### Watching it run
+
+Every request writes one log line — method, path, status, duration, and a
+request id — at `info`. The id comes from an inbound `X-Request-Id` when a proxy
+set one, and is echoed on the response either way, so a report of a slow or
+failed request can be found in the log. Paths are logged **without** their query
+string, so `/api/lookup?name=alice` does not put usernames in your logs.
+
+`GET /metrics` serves Prometheus text. It is **off until you set
+`GAL_METRICS_TOKEN`**, and returns 404 rather than 401 until you do — what it
+exposes is how many people use this server and when, which is not something to
+publish by default and then hope a proxy rule catches. With a token set, scrape
+it with `Authorization: Bearer <token>`.
+
+```sh
+curl -H "Authorization: Bearer $GAL_METRICS_TOKEN" http://127.0.0.1:8080/metrics
+```
+
+Counters cover commands by name, HTTP responses by status, ops applied, refused
+and rolled back, rate-limit refusals by limiter, panics, and unparseable frames;
+gauges cover open connections and resident waves. The one to alert on is
+`gal_ws_slow_client_disconnects_total`: a client whose outbound queue overflows
+has already missed messages and is disconnected so it resynchronises, and that
+is invisible to everyone but the person it happens to. `gal_ops_persist_failures_total`
+should be flat at zero — it counts edits that were applied in memory, would not
+write, and were rolled back.
+
+There are no latency histograms. Per-request duration is in the access log,
+which answers "what is slow" at this size; buckets are worth adding when
+somebody needs a quantile across more than one machine.
 
 ### Backups
 

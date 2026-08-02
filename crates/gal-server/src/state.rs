@@ -106,6 +106,9 @@ pub struct LiveWave {
     /// blocked on this very lock, so it observes the flag and reloads instead of
     /// attaching itself to an orphaned copy.
     pub evicted: bool,
+    /// Shared with `AppState`, so the places that drop a subscriber can say so.
+    /// Those are the ones worth counting and the ones with no other voice.
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl LiveWave {
@@ -266,6 +269,19 @@ impl LiveWave {
                 // Wakes the connection task, which closes the socket. The client
                 // reconnects and re-opens, which is a full resynchronisation.
                 sub.kill.notify_waiters();
+                // Counted and logged because it is otherwise perfectly silent:
+                // the user sees a reconnect, the operator sees nothing, and a
+                // server that is quietly resynchronising everybody looks
+                // healthy from outside.
+                self.metrics
+                    .ws_slow_client_disconnects
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    conn = conn_id,
+                    user = %sub.user_id,
+                    wave = %self.wave.id,
+                    "outbound queue overflowed; disconnecting so the client resynchronises"
+                );
             }
         }
     }
@@ -458,6 +474,7 @@ pub struct ConnHandle {
 pub struct AppState {
     pub db: Storage,
     pub config: Config,
+    pub metrics: Arc<crate::metrics::Metrics>,
     waves: DashMap<WaveId, Arc<Mutex<LiveWave>>>,
     conns: DashMap<ConnId, ConnHandle>,
     user_conns: DashMap<UserId, HashSet<ConnId>>,
@@ -484,6 +501,7 @@ impl AppState {
         Arc::new(AppState {
             db,
             config,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
             waves: DashMap::new(),
             conns: DashMap::new(),
             user_conns: DashMap::new(),
@@ -512,6 +530,7 @@ impl AppState {
             headers,
             peer,
             "Too many attempts. Wait a moment and try again.",
+            "auth",
         )
     }
 
@@ -525,6 +544,7 @@ impl AppState {
             headers,
             peer,
             "Too many lookups. Slow down.",
+            "lookup",
         )
     }
 
@@ -534,6 +554,7 @@ impl AppState {
         headers: &axum::http::HeaderMap,
         peer: Option<std::net::IpAddr>,
         message: &str,
+        name: &'static str,
     ) -> Option<axum::response::Response> {
         use axum::response::IntoResponse;
 
@@ -545,6 +566,9 @@ impl AppState {
         if limiter.check(&key) {
             return None;
         }
+        // A limiter that is doing its job and a limiter that is refusing real
+        // people look identical from inside the process.
+        self.metrics.rate_limit(name);
         Some(
             (
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -626,11 +650,13 @@ impl AppState {
             subscribers: HashMap::new(),
             user_cache: HashMap::new(),
             evicted: false,
+            metrics: self.metrics.clone(),
         };
         live.user_cache = all_users.into_iter().map(|u| (u.id.clone(), u)).collect();
 
         let arc = Arc::new(Mutex::new(live));
         self.waves.insert(wave_id.clone(), arc.clone());
+        self.metrics.wave_loaded();
         Ok(Some(arc))
     }
 
@@ -653,6 +679,7 @@ impl AppState {
         if live.subscribers.is_empty() {
             live.evicted = true;
             self.waves.remove(wave_id);
+            self.metrics.wave_evicted();
         }
     }
 
@@ -682,6 +709,10 @@ impl AppState {
         live.disconnect(&watching);
         live.evicted = true;
         self.waves.remove(wave_id);
+        self.metrics.wave_evicted();
+        self.metrics
+            .waves_evicted_after_panic
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Refresh the cached profile of a user in every resident wave, so a newly
@@ -836,6 +867,9 @@ impl AppState {
             )
             .await
         {
+            self.metrics
+                .ops_persist_failures
+                .fetch_add(1, Ordering::Relaxed);
             tracing::error!(error = %e, blip = %blip_id, "failed to persist op; rolling back");
             if let Some(blip) = live.blips.get_mut(blip_id) {
                 blip.doc.rollback_last();
@@ -846,6 +880,8 @@ impl AppState {
                 "The server could not save your edit; reloading this wave.",
             ));
         }
+
+        self.metrics.ops_applied.fetch_add(1, Ordering::Relaxed);
 
         if let Some(wavelet) = live.wavelet_mut(&wavelet_id) {
             wavelet.last_modified = meta.last_modified;

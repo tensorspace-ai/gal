@@ -27,6 +27,15 @@ pub struct Config {
     /// Send HSTS. Only meaningful behind HTTPS, and harmful before it, since a
     /// browser that caches it cannot reach a plain-HTTP deployment afterwards.
     pub hsts: bool,
+    /// Bearer token a `/metrics` scrape must present.
+    ///
+    /// `None` disables the endpoint entirely, which is the default. Metrics
+    /// describe how busy a server is, how many people are on it and when — so
+    /// the endpoint is off until an operator says otherwise, rather than open
+    /// and relying on a proxy rule nobody wrote.
+    pub metrics_token: Option<String>,
+    /// Emit logs as JSON rather than for a human reader.
+    pub log_json: bool,
 }
 
 impl Default for Config {
@@ -39,6 +48,8 @@ impl Default for Config {
             allowed_origins: Vec::new(),
             trust_forwarded_for: false,
             hsts: false,
+            metrics_token: None,
+            log_json: false,
         }
     }
 }
@@ -80,6 +91,21 @@ impl Config {
         }
         if let Ok(value) = std::env::var("GAL_HSTS") {
             config.hsts = parse_bool("GAL_HSTS", &value)?;
+        }
+        if let Ok(value) = std::env::var("GAL_METRICS_TOKEN") {
+            let value = value.trim().to_string();
+            // A short token on an endpoint that describes your traffic is worse
+            // than no endpoint, and an empty one would open it to anyone who
+            // sends an empty bearer. Refuse rather than approximate.
+            if !value.is_empty() {
+                if value.len() < 16 {
+                    anyhow::bail!("GAL_METRICS_TOKEN must be at least 16 characters");
+                }
+                config.metrics_token = Some(value);
+            }
+        }
+        if let Ok(value) = std::env::var("GAL_LOG_JSON") {
+            config.log_json = parse_bool("GAL_LOG_JSON", &value)?;
         }
         Ok(config)
     }

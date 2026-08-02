@@ -5,6 +5,7 @@
 //! waves it is watching.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -76,6 +77,8 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(OUTBOUND_CAPACITY);
     let conn_id = state.register_conn(user.id.clone(), tx.clone());
+    state.metrics.connection_opened();
+    tracing::debug!(conn = conn_id, user = %user.id, "websocket opened");
 
     // Writer task: the only place that touches the socket's send half.
     let writer = tokio::spawn(async move {
@@ -142,6 +145,7 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         match parsed {
             Ok(command) => {
                 let name = command.name();
+                state.metrics.command(name);
                 // A panic in here is a bug, and it used to take the whole
                 // process with it — `panic = "abort"` made one malformed edit
                 // in one wave an outage for every other connection on the box,
@@ -156,6 +160,10 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
                         let _ = session.tx.try_send(reply);
                     }
                     Err(payload) => {
+                        state
+                            .metrics
+                            .ws_command_panics
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::error!(
                             command = name,
                             user = %session.user.id,
@@ -179,6 +187,10 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
                 }
             }
             Err(e) => {
+                state
+                    .metrics
+                    .ws_frames_unparseable
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = session.tx.try_send(ServerMessage::error(
                     ErrorCode::BadRequest,
                     format!("Could not understand that message: {e}"),
@@ -192,6 +204,8 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         leave_wave(&state, &mut session, &wave_id).await;
     }
     state.unregister_conn(conn_id);
+    state.metrics.connection_closed();
+    tracing::debug!(conn = conn_id, user = %user.id, "websocket closed");
     writer.abort();
 }
 
@@ -249,11 +263,15 @@ async fn dispatch(
             // client holding work it retries forever, and everything typed
             // afterwards piles up behind it.
             if let Err(refusal) = check_embeds(&delta).and_then(|_| check_attributes(&delta)) {
+                state.metrics.ops_refused.fetch_add(1, Ordering::Relaxed);
                 return Err(name_blip(*refusal, &blip_id));
             }
             let (_, wave) = find_blip(state, session, &blip_id).await?;
             let mut live = wave.lock().await;
-            state
+            // Counted here rather than at each refusal inside apply_op: this is
+            // the one place every reason an edit can be declined — mode, size,
+            // attributes, a revision too old to transform from — passes through.
+            let outcome = state
                 .apply_op(
                     &mut live,
                     session.conn_id,
@@ -265,7 +283,11 @@ async fn dispatch(
                         op_id,
                     },
                 )
-                .await
+                .await;
+            if outcome.is_err() {
+                state.metrics.ops_refused.fetch_add(1, Ordering::Relaxed);
+            }
+            outcome
         }
 
         ClientMessage::CreateBlip {

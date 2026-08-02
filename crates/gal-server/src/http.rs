@@ -644,6 +644,86 @@ const ASSETS: &[Asset] = &[
     ),
 ];
 
+/// Prometheus exposition, behind a bearer token.
+///
+/// Off unless `GAL_METRICS_TOKEN` is set. What this returns says how many people
+/// are using a server and when, which is not something to publish by default on
+/// the assumption that an operator wrote a proxy rule for it.
+async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(expected) = state.config.metrics_token.as_deref() else {
+        // Indistinguishable from any other unrouted path, so a scan cannot tell
+        // whether the endpoint exists but is guarded.
+        return not_found("No such endpoint.");
+    };
+
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !auth::constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "Not authorised.".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render(),
+    )
+        .into_response()
+}
+
+/// One log line per request, and a request id carried on the response.
+///
+/// There was no access log by default and no way to tie a 500 to the request
+/// that caused it: `server_error` logged the error alone, so two concurrent
+/// failures were indistinguishable in the output.
+///
+/// The path is logged without its query string. `/api/lookup?name=alice` would
+/// otherwise put usernames in the log of every deployment that turns logging up.
+async fn observe(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    // An id from a proxy in front of us wins, so one request has one id across
+    // every hop that logged it.
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.len() <= 200 && v.is_ascii())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let started = std::time::Instant::now();
+    let mut response = next.run(request).await;
+    let status = response.status();
+    let millis = started.elapsed().as_secs_f64() * 1000.0;
+
+    state.metrics.http_response(status.as_u16());
+    tracing::info!(
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        status = status.as_u16(),
+        duration_ms = format!("{millis:.1}"),
+        "request"
+    );
+
+    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
 /// Paths the client routes itself, which must survive a page reload.
 ///
 /// `app.js` writes exactly two shapes into the address bar — `/` and
@@ -748,6 +828,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/attachments/{id}", get(get_attachment))
         // Before the fallback, so it is a real signal rather than the app shell.
         .route("/healthz", get(health))
+        .route("/metrics", get(metrics))
         .route("/ws", get(crate::ws::handler))
         .fallback(static_asset);
 
@@ -757,7 +838,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::http::HeaderValue::from_static(value),
         ));
     }
-    router.with_state(state)
+    router
+        .layer(axum::middleware::from_fn_with_state(state.clone(), observe))
+        .with_state(state)
 }
 
 #[cfg(test)]

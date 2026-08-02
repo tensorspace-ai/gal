@@ -57,6 +57,22 @@ pub fn hash_token(token: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
+/// Compare two secrets without letting the time taken reveal how much of one
+/// was guessed.
+///
+/// Both sides are hashed first. That makes the comparison fixed-length as well
+/// as constant-time in the content: a plain byte loop returns early when the
+/// lengths differ, which hands an attacker the length of the secret for free.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    let (a, b) = (Sha256::digest(a), Sha256::digest(b));
+    let mut difference = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        difference |= x ^ y;
+    }
+    difference == 0
+}
+
 /// Build the `Set-Cookie` header value for a new session.
 pub fn session_cookie(token: &str, secure: bool, max_age_secs: i64) -> String {
     let mut cookie =

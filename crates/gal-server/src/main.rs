@@ -7,6 +7,7 @@ mod db;
 mod e2e;
 mod http;
 mod limit;
+mod metrics;
 mod state;
 mod ws;
 
@@ -51,17 +52,29 @@ fn healthcheck(config: &Config) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("GAL_LOG")
-                .unwrap_or_else(|_| "gal_server=info,tower_http=warn".into()),
-        )
-        .with_target(false)
-        .init();
+    // Read before logging is set up, so a bad value is reported rather than
+    // logged in a format the operator did not choose.
+    let config = Config::from_env()?;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_env("GAL_LOG")
+        .unwrap_or_else(|_| "gal_server=info,tower_http=warn".into());
+    if config.log_json {
+        // One JSON object per line, for anything that ships logs somewhere. The
+        // human format is unparseable by design — it is aligned for reading.
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    }
 
     install_panic_logger();
-
-    let config = Config::from_env()?;
 
     // `--healthcheck` probes an already-running instance and exits; it does not
     // start a server or touch the database directly.

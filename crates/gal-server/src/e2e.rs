@@ -39,12 +39,17 @@ impl Drop for TestServer {
 }
 
 async fn start_server() -> TestServer {
+    start_server_with(|_| {}).await
+}
+
+async fn start_server_with(adjust: impl FnOnce(&mut Config)) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path().join("e2e.db")).unwrap();
-    let config = Config {
+    let mut config = Config {
         database: dir.path().join("e2e.db"),
         ..Config::default()
     };
+    adjust(&mut config);
     let state = AppState::new(storage, config);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -908,6 +913,140 @@ async fn a_panicking_command_takes_down_one_connection_and_no_more() {
     let mut alice2 = server.connect(&alice_cookie).await;
     alice2.open(&wave_id).await;
     assert_eq!(alice2.text(&root_blip), "before and after");
+}
+
+#[tokio::test]
+async fn metrics_are_off_until_a_token_is_configured() {
+    let server = start_server().await;
+    let http = reqwest::Client::new();
+
+    // Not "401", which would confirm the endpoint exists on a server whose
+    // operator has not opted into publishing anything about its traffic.
+    let response = http
+        .get(format!("{}/metrics", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
+async fn metrics_need_the_token_and_then_report_real_activity() {
+    let server = start_server_with(|config| {
+        config.metrics_token = Some("a-token-of-sufficient-length".into());
+    })
+    .await;
+    let http = reqwest::Client::new();
+
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (_, _, blip) = create_wave(&mut alice, "Instrumented", vec![]).await;
+    alice.edit(&blip, Delta::new().insert("counted")).await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+
+    let unauthorised = http
+        .get(format!("{}/metrics", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorised.status(), 401);
+
+    let wrong = http
+        .get(format!("{}/metrics", server.base))
+        .header("authorization", "Bearer not-the-token-but-long-enough")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401);
+
+    let response = http
+        .get(format!("{}/metrics", server.base))
+        .header("authorization", "Bearer a-token-of-sufficient-length")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+
+    // The numbers have to come from what actually happened, or this is a test
+    // that the string constants are spelled right.
+    assert!(
+        body.contains("gal_ws_commands_total{command=\"submit\"} 1"),
+        "the submitted op was not counted:\n{body}"
+    );
+    assert!(
+        body.contains("gal_ws_commands_total{command=\"createWave\"} 1"),
+        "wave creation was not counted:\n{body}"
+    );
+    assert!(
+        body.contains("gal_ops_applied_total 1"),
+        "the applied op was not counted:\n{body}"
+    );
+    assert!(
+        body.contains("gal_ws_connections_active 1"),
+        "the open connection was not counted:\n{body}"
+    );
+    assert!(
+        body.contains("gal_waves_resident 1"),
+        "the resident wave was not counted:\n{body}"
+    );
+
+    // A counter nothing ever increments reports zero for ever and reads as
+    // "this never happens". Refuse an op and watch it move.
+    assert!(body.contains("gal_ops_refused_total 0"));
+    alice
+        .send(ClientMessage::Submit {
+            blip_id: blip.clone(),
+            revision: 9_000,
+            delta: Delta::new().insert("written against a revision that never was"),
+            op_id: Some("alice-refused".into()),
+        })
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Error { .. }).then_some(()))
+        .await;
+
+    let after = http
+        .get(format!("{}/metrics", server.base))
+        .header("authorization", "Bearer a-token-of-sufficient-length")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        after.contains("gal_ops_refused_total 1"),
+        "a refused op was not counted:\n{after}"
+    );
+}
+
+#[tokio::test]
+async fn every_response_carries_a_request_id() {
+    let server = start_server().await;
+    let http = reqwest::Client::new();
+
+    let fresh = http
+        .get(format!("{}/healthz", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert!(fresh.headers().contains_key("x-request-id"));
+
+    // A proxy in front of us has already given the request an id; adopt it, so
+    // one request reads as one request across every hop that logged it.
+    let passed_through = http
+        .get(format!("{}/healthz", server.base))
+        .header("x-request-id", "from-the-proxy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        passed_through.headers().get("x-request-id").unwrap(),
+        "from-the-proxy"
+    );
 }
 
 #[tokio::test]
