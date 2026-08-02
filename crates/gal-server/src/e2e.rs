@@ -1110,6 +1110,43 @@ async fn ordinary_typing_never_reaches_the_allowance() {
     );
 }
 
+/// axum's graceful shutdown covers HTTP requests and not WebSockets: an
+/// upgraded socket runs in a task it spawned and stopped tracking. So every
+/// deploy exited the process with every socket still live and mid-frame.
+#[tokio::test]
+async fn shutting_down_closes_the_sockets_instead_of_dropping_them() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, _, blip) = create_wave(&mut alice, "Deployed", vec![]).await;
+
+    alice
+        .edit(&blip, Delta::new().insert("committed before the deploy"))
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    assert_eq!(server.state.connections_for(&alice.user.id), 1);
+
+    server.state.begin_shutdown();
+
+    // The socket goes away on its own, without the process having to exit
+    // underneath it.
+    let left_open = server
+        .state
+        .drain_connections(std::time::Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        left_open, 0,
+        "a socket was still open after the grace period"
+    );
+
+    // And the edit that was acknowledged before the shutdown is still there.
+    let mut after = server.connect(&cookie).await;
+    after.open(&wave_id).await;
+    assert_eq!(after.text(&blip), "committed before the deploy");
+}
+
 #[tokio::test]
 async fn one_account_cannot_hold_unlimited_sockets() {
     let server = start_server().await;

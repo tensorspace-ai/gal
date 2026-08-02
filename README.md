@@ -89,6 +89,24 @@ docker build -t gal .
 docker run -p 8080:8080 -v gal-data:/data -e GAL_OPEN_REGISTRATION=0 gal
 ```
 
+### Stopping and restarting it
+
+On `SIGTERM` or Ctrl-C, Gal stops accepting requests, asks every open socket to
+close, and waits up to ten seconds for them to go before exiting. It logs
+whether they all went. This matters because axum's own graceful shutdown does
+not cover WebSockets — an upgraded socket runs in a task it no longer tracks —
+so a stop used to exit the process with every connection still mid-frame.
+
+Clients reconnect with backoff and replay what they had not sent, and ops are
+idempotent, so a restart costs a reconnection rather than anybody's typing.
+
+The server pings a silent socket every 30 seconds and drops one that has said
+nothing at all for two minutes. Browsers answer ping frames themselves, so this
+needs nothing from the client. It is there because a connection whose other end
+vanished — a laptop closed, a NAT that forgot — is otherwise indistinguishable
+from an idle one, and holds a task, a queue and every wave it was watching in
+memory indefinitely.
+
 ### Watching it run
 
 Every request writes one log line — method, path, status, duration, and a

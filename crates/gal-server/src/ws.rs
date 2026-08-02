@@ -16,6 +16,7 @@ use gal_core::model::*;
 use gal_core::protocol::*;
 use gal_ot::{Delta, Insert, OpKind};
 use std::sync::Arc as StdArc;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::auth::Identity;
@@ -35,6 +36,22 @@ const MAX_FRAME_BYTES: usize = 1 << 20;
 /// it could afford file descriptors for. Well above a person with a lot of tabs
 /// and a phone, and far below anything that hurts.
 const MAX_CONNECTIONS_PER_USER: usize = 24;
+
+/// How often the server pings an otherwise silent socket.
+///
+/// The client sends nothing while somebody is reading rather than typing, so
+/// without this there is no traffic at all on an idle connection and no way to
+/// tell one apart from a socket whose other end vanished. A browser answers a
+/// ping frame itself, so this costs the client nothing to support.
+const KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// How long a socket may produce nothing at all — not even a pong — before it
+/// is assumed dead.
+///
+/// A half-open connection behind a NAT is invisible to the server: it holds a
+/// task, a 512-slot queue, and keeps every wave it was watching resident for
+/// ever. Four missed pings is the judgement.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 use crate::state::{MAX_BLIP_RUNS, MAX_BLIP_UNITS};
 
@@ -108,14 +125,29 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
     state.metrics.connection_opened();
     tracing::debug!(conn = conn_id, user = %user.id, "websocket opened");
 
+    // Keepalive requests, kept apart from the message queue so that adding a
+    // control frame does not change the type every broadcast path sends.
+    let (ping_tx, mut ping_rx) = mpsc::channel::<()>(1);
+
     // Writer task: the only place that touches the socket's send half.
     let writer = tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            let Ok(json) = serde_json::to_string(&message) else {
-                continue;
-            };
-            if sink.send(Message::Text(json.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                message = rx.recv() => {
+                    let Some(message) = message else { break };
+                    let Ok(json) = serde_json::to_string(&message) else {
+                        continue;
+                    };
+                    if sink.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+                request = ping_rx.recv() => {
+                    if request.is_none() { break }
+                    if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         let _ = sink.close().await;
@@ -151,15 +183,44 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         inbox,
     });
 
+    let mut shutdown = state.shutdown_signal();
+    let mut keepalive = tokio::time::interval(KEEPALIVE);
+    keepalive.tick().await; // the first tick is immediate
+    let mut last_heard = Instant::now();
+
     loop {
         let incoming = tokio::select! {
             biased;
             // A client that overflowed its queue has already missed messages;
             // closing is what makes it reconnect and resynchronise.
             _ = kill.notified() => break,
+            // The server is stopping. Closing is the whole notice: the client
+            // reconnects with backoff and replays what it had not sent, which
+            // is the same path an outage already takes.
+            _ = shutdown.changed() => {
+                tracing::debug!(conn = conn_id, "closing for shutdown");
+                break;
+            }
+            _ = keepalive.tick() => {
+                if last_heard.elapsed() > IDLE_TIMEOUT {
+                    tracing::debug!(
+                        conn = conn_id,
+                        user = %user.id,
+                        "no traffic within the idle timeout; assuming the socket is dead"
+                    );
+                    break;
+                }
+                // Full means one is already queued and unanswered, which is
+                // what the idle timeout above is for.
+                let _ = ping_tx.try_send(());
+                continue;
+            }
             frame = stream.next() => frame,
         };
         let Some(Ok(message)) = incoming else { break };
+        // Any frame at all proves the far end is there, including the pong the
+        // browser sends back on its own.
+        last_heard = Instant::now();
 
         let text = match message {
             Message::Text(text) => text,

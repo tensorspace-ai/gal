@@ -88,9 +88,17 @@ async fn main() -> Result<()> {
     let user_count = storage.user_count().await?;
     let state = AppState::new(storage, config.clone());
 
-    let app = http::router(state)
+    let app = http::router(state.clone())
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        // A backstop against a request that never finishes arriving. It bounds
+        // producing the response, and a WebSocket's response is the 101 — the
+        // socket itself is not held to it. Generous, because it also covers a
+        // ten-megabyte upload over a bad connection.
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(120),
+        ));
 
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
@@ -103,15 +111,41 @@ async fn main() -> Result<()> {
     }
 
     // Connect-info gives handlers the peer address, which rate limiting needs.
+    let winding_down = state.clone();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tracing::info!("shutting down: asking open sockets to close");
+        // Told here rather than after `serve` returns, so the sockets wind down
+        // while axum is finishing its in-flight HTTP requests instead of after.
+        winding_down.begin_shutdown();
+    })
     .await
     .context("server error")?;
+
+    // axum's graceful shutdown does not cover WebSockets: an upgraded socket is
+    // served by a task it spawned and stopped tracking, so without this the
+    // process exits while every one of them is mid-frame.
+    let still_open = state.drain_connections(SHUTDOWN_GRACE).await;
+    if still_open > 0 {
+        tracing::warn!(
+            connections = still_open,
+            "exiting with sockets still open after the grace period"
+        );
+    } else {
+        tracing::info!("all sockets closed");
+    }
     Ok(())
 }
+
+/// How long to wait for open sockets to close on the way out.
+///
+/// Long enough for a connection to finish the command it is in and shut down
+/// tidily; short enough that a deploy is not held up by one wedged client.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Send panics to `tracing` as well as to stderr.
 ///

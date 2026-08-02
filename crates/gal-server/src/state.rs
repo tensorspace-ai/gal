@@ -493,6 +493,10 @@ pub struct AppState {
     /// so the account is the thing to hold to an allowance, and opening more
     /// connections must not buy more of it.
     command_limiter: RateLimiter,
+    /// Flipped once on shutdown. A watch rather than a `Notify` because a
+    /// connection busy inside a command when the signal arrives must still see
+    /// it afterwards; `notify_waiters` only wakes whoever is already waiting.
+    shutdown: tokio::sync::watch::Sender<bool>,
     /// Makes the next dispatched command panic, so the containment around it can
     /// be tested with a real panic on a real connection rather than by trusting
     /// that it would work. There is no reachable panic to provoke on purpose,
@@ -523,6 +527,7 @@ impl AppState {
             // allows 200 a second sustained and a burst of six seconds' worth.
             // At those prices it is 3 playbacks a second, or 10 searches.
             command_limiter: RateLimiter::new(1200.0, 200.0),
+            shutdown: tokio::sync::watch::channel(false).0,
             #[cfg(test)]
             panic_next_command: std::sync::atomic::AtomicBool::new(false),
         })
@@ -611,6 +616,39 @@ impl AppState {
             "over the command allowance"
         );
         false
+    }
+
+    // --- shutdown -------------------------------------------------------
+
+    /// Watch that flips to `true` when the server is winding down.
+    pub fn shutdown_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    /// Tell every connection to finish and close.
+    pub fn begin_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Wait for the open sockets to go away, up to `grace`.
+    ///
+    /// A WebSocket upgraded by axum runs in a task that `axum::serve` does not
+    /// track, so its graceful shutdown returns while every socket is still
+    /// live and the process then exits from under them mid-frame. Ops are
+    /// idempotent and clients replay on reconnect, so the damage was bounded —
+    /// but "bounded" is not the same as "none", and every deploy was a hard
+    /// disconnect for everyone with no notice.
+    ///
+    /// Returns how many were still open when the wait ended.
+    pub async fn drain_connections(&self, grace: std::time::Duration) -> usize {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            let open = self.conns.len();
+            if open == 0 || std::time::Instant::now() >= deadline {
+                return open;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     // --- connections ----------------------------------------------------
