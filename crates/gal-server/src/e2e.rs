@@ -209,7 +209,7 @@ impl TestClient {
                     }
                 }
             }
-            ServerMessage::BlipAdded { blip, .. } => {
+            ServerMessage::CommentAdded { blip, .. } | ServerMessage::BlipAdded { blip, .. } => {
                 self.docs
                     .entry(blip.id.clone())
                     .or_insert_with(|| ClientDoc {
@@ -351,6 +351,23 @@ impl TestClient {
             .unwrap_or_default()
     }
 
+    /// Open a wave and return the snapshot itself.
+    ///
+    /// Distinct from [`open`](Self::open) because that one consumes the
+    /// `WaveState` on the way past; a caller that wants to inspect the snapshot
+    /// cannot then wait for a second one that will never come.
+    async fn open_state(&mut self, wave_id: &WaveId) -> WaveView {
+        self.send(ClientMessage::Open {
+            wave_id: wave_id.clone(),
+        })
+        .await;
+        self.recv_until(|m| match m {
+            ServerMessage::WaveState { wave } => Some(wave.clone()),
+            _ => None,
+        })
+        .await
+    }
+
     /// Open a wave and return its first blip.
     async fn open(&mut self, wave_id: &WaveId) -> (WaveletId, BlipId) {
         self.send(ClientMessage::Open {
@@ -406,6 +423,81 @@ async fn create_wave_in(
             _ => None,
         })
         .await
+}
+
+/// Every range of `delta` carrying `comment_id` as its anchor attribute, as
+/// `(start, length)` in UTF-16 code units.
+///
+/// This is the client's job in the browser, and doing it here is the point of
+/// these tests: the anchor is *derived from the document*, so if OT moves the
+/// text it must move the range too, with nothing else keeping them in step.
+fn anchored_ranges(delta: &Delta, comment_id: &CommentId) -> Vec<(usize, usize)> {
+    use gal_ot::{Insert, OpKind};
+
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+    for op in &delta.ops {
+        let len = match &op.kind {
+            OpKind::Insert(Insert::Text(text)) => text.encode_utf16().count(),
+            OpKind::Insert(Insert::Embed(_)) => 1,
+            _ => continue,
+        };
+        let anchored = op
+            .attributes
+            .get(COMMENT_ATTRIBUTE)
+            .and_then(|v| v.as_str())
+            == Some(comment_id.as_str());
+        if anchored {
+            // Adjacent runs are one range: an edit inside a commented sentence
+            // splits the op without splitting the comment.
+            match ranges.last_mut() {
+                Some((start, length)) if *start + *length == index => *length += len,
+                _ => ranges.push((index, len)),
+            }
+        }
+        index += len;
+    }
+    ranges
+}
+
+/// Anchor `comment_id` over `[start, start + length)` of a blip, and open the
+/// thread. Mirrors what the browser does when you select text and comment on it.
+async fn comment_on(
+    client: &mut TestClient,
+    wavelet_id: &WaveletId,
+    blip_id: &BlipId,
+    comment_id: &CommentId,
+    start: usize,
+    length: usize,
+    text: &str,
+) {
+    // The thread first, so the anchor never names something that does not exist.
+    client
+        .send(ClientMessage::CreateComment {
+            wavelet_id: wavelet_id.clone(),
+            blip_id: blip_id.clone(),
+            comment_id: comment_id.clone(),
+            content: Some(Delta::document(text)),
+        })
+        .await;
+    client
+        .recv_until(|m| match m {
+            ServerMessage::CommentAdded { comment, .. } if &comment.id == comment_id => Some(()),
+            _ => None,
+        })
+        .await;
+
+    let mut attrs = gal_ot::Attributes::new();
+    attrs.insert(
+        COMMENT_ATTRIBUTE.to_string(),
+        serde_json::json!(comment_id.as_str()),
+    );
+    client
+        .edit(
+            blip_id,
+            Delta::new().retain(start).retain_with(length, attrs),
+        )
+        .await;
 }
 
 // --- tests --------------------------------------------------------------
@@ -1943,4 +2035,661 @@ async fn an_op_against_an_impossible_revision_is_refused_without_corrupting_the_
     let mut fresh = server.connect(&cookie).await;
     fresh.open(&wave_id).await;
     assert_eq!(fresh.text(&blip_id), "safe", "document must be untouched");
+}
+
+// --- comments ------------------------------------------------------------
+
+/// The whole reason the anchor is an attribute rather than an offset.
+///
+/// Alice comments on a phrase; Bob then types *before* it. Nothing tells the
+/// comment about that edit, and nothing has to: the anchor is part of the
+/// document, so the same transform that moves the text moves the highlight, and
+/// both clients land on the same range.
+#[tokio::test]
+async fn an_anchor_moves_with_its_text_when_someone_types_in_front_of_it() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, wavelet_id, page) = create_wave_in(
+        &mut alice,
+        "Release notes",
+        vec!["bob".into()],
+        Some(WaveMode::Notepad),
+    )
+    .await;
+    bob.open(&wave_id).await;
+
+    alice
+        .edit(&page, Delta::new().insert("Ship it on Friday."))
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    bob.drain().await;
+
+    // Anchor "Friday" — offset 11, six units in.
+    let thread = CommentId::new();
+    comment_on(
+        &mut alice,
+        &wavelet_id,
+        &page,
+        &thread,
+        11,
+        6,
+        "Friday is too soon.",
+    )
+    .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    bob.drain().await;
+
+    let before = anchored_ranges(&alice.docs[&page].doc, &thread);
+    assert_eq!(before, vec![(11, 6)], "the anchor starts on 'Friday'");
+    assert_eq!(
+        anchored_ranges(&bob.docs[&page].doc, &thread),
+        before,
+        "both clients see the same anchor"
+    );
+
+    // Bob prepends eight units. He knows nothing about the comment.
+    bob.edit(&page, Delta::new().insert("Reminder")).await;
+    bob.recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    alice.drain().await;
+    bob.drain().await;
+
+    assert_eq!(
+        alice.text(&page),
+        "ReminderShip it on Friday.",
+        "the text converged"
+    );
+    assert_eq!(
+        anchored_ranges(&alice.docs[&page].doc, &thread),
+        vec![(19, 6)],
+        "the anchor followed 'Friday' rather than staying at offset 11"
+    );
+    assert_eq!(
+        anchored_ranges(&bob.docs[&page].doc, &thread),
+        vec![(19, 6)],
+        "and every client agrees on where it landed"
+    );
+
+    // A reopened wave rebuilds from the stored snapshot, so the anchor has to
+    // survive the round trip through the database too.
+    let mut fresh = server.connect(&alice_cookie).await;
+    fresh.open(&wave_id).await;
+    assert_eq!(
+        anchored_ranges(&fresh.docs[&page].doc, &thread),
+        vec![(19, 6)]
+    );
+}
+
+/// Deleting the commented words detaches the thread rather than leaving it
+/// pointing at whatever text happens to occupy those offsets afterwards.
+#[tokio::test]
+async fn deleting_the_anchored_text_detaches_the_thread_but_keeps_it() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    let (wave_id, wavelet_id, page) =
+        create_wave_in(&mut alice, "Page", vec![], Some(WaveMode::Notepad)).await;
+    alice
+        .edit(&page, Delta::new().insert("keep cut keep"))
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+
+    let thread = CommentId::new();
+    comment_on(&mut alice, &wavelet_id, &page, &thread, 5, 3, "why this?").await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    assert_eq!(
+        anchored_ranges(&alice.docs[&page].doc, &thread),
+        vec![(5, 3)]
+    );
+
+    alice.edit(&page, Delta::new().retain(4).delete(4)).await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+
+    assert_eq!(alice.text(&page), "keep keep");
+    assert!(
+        anchored_ranges(&alice.docs[&page].doc, &thread).is_empty(),
+        "the anchor went with the words it marked"
+    );
+
+    // The remarks are still there. Losing them because someone edited a
+    // sentence would destroy the discussion about why it was edited.
+    let mut fresh = server.connect(&cookie).await;
+    let threads = fresh.open_state(&wave_id).await.wavelets[0]
+        .comments
+        .clone();
+    assert_eq!(threads.len(), 1, "the thread outlives its anchor");
+    assert_eq!(threads[0].id, thread);
+}
+
+#[tokio::test]
+async fn only_a_notepad_takes_comments() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    for mode in WaveMode::ALL {
+        let (_, wavelet_id, page) =
+            create_wave_in(&mut alice, mode.label(), vec![], Some(mode)).await;
+        alice.drain().await;
+        alice
+            .send(ClientMessage::CreateComment {
+                wavelet_id,
+                blip_id: page,
+                comment_id: CommentId::new(),
+                content: Some(Delta::document("a remark")),
+            })
+            .await;
+
+        let accepted = alice
+            .recv_until(|m| match m {
+                ServerMessage::CommentAdded { .. } => Some(true),
+                ServerMessage::Error { .. } => Some(false),
+                _ => None,
+            })
+            .await;
+        assert_eq!(
+            accepted,
+            mode.allows_comments(),
+            "{mode:?} disagreed with its own rule"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_comment_reaches_the_other_participant_live() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, wavelet_id, page) = create_wave_in(
+        &mut alice,
+        "Shared page",
+        vec!["bob".into()],
+        Some(WaveMode::Notepad),
+    )
+    .await;
+    bob.open(&wave_id).await;
+
+    let thread = CommentId::new();
+    alice
+        .send(ClientMessage::CreateComment {
+            wavelet_id,
+            blip_id: page.clone(),
+            comment_id: thread.clone(),
+            content: Some(Delta::document("is this right?")),
+        })
+        .await;
+
+    let (comment, blip) = bob
+        .recv_until(|m| match m {
+            ServerMessage::CommentAdded { comment, blip, .. } => {
+                Some((comment.clone(), blip.clone()))
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(comment.id, thread);
+    assert_eq!(comment.blip_id, page, "the thread names the page it is on");
+    assert_eq!(comment.author, alice.user.id);
+    assert!(!comment.resolved());
+    // The remark arrives with the thread, not in a second message: a thread
+    // with nothing in it is a state no client should have to draw.
+    assert_eq!(blip.comment.as_ref(), Some(&thread));
+    assert_eq!(blip.parent.as_ref(), Some(&page));
+    assert_eq!(blip.content.to_plain_text(), "is this right?");
+
+    // Bob replies; Alice sees it as an ordinary blip tagged with the thread.
+    bob.send(ClientMessage::ReplyToComment {
+        comment_id: thread.clone(),
+        content: Some(Delta::document("no, fixing it")),
+    })
+    .await;
+    let reply = alice
+        .recv_until(|m| match m {
+            ServerMessage::BlipAdded { blip, .. } if blip.comment.as_ref() == Some(&thread) => {
+                Some(blip.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(reply.author, bob.user.id);
+    assert_eq!(reply.content.to_plain_text(), "no, fixing it");
+}
+
+#[tokio::test]
+async fn a_thread_can_be_closed_and_reopened_without_losing_anything() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, wavelet_id, page) = create_wave_in(
+        &mut alice,
+        "Page",
+        vec!["bob".into()],
+        Some(WaveMode::Notepad),
+    )
+    .await;
+    bob.open(&wave_id).await;
+
+    let thread = CommentId::new();
+    comment_on(&mut alice, &wavelet_id, &page, &thread, 0, 0, "typo here").await;
+    bob.drain().await;
+
+    // Bob did not open the thread, and closes it anyway: a notepad is a page
+    // everyone edits, so a remark about it is everyone's to settle.
+    bob.send(ClientMessage::ResolveComment {
+        comment_id: thread.clone(),
+        resolved: true,
+    })
+    .await;
+    let by = alice
+        .recv_until(|m| match m {
+            ServerMessage::CommentResolved {
+                comment_id,
+                resolved_by,
+                ..
+            } if comment_id == &thread => Some(resolved_by.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(by, Some(bob.user.id.clone()), "who closed it is recorded");
+
+    // Nothing was destroyed: the remark and the anchor are both still there.
+    let mut fresh = server.connect(&alice_cookie).await;
+    let state = fresh.open_state(&wave_id).await.wavelets[0].clone();
+    let stored = state.comments.iter().find(|c| c.id == thread).unwrap();
+    assert!(stored.resolved());
+    assert_eq!(stored.resolved_by.as_ref(), Some(&bob.user.id));
+    assert!(stored.resolved_at.is_some());
+    assert_eq!(
+        anchored_ranges(&fresh.docs[&page].doc, &thread).len(),
+        0,
+        "this thread was anchored to an empty range, so there is nothing to find"
+    );
+    assert!(
+        state
+            .blips
+            .iter()
+            .any(|b| b.comment.as_ref() == Some(&thread)),
+        "the remark survives being resolved"
+    );
+
+    // And reopening restores it exactly. Bob is drained first: he was sent the
+    // broadcast of his own resolve, and matching that one would prove nothing.
+    bob.drain().await;
+    alice
+        .send(ClientMessage::ResolveComment {
+            comment_id: thread.clone(),
+            resolved: false,
+        })
+        .await;
+    let by = bob
+        .recv_until(|m| match m {
+            ServerMessage::CommentResolved {
+                comment_id,
+                resolved_by,
+                ..
+            } if comment_id == &thread => Some(resolved_by.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(by, None);
+}
+
+#[tokio::test]
+async fn a_resolved_thread_refuses_a_remark_rather_than_hiding_it() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    let (_, wavelet_id, page) =
+        create_wave_in(&mut alice, "Page", vec![], Some(WaveMode::Notepad)).await;
+    let thread = CommentId::new();
+    comment_on(&mut alice, &wavelet_id, &page, &thread, 0, 0, "a point").await;
+    alice.drain().await;
+
+    alice
+        .send(ClientMessage::ResolveComment {
+            comment_id: thread.clone(),
+            resolved: true,
+        })
+        .await;
+    alice.drain().await;
+
+    alice
+        .send(ClientMessage::ReplyToComment {
+            comment_id: thread,
+            content: Some(Delta::document("one more thing")),
+        })
+        .await;
+    // Accepting this would write a remark into a thread drawn collapsed, so the
+    // author would never see what they had just written.
+    let code = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::BlipAdded { .. } => Some(ErrorCode::Internal),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::BadRequest);
+}
+
+#[tokio::test]
+async fn a_comment_id_the_server_would_not_mint_is_refused() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    let (_, wavelet_id, page) =
+        create_wave_in(&mut alice, "Page", vec![], Some(WaveMode::Notepad)).await;
+    alice.drain().await;
+
+    // The id is the client's to choose, which is exactly why its shape is not.
+    for bad in ["", "b-stolen", "c-a'; DROP TABLE blips--", "c-<script>"] {
+        alice
+            .send(ClientMessage::CreateComment {
+                wavelet_id: wavelet_id.clone(),
+                blip_id: page.clone(),
+                comment_id: CommentId::from(bad),
+                content: Some(Delta::document("x")),
+            })
+            .await;
+        let code = alice
+            .recv_until(|m| match m {
+                ServerMessage::Error { code, .. } => Some(*code),
+                ServerMessage::CommentAdded { .. } => Some(ErrorCode::Internal),
+                _ => None,
+            })
+            .await;
+        assert_eq!(code, ErrorCode::BadRequest, "should be refused: {bad:?}");
+    }
+
+    // Reusing an id would merge two people's threads into one.
+    let thread = CommentId::new();
+    comment_on(&mut alice, &wavelet_id, &page, &thread, 0, 0, "first").await;
+    alice.drain().await;
+    alice
+        .send(ClientMessage::CreateComment {
+            wavelet_id,
+            blip_id: page,
+            comment_id: thread,
+            content: Some(Delta::document("second")),
+        })
+        .await;
+    let code = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::CommentAdded { .. } => Some(ErrorCode::Internal),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::BadRequest);
+}
+
+#[tokio::test]
+async fn a_remark_cannot_be_deleted_out_from_under_its_thread() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    let (wave_id, wavelet_id, page) =
+        create_wave_in(&mut alice, "Page", vec![], Some(WaveMode::Notepad)).await;
+    let thread = CommentId::new();
+    comment_on(&mut alice, &wavelet_id, &page, &thread, 0, 0, "a point").await;
+    let remark = alice
+        .docs
+        .keys()
+        .find(|id| *id != &page)
+        .cloned()
+        .expect("the remark is a blip");
+    alice.drain().await;
+
+    // Notepad forbids deletion anyway; switch to a mode that allows it, which is
+    // the case that would otherwise slip through.
+    alice
+        .send(ClientMessage::SetMode {
+            wave_id: wave_id.clone(),
+            mode: WaveMode::Document,
+        })
+        .await;
+    alice.drain().await;
+
+    alice
+        .send(ClientMessage::DeleteBlip {
+            blip_id: remark.clone(),
+        })
+        .await;
+    let code = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::BlipRemoved { .. } => Some(ErrorCode::Internal),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        code,
+        ErrorCode::Forbidden,
+        "deleting the only remark would leave a thread nothing can draw"
+    );
+
+    // Nor can the page be deleted while a comment hangs off it.
+    alice
+        .send(ClientMessage::DeleteBlip { blip_id: page })
+        .await;
+    let code = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::BlipRemoved { .. } => Some(ErrorCode::Internal),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::BadRequest);
+}
+
+/// Leaving Notepad must not strand open threads, and freezing must stop them.
+#[tokio::test]
+async fn a_thread_can_still_be_settled_after_the_mode_moves_on() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    let (wave_id, wavelet_id, page) =
+        create_wave_in(&mut alice, "Page", vec![], Some(WaveMode::Notepad)).await;
+    let thread = CommentId::new();
+    comment_on(&mut alice, &wavelet_id, &page, &thread, 0, 0, "a point").await;
+    alice.drain().await;
+
+    alice
+        .send(ClientMessage::SetMode {
+            wave_id: wave_id.clone(),
+            mode: WaveMode::Document,
+        })
+        .await;
+    alice.drain().await;
+
+    // Still settleable: mode changes are reversible and must not leave rubbish
+    // behind that nothing can ever clear.
+    alice
+        .send(ClientMessage::ResolveComment {
+            comment_id: thread.clone(),
+            resolved: true,
+        })
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::CommentResolved { .. }).then_some(()))
+        .await;
+
+    // But a frozen wave is frozen, resolving included.
+    alice
+        .send(ClientMessage::SetMode {
+            wave_id,
+            mode: WaveMode::Frozen,
+        })
+        .await;
+    alice.drain().await;
+    alice
+        .send(ClientMessage::ResolveComment {
+            comment_id: thread,
+            resolved: false,
+        })
+        .await;
+    let code = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::CommentResolved { .. } => Some(ErrorCode::Internal),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::Forbidden);
+}
+
+/// Access control lives on the wavelet, and comments are no exception.
+#[tokio::test]
+async fn a_comment_in_a_private_reply_stays_inside_it() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let carol_cookie = server.register("carol").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+    let mut carol = server.connect(&carol_cookie).await;
+
+    // Start in Document so a private reply may be branched, then switch to
+    // Notepad, which is the mode that takes comments.
+    let (wave_id, wavelet_id, page) =
+        create_wave(&mut alice, "Plan", vec!["bob".into(), "carol".into()]).await;
+    bob.open(&wave_id).await;
+    carol.open(&wave_id).await;
+
+    alice
+        .send(ClientMessage::PrivateReply {
+            wavelet_id: wavelet_id.clone(),
+            anchor: page,
+            participants: vec!["bob".into()],
+        })
+        .await;
+    let private = alice
+        .recv_until(|m| match m {
+            ServerMessage::WaveletAdded { wavelet, .. } => {
+                Some((wavelet.id.clone(), wavelet.blips[0].id.clone()))
+            }
+            _ => None,
+        })
+        .await;
+    alice
+        .send(ClientMessage::SetMode {
+            wave_id: wave_id.clone(),
+            mode: WaveMode::Notepad,
+        })
+        .await;
+    alice.drain().await;
+    bob.drain().await;
+    carol.drain().await;
+
+    let thread = CommentId::new();
+    alice
+        .send(ClientMessage::CreateComment {
+            wavelet_id: private.0,
+            blip_id: private.1.clone(),
+            comment_id: thread.clone(),
+            content: Some(Delta::document("just between us")),
+        })
+        .await;
+    bob.recv_until(|m| match m {
+        ServerMessage::CommentAdded { comment, .. } if comment.id == thread => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // Carol is in the wave but not in that wavelet, so nothing about the thread
+    // may reach her — including the fact that it exists.
+    carol.drain().await;
+    assert!(
+        !carol
+            .docs
+            .keys()
+            .any(|id| Some(id) == alice.docs.keys().find(|k| **k == private.1)),
+        "carol never received the private blip"
+    );
+    carol
+        .send(ClientMessage::ResolveComment {
+            comment_id: thread.clone(),
+            resolved: true,
+        })
+        .await;
+    let code = carol
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::CommentResolved { .. } => Some(ErrorCode::Internal),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        code,
+        ErrorCode::NotFound,
+        "and she is told no more than that"
+    );
+
+    // A reopened wave must not hand her the thread either.
+    let mut fresh = server.connect(&carol_cookie).await;
+    let wavelets = fresh.open_state(&wave_id).await.wavelets;
+    assert!(
+        wavelets.iter().all(|w| w.comments.is_empty()),
+        "carol's snapshot must not carry a thread from a wavelet she is not in"
+    );
+}
+
+#[tokio::test]
+async fn a_comment_cannot_be_hung_on_a_comment() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    let (_, wavelet_id, page) =
+        create_wave_in(&mut alice, "Page", vec![], Some(WaveMode::Notepad)).await;
+    let thread = CommentId::new();
+    comment_on(&mut alice, &wavelet_id, &page, &thread, 0, 0, "a point").await;
+    let remark = alice
+        .docs
+        .keys()
+        .find(|id| *id != &page)
+        .cloned()
+        .expect("the remark is a blip");
+    alice.drain().await;
+
+    alice
+        .send(ClientMessage::CreateComment {
+            wavelet_id,
+            blip_id: remark,
+            comment_id: CommentId::new(),
+            content: Some(Delta::document("meta")),
+        })
+        .await;
+    let code = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::CommentAdded { .. } => Some(ErrorCode::Internal),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::BadRequest);
 }

@@ -95,6 +95,49 @@ id_type!(/// Identifies a wavelet — a participant set plus its threaded blips.
     WaveletId, "s-");
 id_type!(/// Identifies a blip — a single message document.
     BlipId, "b-");
+id_type!(/// Identifies a comment thread anchored to a range of text.
+    CommentId, "c-");
+
+impl CommentId {
+    /// Longest identifier accepted from a client.
+    ///
+    /// A comment id is one of the few identifiers a *client* mints (see
+    /// [`CommentId::is_well_formed`]), and it is stored, indexed, and written
+    /// into the document as an attribute value. Bounding it keeps a hostile
+    /// client from using an anchor as free storage.
+    pub const MAX_LEN: usize = 64;
+
+    /// Whether this is an identifier the server is willing to accept.
+    ///
+    /// Unlike every other id in this model, a comment id is chosen by the
+    /// client. It has to be: anchoring a comment means applying an attribute to
+    /// a range of text *and* creating the thread it names, and a client that had
+    /// to wait for a server-minted id could not do both against the same
+    /// revision — someone typing in the page would have moved the range out from
+    /// under it.
+    ///
+    /// Accepting a client's id is therefore fine, but accepting a client's
+    /// *string* is not: it reaches SQL, the wire, and the DOM.
+    pub fn is_well_formed(&self) -> bool {
+        let Some(rest) = self.0.strip_prefix("c-") else {
+            return false;
+        };
+        !rest.is_empty()
+            && self.0.len() <= Self::MAX_LEN
+            && rest.chars().all(|c| c.is_ascii_alphanumeric())
+    }
+}
+
+/// The document attribute that anchors a range of text to a comment thread.
+///
+/// Anchoring this way rather than storing an offset is what makes a comment
+/// survive editing: the attribute is part of the document, so every transform
+/// the OT engines already perform carries it along. Type a paragraph above a
+/// commented sentence and the highlight moves with the sentence, on every
+/// client, with no separate index to keep in step. Delete the sentence and the
+/// anchor goes with it, which is what leaves the thread detached rather than
+/// pointing at unrelated words.
+pub const COMMENT_ATTRIBUTE: &str = "comment";
 
 // --- users --------------------------------------------------------------
 
@@ -166,7 +209,8 @@ pub enum WaveMode {
     Chat,
     /// Only the creator posts at the top level; anyone may reply.
     Announcement,
-    /// One shared page: everyone edits what is there, nothing new is added.
+    /// One shared page: everyone edits what is there, nothing new is added —
+    /// except comments, which hang off a range of the page rather than extend it.
     Notepad,
     /// Read-only. Reversible.
     Frozen,
@@ -263,6 +307,29 @@ impl WaveMode {
         }
     }
 
+    /// May a comment be anchored to a range of text?
+    ///
+    /// Notepad alone, and that is the whole point of it. Every other writable
+    /// mode already has somewhere to put a remark — a reply, or another message
+    /// in the channel — but a notepad admits no new messages at all, so the only
+    /// way to say "this sentence is wrong" was to edit the sentence. A comment
+    /// is the missing way to say something *about* the page without changing it.
+    pub fn allows_comments(self) -> bool {
+        matches!(self, WaveMode::Notepad)
+    }
+
+    /// May an existing comment thread be resolved or reopened?
+    ///
+    /// Deliberately wider than [`allows_comments`](Self::allows_comments):
+    /// resolving is housekeeping on a thread that already exists, not a new
+    /// contribution. Gating it the same way would strand every open thread the
+    /// moment a notepad was switched to another mode, and mode changes are
+    /// supposed to be reversible. Frozen still refuses, because frozen means
+    /// nothing changes.
+    pub fn allows_resolve(self) -> bool {
+        !self.is_frozen()
+    }
+
     /// May a private side conversation be started?
     pub fn allows_private_reply(self) -> bool {
         matches!(
@@ -282,7 +349,9 @@ impl WaveMode {
             WaveMode::Document => "Everyone can edit every message. Replies nest.",
             WaveMode::Chat => "A channel. Only you can edit your own messages.",
             WaveMode::Announcement => "Only you can post; anyone can reply.",
-            WaveMode::Notepad => "One shared page that everyone edits.",
+            WaveMode::Notepad => {
+                "One shared page that everyone edits, with comments in the margin."
+            }
             WaveMode::Frozen => "Read-only. Nothing can change until you unfreeze it.",
         }
     }
@@ -342,6 +411,12 @@ pub struct Blip {
     pub wave_id: WaveId,
     /// The blip this one replies to. `None` makes it a root-level blip.
     pub parent: Option<BlipId>,
+    /// Set when this blip is a remark in a comment thread rather than part of
+    /// the conversation itself. Its [`parent`](Self::parent) is the blip the
+    /// thread is anchored in, so a comment cannot be orphaned by the ordinary
+    /// threading rules; this field is what tells the two apart.
+    #[serde(default)]
+    pub comment: Option<CommentId>,
     /// Ordering among siblings; monotonic within a wavelet.
     pub seq: i64,
     pub author: UserId,
@@ -372,6 +447,7 @@ impl Blip {
             wavelet_id,
             wave_id,
             parent,
+            comment: None,
             seq,
             contributors: vec![author.clone()],
             author,
@@ -402,6 +478,44 @@ impl Blip {
             let cut: String = trimmed.chars().take(max_chars).collect();
             format!("{}…", cut.trim_end())
         }
+    }
+}
+
+/// A comment thread: a remark about a range of text rather than about the wave.
+///
+/// The thread carries no text of its own. Its remarks are ordinary blips
+/// carrying its [`id`](Self::id), which is what gives a comment everything a
+/// message already has — live co-editing, contributor avatars, unread marks,
+/// search, and a place in playback — instead of a second, poorer kind of text.
+///
+/// Where the thread points is *not* stored here. The anchor lives in the
+/// document as a [`COMMENT_ATTRIBUTE`] run, so it moves as the page is edited.
+/// This row only records that the thread exists, which page blip it belongs to,
+/// and whether anyone has closed it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentThread {
+    pub id: CommentId,
+    /// Kept alongside `blip_id` because access control is a *wavelet* test, and
+    /// every path that returns a comment has to be able to make that test
+    /// without first looking up the blip it hangs from.
+    pub wavelet_id: WaveletId,
+    /// The blip whose text carries the anchor.
+    pub blip_id: BlipId,
+    pub author: UserId,
+    pub created_at: Timestamp,
+    /// Who closed the thread, if anyone. A resolved thread keeps its anchor and
+    /// its remarks; only the way it is drawn changes, so reopening restores it
+    /// exactly.
+    #[serde(default)]
+    pub resolved_by: Option<UserId>,
+    #[serde(default)]
+    pub resolved_at: Option<Timestamp>,
+}
+
+impl CommentThread {
+    pub fn resolved(&self) -> bool {
+        self.resolved_by.is_some()
     }
 }
 
@@ -529,6 +643,8 @@ mod tests {
         assert!(!m.allows_delete());
         assert!(!m.allows_private_reply());
         assert!(m.is_flat());
+        // The one way to say something without changing the page.
+        assert!(m.allows_comments() && m.allows_resolve());
     }
 
     #[test]
@@ -541,6 +657,86 @@ mod tests {
             assert!(!m.allows_retitle(is_privileged));
         }
         assert!(!m.allows_replies() && !m.allows_delete() && !m.allows_private_reply());
+        assert!(!m.allows_comments() && !m.allows_resolve());
+    }
+
+    #[test]
+    fn commenting_is_notepads_alone() {
+        for mode in WaveMode::ALL {
+            assert_eq!(
+                mode.allows_comments(),
+                mode == WaveMode::Notepad,
+                "{mode:?} should not offer comments: every other writable mode \
+                 already has a reply or a composer to put a remark in"
+            );
+        }
+    }
+
+    #[test]
+    fn any_mode_that_can_open_a_thread_can_also_close_one() {
+        // Otherwise a notepad would accumulate threads nobody could ever clear.
+        for mode in WaveMode::ALL {
+            assert!(
+                !mode.allows_comments() || mode.allows_resolve(),
+                "{mode:?} opens threads it cannot close"
+            );
+        }
+    }
+
+    #[test]
+    fn resolving_outlives_the_mode_that_allowed_commenting() {
+        // Switching a notepad to another mode must not strand its open threads;
+        // mode changes are reversible and are not supposed to destroy anything.
+        assert!(WaveMode::Document.allows_resolve());
+        assert!(WaveMode::Chat.allows_resolve());
+        assert!(WaveMode::Announcement.allows_resolve());
+        assert!(!WaveMode::Frozen.allows_resolve(), "frozen means frozen");
+    }
+
+    #[test]
+    fn a_client_minted_comment_id_must_look_like_one() {
+        assert!(CommentId::new().is_well_formed(), "our own minting");
+        assert!(CommentId::from("c-a1b2").is_well_formed());
+
+        for bad in [
+            "",
+            "c-",                       // prefix but no body
+            "b-abc",                    // someone else's namespace
+            "abc",                      // no prefix at all
+            "c-../../etc",              // path-ish
+            "c-<script>",               // markup
+            "c-a b",                    // whitespace
+            "c-héllo",                  // non-ASCII
+            "c-a'; DROP TABLE blips--", // the classic
+        ] {
+            assert!(
+                !CommentId::from(bad).is_well_formed(),
+                "should be refused: {bad:?}"
+            );
+        }
+
+        // An id is stored, indexed, and written into the document as an
+        // attribute value, so length is bounded too.
+        let long = format!("c-{}", "a".repeat(CommentId::MAX_LEN));
+        assert!(!CommentId::from(long.as_str()).is_well_formed());
+        let limit = format!("c-{}", "a".repeat(CommentId::MAX_LEN - 2));
+        assert!(CommentId::from(limit.as_str()).is_well_formed());
+    }
+
+    #[test]
+    fn a_thread_is_open_until_someone_is_recorded_as_closing_it() {
+        let mut thread = CommentThread {
+            id: CommentId::new(),
+            wavelet_id: WaveletId::new(),
+            blip_id: BlipId::new(),
+            author: UserId::from("u-alice"),
+            created_at: now(),
+            resolved_by: None,
+            resolved_at: None,
+        };
+        assert!(!thread.resolved());
+        thread.resolved_by = Some(UserId::from("u-bob"));
+        assert!(thread.resolved());
     }
 
     #[test]

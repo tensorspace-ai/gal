@@ -39,7 +39,7 @@ pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// table, so without this a new column would simply never be added: the server
 /// would start cleanly, then fail at query time in ways that look like data loss
 /// to the user.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The version `schema.sql` describes.
 ///
@@ -399,7 +399,7 @@ impl Storage {
         self.run(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, wavelet_id, wave_id, parent, seq, author, contributors,
-                        created_at, last_modified, content, revision, deleted
+                        created_at, last_modified, content, revision, deleted, comment
                  FROM blips WHERE wave_id = ?1 AND deleted = 0 ORDER BY seq",
             )?;
             let blips = stmt
@@ -469,8 +469,8 @@ impl Storage {
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO blips (id, wavelet_id, wave_id, parent, seq, author, contributors,
-                                    created_at, last_modified, content, revision, deleted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
+                                    created_at, last_modified, content, revision, deleted, comment)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
                 params![
                     blip.id.as_str(),
                     blip.wavelet_id.as_str(),
@@ -483,10 +483,97 @@ impl Storage {
                     blip.last_modified,
                     serde_json::to_string(&blip.content)?,
                     blip.revision,
+                    blip.comment.as_ref().map(|c| c.0.clone()),
                 ],
             )?;
             index_blip(&tx, &blip)?;
             tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    // --- comments -------------------------------------------------------
+
+    /// Open a comment thread and store its first remark in one transaction.
+    ///
+    /// Together, because a thread with nothing in it is a row no reader knows
+    /// how to draw and no writer would ever create on purpose. If either half
+    /// failed alone the client would show a marked-up range that opens onto
+    /// nothing, and there is no path in the protocol to repair that.
+    pub async fn create_comment(&self, thread: CommentThread, blip: Blip) -> Result<()> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO comments (id, wave_id, wavelet_id, blip_id, author, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    thread.id.as_str(),
+                    blip.wave_id.as_str(),
+                    thread.wavelet_id.as_str(),
+                    thread.blip_id.as_str(),
+                    thread.author.as_str(),
+                    thread.created_at,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO blips (id, wavelet_id, wave_id, parent, seq, author, contributors,
+                                    created_at, last_modified, content, revision, deleted, comment)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
+                params![
+                    blip.id.as_str(),
+                    blip.wavelet_id.as_str(),
+                    blip.wave_id.as_str(),
+                    blip.parent.as_ref().map(|p| p.0.clone()),
+                    blip.seq,
+                    blip.author.as_str(),
+                    serde_json::to_string(&blip.contributors)?,
+                    blip.created_at,
+                    blip.last_modified,
+                    serde_json::to_string(&blip.content)?,
+                    blip.revision,
+                    blip.comment.as_ref().map(|c| c.0.clone()),
+                ],
+            )?;
+            index_blip(&tx, &blip)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn comments_of_wave(&self, wave_id: &WaveId) -> Result<Vec<CommentThread>> {
+        let id = wave_id.clone();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, wavelet_id, blip_id, author, created_at, resolved_by, resolved_at
+                 FROM comments WHERE wave_id = ?1 ORDER BY created_at",
+            )?;
+            let threads = stmt
+                .query_map(params![id.as_str()], row_to_comment)?
+                .collect::<Result<_, _>>()?;
+            Ok(threads)
+        })
+        .await
+    }
+
+    /// Close a thread, or reopen it. Nothing else about it changes.
+    pub async fn set_comment_resolved(
+        &self,
+        comment_id: &CommentId,
+        resolved_by: Option<UserId>,
+        resolved_at: Option<Timestamp>,
+    ) -> Result<()> {
+        let id = comment_id.clone();
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE comments SET resolved_by = ?2, resolved_at = ?3 WHERE id = ?1",
+                params![
+                    id.as_str(),
+                    resolved_by.as_ref().map(|u| u.0.clone()),
+                    resolved_at,
+                ],
+            )?;
             Ok(())
         })
         .await
@@ -1312,6 +1399,40 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tracing::debug!("migrated database schema to v4");
     }
 
+    if version == 4 {
+        let tx = conn.transaction()?;
+        // Keyed to the wavelet for the same reason attachments are: access
+        // control is a membership test on the wavelet, and a comment must not be
+        // reachable by anyone who cannot read the blip it annotates.
+        //
+        // Where in the blip a thread points is deliberately *not* a column here.
+        // The anchor is a run of the document carrying the thread's id as an
+        // attribute, so it is transformed along with every other edit; an offset
+        // stored beside the document would be stale the moment anyone typed.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS comments (
+                 id          TEXT PRIMARY KEY,
+                 wave_id     TEXT NOT NULL,
+                 wavelet_id  TEXT NOT NULL REFERENCES wavelets(id) ON DELETE CASCADE,
+                 blip_id     TEXT NOT NULL,
+                 author      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 created_at  INTEGER NOT NULL,
+                 resolved_by TEXT,
+                 resolved_at INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS comments_wave ON comments(wave_id);
+             CREATE INDEX IF NOT EXISTS comments_blip ON comments(blip_id);
+             -- A remark belongs to a thread. Existing blips get NULL, which is
+             -- exactly what they are: conversation, not commentary.
+             ALTER TABLE blips ADD COLUMN comment TEXT;
+             CREATE INDEX IF NOT EXISTS blips_comment ON blips(comment) WHERE comment IS NOT NULL;",
+        )?;
+        tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+        version = 5;
+        tracing::debug!("migrated database schema to v5");
+    }
+
     if version < SCHEMA_VERSION {
         anyhow::bail!(
             "no migration available from schema v{version} to v{SCHEMA_VERSION}; \
@@ -1403,6 +1524,19 @@ fn row_to_blip(row: &Row<'_>) -> rusqlite::Result<Blip> {
         content: stored_json(9, &content)?,
         revision: row.get::<_, i64>(10)? as u64,
         deleted: row.get::<_, i64>(11)? != 0,
+        comment: row.get::<_, Option<String>>(12)?.map(CommentId),
+    })
+}
+
+fn row_to_comment(row: &Row<'_>) -> rusqlite::Result<CommentThread> {
+    Ok(CommentThread {
+        id: CommentId(row.get(0)?),
+        wavelet_id: WaveletId(row.get(1)?),
+        blip_id: BlipId(row.get(2)?),
+        author: UserId(row.get(3)?),
+        created_at: row.get(4)?,
+        resolved_by: row.get::<_, Option<String>>(5)?.map(UserId),
+        resolved_at: row.get(6)?,
     })
 }
 

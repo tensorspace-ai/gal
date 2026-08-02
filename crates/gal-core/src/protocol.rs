@@ -37,6 +37,11 @@ pub struct WaveletView {
     pub created_at: Timestamp,
     pub last_modified: Timestamp,
     pub blips: Vec<BlipView>,
+    /// Comment threads anchored in this wavelet's blips. Their remarks are in
+    /// `blips` like any other, tagged with the thread they belong to; this list
+    /// only carries the thread state that has nowhere else to live.
+    #[serde(default)]
+    pub comments: Vec<CommentThread>,
 }
 
 /// A blip document with everything needed to render and edit it.
@@ -46,6 +51,10 @@ pub struct BlipView {
     pub id: BlipId,
     pub wavelet_id: WaveletId,
     pub parent: Option<BlipId>,
+    /// Set when this blip is a remark in a comment thread rather than part of
+    /// the conversation.
+    #[serde(default)]
+    pub comment: Option<CommentId>,
     pub seq: i64,
     pub author: UserId,
     pub contributors: Vec<UserId>,
@@ -211,6 +220,42 @@ pub enum ClientMessage {
         user_id: UserId,
     },
 
+    /// Open a comment thread on a range of a blip's text.
+    ///
+    /// The range itself is not named here. The client applies a
+    /// [`COMMENT_ATTRIBUTE`] run over the text in an ordinary
+    /// [`Submit`](Self::Submit), which is what makes the anchor move as the page
+    /// is edited; this message only creates the thread that run points at. The
+    /// client picks `comment_id` so it can do both against one revision.
+    #[serde(rename_all = "camelCase")]
+    CreateComment {
+        wavelet_id: WaveletId,
+        /// The blip the anchored range lives in.
+        blip_id: BlipId,
+        comment_id: CommentId,
+        /// Text of the first remark, so opening a thread is one round trip.
+        #[serde(default)]
+        content: Option<Delta>,
+    },
+
+    /// Add a further remark to an open thread.
+    #[serde(rename_all = "camelCase")]
+    ReplyToComment {
+        comment_id: CommentId,
+        #[serde(default)]
+        content: Option<Delta>,
+    },
+
+    /// Close a thread, or reopen a closed one.
+    ///
+    /// Nothing is deleted either way: the anchor and every remark stay exactly
+    /// where they are, so this only changes how the thread is drawn.
+    #[serde(rename_all = "camelCase")]
+    ResolveComment {
+        comment_id: CommentId,
+        resolved: bool,
+    },
+
     /// Branch a private side conversation off a blip.
     #[serde(rename_all = "camelCase")]
     PrivateReply {
@@ -310,6 +355,28 @@ pub enum ServerMessage {
     BlipRemoved {
         wave_id: WaveId,
         blip_id: BlipId,
+    },
+
+    /// A comment thread was opened.
+    ///
+    /// Carries its first remark rather than leaving that to a following
+    /// [`BlipAdded`](Self::BlipAdded): a thread with nothing in it is a state no
+    /// recipient should ever have to draw. Later remarks do arrive as ordinary
+    /// `BlipAdded`, tagged with the thread.
+    #[serde(rename_all = "camelCase")]
+    CommentAdded {
+        wave_id: WaveId,
+        comment: CommentThread,
+        blip: BlipView,
+    },
+
+    /// A thread was closed, or reopened. `resolved_by` is `None` when reopened.
+    #[serde(rename_all = "camelCase")]
+    CommentResolved {
+        wave_id: WaveId,
+        comment_id: CommentId,
+        resolved_by: Option<UserId>,
+        resolved_at: Option<Timestamp>,
     },
 
     /// The wave's mode changed. Recipients must re-render, and drop any local
@@ -496,6 +563,20 @@ mod tests {
                 wavelet_id: WaveletId::from("s-1"),
                 anchor: BlipId::from("b-1"),
                 participants: vec!["dave".into()],
+            },
+            ClientMessage::CreateComment {
+                wavelet_id: WaveletId::from("s-1"),
+                blip_id: BlipId::from("b-1"),
+                comment_id: CommentId::from("c-1"),
+                content: Some(Delta::document("this line reads oddly")),
+            },
+            ClientMessage::ReplyToComment {
+                comment_id: CommentId::from("c-1"),
+                content: None,
+            },
+            ClientMessage::ResolveComment {
+                comment_id: CommentId::from("c-1"),
+                resolved: true,
             },
             ClientMessage::Cursor {
                 wave_id: WaveId::from("w-1"),
@@ -704,6 +785,20 @@ mod tests {
                 anchor: BlipId::from("b-1"),
                 participants: vec![],
             },
+            ClientMessage::CreateComment {
+                wavelet_id: WaveletId::from("s-1"),
+                blip_id: BlipId::from("b-1"),
+                comment_id: CommentId::from("c-1"),
+                content: None,
+            },
+            ClientMessage::ReplyToComment {
+                comment_id: CommentId::from("c-1"),
+                content: None,
+            },
+            ClientMessage::ResolveComment {
+                comment_id: CommentId::from("c-1"),
+                resolved: true,
+            },
             ClientMessage::Cursor {
                 wave_id: WaveId::from("w-1"),
                 blip_id: BlipId::from("b-1"),
@@ -736,6 +831,7 @@ mod tests {
             id: BlipId::from("b-1"),
             wavelet_id: WaveletId::from("s-1"),
             parent: None,
+            comment: None,
             seq: 0,
             author: UserId::from("u-1"),
             contributors: vec![],
@@ -744,6 +840,15 @@ mod tests {
             content: Delta::new(),
             revision: 0,
             unread: false,
+        };
+        let thread = CommentThread {
+            id: CommentId::from("c-1"),
+            wavelet_id: WaveletId::from("s-1"),
+            blip_id: BlipId::from("b-1"),
+            author: UserId::from("u-1"),
+            created_at: 0,
+            resolved_by: None,
+            resolved_at: None,
         };
         let wavelet = WaveletView {
             id: WaveletId::from("s-1"),
@@ -755,6 +860,7 @@ mod tests {
             created_at: 0,
             last_modified: 0,
             blips: vec![blip.clone()],
+            comments: vec![thread.clone()],
         };
         let summary = WaveSummary {
             id: WaveId::from("w-1"),
@@ -799,11 +905,22 @@ mod tests {
             },
             ServerMessage::BlipAdded {
                 wave_id: WaveId::from("w-1"),
-                blip,
+                blip: blip.clone(),
             },
             ServerMessage::BlipRemoved {
                 wave_id: WaveId::from("w-1"),
                 blip_id: BlipId::from("b-1"),
+            },
+            ServerMessage::CommentAdded {
+                wave_id: WaveId::from("w-1"),
+                comment: thread,
+                blip: blip.clone(),
+            },
+            ServerMessage::CommentResolved {
+                wave_id: WaveId::from("w-1"),
+                comment_id: CommentId::from("c-1"),
+                resolved_by: Some(UserId::from("u-1")),
+                resolved_at: Some(0),
             },
             ServerMessage::TitleChanged {
                 wave_id: WaveId::from("w-1"),

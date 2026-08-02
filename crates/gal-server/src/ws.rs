@@ -250,6 +250,23 @@ async fn dispatch(
             participants,
         } => private_reply(state, session, wavelet_id, anchor, participants).await,
 
+        ClientMessage::CreateComment {
+            wavelet_id,
+            blip_id,
+            comment_id,
+            content,
+        } => create_comment(state, session, wavelet_id, blip_id, comment_id, content).await,
+
+        ClientMessage::ReplyToComment {
+            comment_id,
+            content,
+        } => reply_to_comment(state, session, comment_id, content).await,
+
+        ClientMessage::ResolveComment {
+            comment_id,
+            resolved,
+        } => resolve_comment(state, session, comment_id, resolved).await,
+
         ClientMessage::Cursor {
             wave_id,
             blip_id,
@@ -541,6 +558,264 @@ async fn create_blip(
     Ok(())
 }
 
+/// Open a comment thread on a range of a blip's text.
+///
+/// The range is not named here and is not stored: the client marks it by
+/// applying a [`COMMENT_ATTRIBUTE`] run in an ordinary `Submit`, so the anchor
+/// is part of the document and rides along with every edit. This creates the
+/// thread that run points at, together with its first remark.
+async fn create_comment(
+    state: &Arc<AppState>,
+    session: &mut Session,
+    wavelet_id: WaveletId,
+    blip_id: BlipId,
+    comment_id: CommentId,
+    content: Option<Delta>,
+) -> Result<(), ServerMessage> {
+    // A client mints this id, so it is checked before it reaches storage, the
+    // wire, or anyone's DOM.
+    if !comment_id.is_well_formed() {
+        return Err(ServerMessage::error(
+            ErrorCode::BadRequest,
+            "That is not a usable comment id.",
+        ));
+    }
+    let (wave_id, wave) = find_wavelet(state, session, &wavelet_id).await?;
+    let content = seed_content(content).map_err(|e| *e)?;
+
+    // Held across the writes, as in `create_blip`: releasing it between the
+    // checks and the insert would let two clients claim the same id, and would
+    // let the mode change in the gap.
+    let mut live = wave.lock().await;
+    if !live.may_access(&session.user.id, &wavelet_id) {
+        return Err(not_found());
+    }
+    live.permit(&session.user.id, Action::Comment)?;
+
+    if live.comments.contains_key(&comment_id) {
+        return Err(ServerMessage::error(
+            ErrorCode::BadRequest,
+            "That comment already exists.",
+        ));
+    }
+    let Some(target) = live.blips.get(&blip_id) else {
+        return Err(not_found());
+    };
+    if target.meta.wavelet_id != wavelet_id {
+        return Err(not_found());
+    }
+    // Comments annotate the page, not each other. Allowing a thread on a remark
+    // would give a comment its own comments and no sensible place to draw them.
+    if target.meta.comment.is_some() {
+        return Err(ServerMessage::error(
+            ErrorCode::BadRequest,
+            "You cannot comment on a comment.",
+        ));
+    }
+
+    let thread = CommentThread {
+        id: comment_id.clone(),
+        wavelet_id: wavelet_id.clone(),
+        blip_id: blip_id.clone(),
+        author: session.user.id.clone(),
+        created_at: now(),
+        resolved_by: None,
+        resolved_at: None,
+    };
+    // The remark hangs off the blip it annotates, so the existing rule that a
+    // blip with replies cannot be deleted already protects a commented page.
+    let mut blip = Blip::new(
+        wave_id.clone(),
+        wavelet_id.clone(),
+        session.user.id.clone(),
+        Some(blip_id),
+        live.next_seq(&wavelet_id),
+    );
+    blip.comment = Some(comment_id);
+    if let Some(content) = content {
+        blip.content = content;
+        blip.revision = 1;
+    }
+
+    state
+        .db
+        .create_comment(thread.clone(), blip.clone())
+        .await
+        .map_err(internal)?;
+    if blip.revision > 0 {
+        if let Err(e) = state
+            .db
+            .commit_op(
+                blip.clone(),
+                blip.content.clone(),
+                session.user.id.clone(),
+                blip.created_at,
+                None,
+            )
+            .await
+        {
+            // As in `create_blip`: a row whose seed op is missing would make
+            // playback rebuild the wrong document, so take it back out.
+            let _ = state.db.delete_blip(&blip.id).await;
+            return Err(internal(e));
+        }
+    }
+
+    live.comments.insert(thread.id.clone(), thread.clone());
+    live.blips
+        .insert(blip.id.clone(), crate::state::LiveBlip::new(blip.clone()));
+    if let Some(wavelet) = live.wavelet_mut(&wavelet_id) {
+        wavelet.last_modified = blip.last_modified;
+    }
+
+    let empty = Default::default();
+    // Everyone including the author, who needs the ids to focus the new remark.
+    live.broadcast(
+        &wavelet_id,
+        None,
+        ServerMessage::CommentAdded {
+            wave_id: wave_id.clone(),
+            comment: thread,
+            blip: blip_view(&blip, &empty),
+        },
+    );
+    drop(live);
+
+    state.schedule_inbox_update(&wave_id);
+    Ok(())
+}
+
+async fn reply_to_comment(
+    state: &Arc<AppState>,
+    session: &mut Session,
+    comment_id: CommentId,
+    content: Option<Delta>,
+) -> Result<(), ServerMessage> {
+    let (wave_id, wave) = find_comment(state, session, &comment_id).await?;
+    let content = seed_content(content).map_err(|e| *e)?;
+
+    let mut live = wave.lock().await;
+    let Some(thread) = live.comments.get(&comment_id).cloned() else {
+        return Err(not_found());
+    };
+    if !live.may_access(&session.user.id, &thread.wavelet_id) {
+        return Err(not_found());
+    }
+    live.permit(&session.user.id, Action::Comment)?;
+    // A resolved thread is drawn collapsed, so a remark added to one would be
+    // written and then not shown. Reopening is one click and says what happened.
+    if thread.resolved() {
+        return Err(ServerMessage::error(
+            ErrorCode::BadRequest,
+            "This comment is resolved. Reopen it to reply.",
+        ));
+    }
+
+    let mut blip = Blip::new(
+        wave_id.clone(),
+        thread.wavelet_id.clone(),
+        session.user.id.clone(),
+        Some(thread.blip_id.clone()),
+        live.next_seq(&thread.wavelet_id),
+    );
+    blip.comment = Some(comment_id);
+    if let Some(content) = content {
+        blip.content = content;
+        blip.revision = 1;
+    }
+
+    state.db.insert_blip(blip.clone()).await.map_err(internal)?;
+    if blip.revision > 0 {
+        if let Err(e) = state
+            .db
+            .commit_op(
+                blip.clone(),
+                blip.content.clone(),
+                session.user.id.clone(),
+                blip.created_at,
+                None,
+            )
+            .await
+        {
+            let _ = state.db.delete_blip(&blip.id).await;
+            return Err(internal(e));
+        }
+    }
+
+    live.blips
+        .insert(blip.id.clone(), crate::state::LiveBlip::new(blip.clone()));
+    if let Some(wavelet) = live.wavelet_mut(&thread.wavelet_id) {
+        wavelet.last_modified = blip.last_modified;
+    }
+    let empty = Default::default();
+    live.broadcast(
+        &thread.wavelet_id,
+        None,
+        ServerMessage::BlipAdded {
+            wave_id: wave_id.clone(),
+            blip: blip_view(&blip, &empty),
+        },
+    );
+    drop(live);
+
+    state.schedule_inbox_update(&wave_id);
+    Ok(())
+}
+
+/// Close a thread, or reopen it.
+///
+/// Any participant may, which matches the mode this exists for: a notepad is a
+/// page everyone edits, so a thread about it is everyone's to close. Who did it
+/// is recorded rather than restricted.
+async fn resolve_comment(
+    state: &Arc<AppState>,
+    session: &mut Session,
+    comment_id: CommentId,
+    resolved: bool,
+) -> Result<(), ServerMessage> {
+    let (wave_id, wave) = find_comment(state, session, &comment_id).await?;
+
+    let mut live = wave.lock().await;
+    let Some(thread) = live.comments.get(&comment_id).cloned() else {
+        return Err(not_found());
+    };
+    if !live.may_access(&session.user.id, &thread.wavelet_id) {
+        return Err(not_found());
+    }
+    live.permit(&session.user.id, Action::ResolveComment)?;
+    if thread.resolved() == resolved {
+        return Ok(()); // already how the caller wants it
+    }
+
+    let (resolved_by, resolved_at) = if resolved {
+        (Some(session.user.id.clone()), Some(now()))
+    } else {
+        (None, None)
+    };
+    if let Some(thread) = live.comments.get_mut(&comment_id) {
+        thread.resolved_by = resolved_by.clone();
+        thread.resolved_at = resolved_at;
+    }
+    live.broadcast(
+        &thread.wavelet_id,
+        None,
+        ServerMessage::CommentResolved {
+            wave_id: wave_id.clone(),
+            comment_id: comment_id.clone(),
+            resolved_by: resolved_by.clone(),
+            resolved_at,
+        },
+    );
+    drop(live);
+
+    state
+        .db
+        .set_comment_resolved(&comment_id, resolved_by, resolved_at)
+        .await
+        .map_err(internal)?;
+    Ok(())
+}
+
 async fn delete_blip(
     state: &Arc<AppState>,
     session: &mut Session,
@@ -555,6 +830,17 @@ async fn delete_blip(
     let wavelet_id = blip.meta.wavelet_id.clone();
     if !live.may_access(&session.user.id, &wavelet_id) {
         return Err(not_found());
+    }
+    // A remark is not deletable, in any mode. Deleting the first one would leave
+    // a thread with nothing in it — a state the client cannot draw and the
+    // protocol has no way to repair — and the wave may since have left Notepad,
+    // where `allows_delete` would otherwise wave this through. Resolving is what
+    // retracts a comment, and it keeps the record.
+    if blip.meta.comment.is_some() {
+        return Err(ServerMessage::error(
+            ErrorCode::Forbidden,
+            "Comments are not deleted. Resolve the thread instead.",
+        ));
     }
     if blip.meta.author != session.user.id {
         return Err(ServerMessage::error(
@@ -923,6 +1209,8 @@ async fn private_reply(
         created_at: wavelet.created_at,
         last_modified: wavelet.last_modified,
         blips: vec![blip_view(&blip, &empty)],
+        // A wavelet created this instant has nothing anchored in it yet.
+        comments: Vec::new(),
     };
     live.broadcast(
         &wavelet.id,
@@ -1007,6 +1295,22 @@ async fn find_blip(
     for wave_id in &session.subscribed {
         if let Ok(Some(wave)) = state.open_wave(wave_id).await {
             if wave.lock().await.blips.contains_key(blip_id) {
+                return Ok((wave_id.clone(), wave));
+            }
+        }
+    }
+    Err(not_found())
+}
+
+/// Same, for a comment thread.
+async fn find_comment(
+    state: &Arc<AppState>,
+    session: &Session,
+    comment_id: &CommentId,
+) -> Result<(WaveId, Arc<Mutex<LiveWave>>), ServerMessage> {
+    for wave_id in &session.subscribed {
+        if let Ok(Some(wave)) = state.open_wave(wave_id).await {
+            if wave.lock().await.comments.contains_key(comment_id) {
                 return Ok((wave_id.clone(), wave));
             }
         }

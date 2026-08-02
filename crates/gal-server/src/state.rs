@@ -74,6 +74,9 @@ pub struct LiveWave {
     pub wave: Wave,
     pub wavelets: Vec<Wavelet>,
     pub blips: HashMap<BlipId, LiveBlip>,
+    /// Comment threads, keyed by id. Their remarks are ordinary entries in
+    /// `blips`, tagged with the thread they belong to.
+    pub comments: HashMap<CommentId, CommentThread>,
     pub subscribers: HashMap<ConnId, Subscriber>,
     /// Public profiles of everyone who might appear in this wave, so rendering
     /// a view never has to go back to the database.
@@ -126,6 +129,8 @@ impl LiveWave {
             Action::Delete => mode.allows_delete(),
             Action::Retitle => mode.allows_retitle(is_creator),
             Action::PrivateReply => mode.allows_private_reply(),
+            Action::Comment => mode.allows_comments(),
+            Action::ResolveComment => mode.allows_resolve(),
             // Changing the rules is the creator's alone, in every mode —
             // including Frozen, or a wave could never be thawed.
             Action::SetMode => is_creator,
@@ -142,6 +147,11 @@ impl LiveWave {
                 }
                 (m, _) if m.is_frozen() => {
                     "This wave is frozen. Unfreeze it to make changes.".to_string()
+                }
+                // Every other writable mode has a reply or a composer, which is
+                // why it has no comments: there is already somewhere to say this.
+                (_, Action::Comment) => {
+                    "Comments belong to a notepad. Here you can reply instead.".to_string()
                 }
                 (WaveMode::Chat, Action::Edit { .. }) => {
                     "In a chat you can only edit your own messages.".to_string()
@@ -299,6 +309,19 @@ impl LiveWave {
                         .into_iter()
                         .map(|b| blip_view(&b.meta, read_marks))
                         .collect(),
+                    // Scoped by wavelet like everything else here: a thread is
+                    // only ever visible to people who can read the blip it
+                    // annotates, because that is the wavelet it belongs to.
+                    comments: {
+                        let mut threads: Vec<CommentThread> = self
+                            .comments
+                            .values()
+                            .filter(|c| c.wavelet_id == w.id)
+                            .cloned()
+                            .collect();
+                        threads.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+                        threads
+                    },
                 }
             })
             .collect();
@@ -369,6 +392,10 @@ pub enum Action {
     Delete,
     Retitle,
     PrivateReply,
+    /// Opening a comment thread on a range of text, or adding to one.
+    Comment,
+    /// Closing or reopening a thread that already exists.
+    ResolveComment,
     SetMode,
 }
 
@@ -389,6 +416,7 @@ pub fn blip_view(blip: &Blip, read_marks: &HashMap<BlipId, u64>) -> BlipView {
         id: blip.id.clone(),
         wavelet_id: blip.wavelet_id.clone(),
         parent: blip.parent.clone(),
+        comment: blip.comment.clone(),
         seq: blip.seq,
         author: blip.author.clone(),
         contributors: blip.contributors.clone(),
@@ -556,6 +584,7 @@ impl AppState {
         };
         let wavelets = self.db.wavelets_of_wave(wave_id).await?;
         let blips = self.db.blips_of_wave(wave_id).await?;
+        let comments = self.db.comments_of_wave(wave_id).await?;
         let all_users = self.db.all_users().await?;
 
         let mut live = LiveWave {
@@ -565,6 +594,7 @@ impl AppState {
                 .into_iter()
                 .map(|b| (b.id.clone(), LiveBlip::new(b)))
                 .collect(),
+            comments: comments.into_iter().map(|c| (c.id.clone(), c)).collect(),
             subscribers: HashMap::new(),
             user_cache: HashMap::new(),
             evicted: false,
