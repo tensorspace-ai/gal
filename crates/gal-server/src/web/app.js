@@ -93,6 +93,9 @@ const state = {
   commentRail: null,
   /// The thread whose card and highlight are lit up, if any.
   activeComment: null,
+  /// A message a search hit is on its way to, held until the thread has been
+  /// built from the snapshot and the node exists to scroll to.
+  revealBlip: null,
   /// Whether settled threads are on show. Off by default: the point of
   /// resolving one is to get it out of the margin.
   showResolved: false,
@@ -290,10 +293,20 @@ function renderFilters() {
   }
 }
 
+/**
+ * What a wave counts as unread for. Muting a wave is a statement that you do
+ * not want to be told about it, so it keeps its messages and loses its claim on
+ * your attention: no badge, and out of the Unread filter. It stays in All,
+ * because muting is not archiving and the conversation is still yours.
+ */
+function unreadCount(row) {
+  return row.flags.muted ? 0 : row.unreadCount;
+}
+
 function inboxRows() {
   const rows = [...state.inbox.values()];
   const filtered = rows.filter((row) => {
-    if (state.filter === 'unread') return row.unreadCount > 0 && !row.flags.archived;
+    if (state.filter === 'unread') return unreadCount(row) > 0 && !row.flags.archived;
     if (state.filter === 'archived') return row.flags.archived;
     return !row.flags.archived;
   });
@@ -311,7 +324,7 @@ function renderInbox() {
     for (const hit of state.search.hits) {
       host.appendChild(el('button', {
         class: 'inbox-row',
-        onClick: () => openWave(hit.waveId),
+        onClick: () => openWave(hit.waveId, { revealBlip: hit.blipId }),
       }, [
         // Same shape as an inbox row, so the timestamp lines up in the same
         // place rather than dropping onto a line of its own.
@@ -338,18 +351,24 @@ function renderInbox() {
     const faces = el('div', { class: 'faces' },
       (others.length ? others : row.participants).slice(0, 3).map((p) => avatar(p, { size: 22 })));
 
+    const unread = unreadCount(row);
     host.appendChild(el('button', {
-      class: `inbox-row ${row.id === state.waveId ? 'active' : ''} ${row.unreadCount ? 'unread' : ''}`,
+      class: `inbox-row ${row.id === state.waveId ? 'active' : ''} ${unread ? 'unread' : ''}`
+        + `${row.flags.muted ? ' muted' : ''}`,
       onClick: () => openWave(row.id),
+      'aria-current': row.id === state.waveId ? 'true' : null,
     }, [
       el('div', { class: 'inbox-row-top' }, [
         faces,
         el('div', { class: 'inbox-title', text: row.title }),
+        row.flags.muted
+          ? el('span', { class: 'muted-mark', text: 'Muted', title: 'Muted — no unread count' })
+          : null,
         el('div', { class: 'inbox-time', text: relativeTime(row.lastModified) }),
       ]),
       el('div', { class: 'inbox-snippet', text: row.snippet || 'No messages yet' }),
-      row.unreadCount
-        ? el('span', { class: 'badge', text: String(row.unreadCount) })
+      unread
+        ? el('span', { class: 'badge', text: String(unread) })
         : null,
     ]));
   }
@@ -383,14 +402,41 @@ function renderEmptyWave() {
   ]));
 }
 
-function openWave(waveId) {
-  if (state.waveId === waveId) return;
+function openWave(waveId, { revealBlip = null } = {}) {
+  if (state.waveId === waveId) {
+    // Already here: a second search hit in the open wave still has somewhere to
+    // take you, so do the reveal rather than nothing.
+    if (revealBlip) revealBlip_(revealBlip);
+    return;
+  }
   if (state.waveId) conn.closeWave(state.waveId);
   teardownWave();
   state.waveId = waveId;
+  // Held until the thread has been built from the snapshot; the blip does not
+  // exist as a node yet.
+  state.revealBlip = revealBlip;
   conn.openWave(waveId);
   showInbox(false);
   renderInbox();
+}
+
+/**
+ * Scroll a message into view and mark it briefly.
+ *
+ * Search has always known which message matched — `blipId` is on every hit —
+ * and the client threw it away and opened the wave at the top, leaving you to
+ * find the line again by eye in a conversation that might be a year long.
+ */
+function revealBlip_(blipId) {
+  const node = state.blipNodes.get(blipId);
+  if (!node) return false;
+  node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  node.classList.remove('revealed');
+  // Restart the animation: without the reflow a second hit on the same message
+  // re-adds a class the node already has and nothing happens.
+  void node.offsetWidth;
+  node.classList.add('revealed');
+  return true;
 }
 
 function teardownWave() {
@@ -408,6 +454,7 @@ function teardownWave() {
   state.toolbar = null;
   state.toolbarHome = null;
   state.doomed.clear();
+  state.revealBlip = null;
   state.commentRail = null;
   state.activeComment = null;
   state.showResolved = false;
@@ -476,6 +523,29 @@ function renderWave() {
           waveId: state.waveId,
           flags: { ...state.wave.flags, archived: !state.wave.flags.archived },
         }),
+      }),
+      // Muting keeps the wave and drops its claim on your attention. Archiving
+      // is the one that takes it out of the list, and a wave that anybody
+      // writes in comes straight back out of the archive — so without this
+      // there was no way to stay in a busy conversation without being counted
+      // at by it.
+      el('button', {
+        class: 'btn ghost',
+        text: state.wave.flags.muted ? 'Unmute' : 'Mute',
+        title: state.wave.flags.muted
+          ? 'Count unread messages in this wave again'
+          : 'Keep this wave, but stop counting its unread messages',
+        onClick: () => conn.send({
+          type: 'setFlags',
+          waveId: state.waveId,
+          flags: { ...state.wave.flags, muted: !state.wave.flags.muted },
+        }),
+      }),
+      el('button', {
+        class: 'btn ghost',
+        text: 'Leave',
+        title: 'Remove yourself from this wave',
+        onClick: () => leaveWave(),
       }),
     ]),
   ]);
@@ -665,6 +735,34 @@ function modeControl() {
   return select;
 }
 
+/**
+ * Remove yourself from the open wave.
+ *
+ * The server takes the private replies with it, so say so: someone leaving a
+ * wave they had a side conversation in is leaving that too, and finding out
+ * afterwards is not the moment to learn it.
+ */
+async function leaveWave() {
+  const root = rootWavelet();
+  if (!root) return;
+  // The server keeps a wave from being emptied, since nothing could ever reach
+  // it again. Say so here rather than sending a request that comes back as an
+  // error the person cannot act on.
+  if (root.participants.length <= 1) {
+    toast('You are the only person in this wave, and a wave needs someone in it.'
+      + ' Archive it instead.');
+    return;
+  }
+  const ok = await confirmAction(
+    'Leave this wave',
+    'You will stop receiving it, including any private replies you are part of.'
+      + ' Someone still in it can add you back.',
+    { confirmLabel: 'Leave', danger: true },
+  );
+  if (!ok) return;
+  conn.send({ type: 'removeParticipant', waveletId: root.id, userId: state.me.id });
+}
+
 function renderParticipants() {
   const host = document.getElementById('participants');
   if (!host) return;
@@ -673,10 +771,18 @@ function renderParticipants() {
   if (!root) return;
 
   for (const participant of root.participants) {
+    const isMe = participant.id === state.me.id;
     const face = avatar(participant, { size: 24 });
     face.classList.add('clickable');
-    face.addEventListener('click', async () => {
-      if (participant.id === state.me.id) return;
+    face.title = isMe ? 'Leave this wave' : `Remove ${participant.displayName}`;
+    const act = async () => {
+      // Clicking your own face used to do nothing at all, so there was no way
+      // out of a wave from the client even though the server has always allowed
+      // anyone to remove themselves.
+      if (isMe) {
+        await leaveWave();
+        return;
+      }
       const ok = await confirmAction(
         'Remove participant',
         `Remove ${participant.displayName} from this wave?`,
@@ -685,7 +791,8 @@ function renderParticipants() {
       if (ok) {
         conn.send({ type: 'removeParticipant', waveletId: root.id, userId: participant.id });
       }
-    });
+    };
+    face.addEventListener('click', act);
     host.appendChild(face);
   }
 
@@ -848,6 +955,10 @@ function renderThread() {
   dockToolbar();
   restoreCommentFocus();
   if (chat && pinned) scroller.scrollTop = scroller.scrollHeight;
+
+  // A search hit waiting for its message to exist. Cleared once it lands, so a
+  // later rebuild does not drag the reader back to it.
+  if (state.revealBlip && revealBlip_(state.revealBlip)) state.revealBlip = null;
 }
 
 /// Put the caret back in the active card's reply box after a rebuild.
@@ -2219,6 +2330,15 @@ conn.on('waveletAdded', (message) => {
 
 conn.on('inboxUpdated', (message) => {
   state.inbox.set(message.summary.id, message.summary);
+  // The open wave holds its own copy of the flags, taken from the snapshot it
+  // was opened with, and the header's buttons are drawn from that copy. Without
+  // this it never hears about a change it made itself: Archive has always gone
+  // on saying "Archive" after archiving, until the wave was closed and reopened.
+  if (state.wave && message.summary.id === state.waveId) {
+    const before = JSON.stringify(state.wave.flags);
+    state.wave.flags = message.summary.flags;
+    if (JSON.stringify(state.wave.flags) !== before) renderWave();
+  }
   renderInbox();
 });
 

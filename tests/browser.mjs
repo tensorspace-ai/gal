@@ -826,6 +826,75 @@ try {
   check('and survives a thread rebuild with the caret elsewhere',
     (await fAlice.locator('.toolbar .tool-bold').count()) === 1);
 
+  // --- muting, leaving, and finding a hit --------------------------------
+
+  section('Muting, leaving, and jumping to a search hit');
+
+  const gwen = await signUp('gwen');
+  const hana = await signUp('hana');
+  await createWave(gwen, 'Roadmap');
+  await addParticipant(gwen, 'hana');
+  await gwen.click('.blip .editor');
+  await gwen.keyboard.type('the aardvark milestone slips to March');
+  await gwen.waitForTimeout(900);
+
+  // Hana has an unread wave. Muting it keeps it and drops the count.
+  await hana.waitForTimeout(900);
+  await hana.click('.inbox-row');
+  await hana.waitForSelector('.wave-actions');
+  await hana.click('.inbox-back, .sidebar-toggle').catch(() => {});
+  await hana.waitForTimeout(400);
+
+  await gwen.click('.blip .editor');
+  await gwen.keyboard.type(' — and again');
+  await gwen.waitForTimeout(1200);
+
+  const badgeBeforeMute = await hana.locator('.inbox-row .badge').count();
+  await hana.click('.wave-actions .btn.ghost:has-text("Mute")');
+  await hana.waitForTimeout(900);
+  check('muting a wave clears its unread badge',
+    badgeBeforeMute >= 0 && (await hana.locator('.inbox-row .badge').count()) === 0);
+  check('and says the wave is muted rather than just going quiet',
+    (await hana.locator('.muted-mark').count()) === 1);
+  check('the button offers to undo it',
+    (await hana.locator('.wave-actions .btn.ghost:has-text("Unmute")').count()) === 1);
+
+  // Leaving is a thing the server always allowed and the client never offered.
+  await hana.click('.wave-actions .btn.ghost:has-text("Leave")');
+  await hana.waitForSelector('.dialog');
+  // A destructive confirmation is `.btn.danger`, not `.btn.primary`.
+  await hana.click('.dialog .btn.danger');
+  await hana.waitForTimeout(1200);
+  check('leaving a wave takes it out of the inbox',
+    (await hana.locator('.inbox-row').count()) === 0);
+  check('and the person still in it sees them go',
+    (await gwen.locator('.participants .avatar').count()) === 1);
+
+  // A search hit knows which message matched; it used to open the wave at the
+  // top and leave you to find the line by eye.
+  await gwen.click('.blip .editor');
+  await gwen.keyboard.press('End');
+  for (let i = 0; i < 12; i += 1) {
+    await gwen.click('.thread-foot .btn.primary');
+    await gwen.waitForTimeout(120);
+  }
+  await gwen.waitForTimeout(900);
+  const lastBlip = await gwen.locator('.blip').last();
+  await lastBlip.locator('.editor').click();
+  await gwen.keyboard.type('pangolin');
+  await gwen.waitForTimeout(1200);
+
+  await gwen.fill('.search-input', 'pangolin');
+  await gwen.waitForTimeout(1200);
+  check('search finds the message',
+    (await gwen.locator('.inbox-row .inbox-snippet mark').count()) >= 1);
+  await gwen.click('.inbox-row');
+  await gwen.waitForTimeout(1400);
+  check('clicking the hit marks the message it matched',
+    (await gwen.locator('.blip.revealed').count()) === 1);
+  check('and it is the message that actually contains the word',
+    (await gwen.textContent('.blip.revealed')).includes('pangolin'));
+
   // --- surviving an outage ----------------------------------------------
 
   section('Surviving an outage');

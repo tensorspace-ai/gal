@@ -396,6 +396,47 @@ textarea {
   line-height: 17px;
 }
 
+/* A muted wave keeps its place in the list and gives up its emphasis: the
+   title stops going bold on unread, and the row says why rather than leaving
+   a missing badge to be read as "nothing happened here". */
+.inbox-row.muted .inbox-title {
+  font-weight: 500;
+}
+
+.muted-mark {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 0 6px;
+  line-height: 15px;
+}
+
+/* Where a search hit landed. Long enough to find with the eye after the scroll
+   settles, then gone — it marks a message, it does not select one. */
+.blip.revealed {
+  animation: reveal 2.4s ease-out;
+}
+
+@keyframes reveal {
+  0%,
+  55% {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .blip.revealed {
+    animation-duration: 1ms;
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
 .empty-note {
   padding: 22px 12px;
   color: var(--text-faint);

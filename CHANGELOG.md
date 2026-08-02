@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — muting, leaving, and search that takes you to the message
+
+Three things the server already did and the client never offered.
+
+**Mute** a wave to keep it and stop being counted at: no badge, and out of the
+Unread filter, while it stays where it is in the list. The flag has been in the
+schema and on the wire since waves had flags at all, and nothing read it.
+
+**Leave** a wave from its header, or by clicking your own face among the
+participants — which used to be the one avatar that did nothing when clicked,
+though the server has always allowed anyone to remove themselves. Leaving takes
+the private replies you were in with it.
+
+**Search results now open at the message that matched**, scroll it into view and
+mark it briefly. Every hit has carried its `blipId` all along; the client threw
+it away and opened the wave at the top.
+
+### Fixed — the wave header no longer shows stale flags
+
+Archiving a wave left its button saying "Archive". The open wave keeps its own
+copy of the flags from the snapshot it was opened with, and an inbox update
+refreshed the list without refreshing that copy, so the header went on
+describing the state from before the change until the wave was closed and
+reopened.
+
 ### Added — comments on a notepad
 
 A notepad admits no new messages by design, so the only way to disagree with a

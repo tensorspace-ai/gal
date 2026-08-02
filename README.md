@@ -224,7 +224,15 @@ upgrading.
   yet.
 - **Unread tracking that understands editing.** Read state is per *revision*, so
   a message you have already read becomes unread again when somebody revises it.
-- **Full-text search** across every wave you participate in, with highlights.
+  A wave you **mute** keeps arriving and stops counting: it holds its place in
+  the list, without a badge and out of the Unread filter. Archiving is the one
+  that puts a wave away, and anything written in it brings it back.
+- **Leaving.** Remove yourself from a wave from its header, or by clicking your
+  own face in the participant list. It takes any private replies you were in
+  with it, since those are part of the wave.
+- **Full-text search** across every wave you participate in, with highlights —
+  and opening a result scrolls to the message that matched and marks it, rather
+  than dropping you at the top of a conversation to find the line by eye.
 - **Offline tolerance.** Kill the server mid-sentence and keep typing. The client
   reconnects with backoff, resynchronises, and replays what you wrote while it was
   gone — exactly once, even if the original op had actually been applied. There is
