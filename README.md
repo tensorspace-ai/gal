@@ -238,6 +238,16 @@ upgrading.
   Frame 102 of 291 for the wave above. The first message stops mid-word, and the
   replies that had not been written yet are empty — this is the op log replayed,
   so the granularity is a keystroke, not a save.
+- **Mentions.** Type `@` to name someone in the wave. The mention is a document
+  attribute carrying their *id*, not their name, so it is transformed by the
+  same code that transforms bold — it survives whatever anyone types around it —
+  and it still means the same person after the words are edited or they change
+  what they are called. Only participants are offered: naming somebody who
+  cannot see the message is a way to think you have reached them and be wrong.
+  Being named is drawn differently from naming someone else.
+
+  There are **no notifications yet**, so a mention is a highlight and not a
+  summons; if the tab is closed, nothing tells you.
 - **Undo that knows other people exist.** ⌘Z / Ctrl-Z takes back *your* last
   edit, not the last edit — and it keeps working after somebody else has
   written in the same message. The stack holds operations rather than saved

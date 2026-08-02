@@ -2,7 +2,15 @@
 
 import { Delta, compose } from './ot.js';
 import { BlipDoc, Connection } from './client.js';
-import { COMMENT_ATTR, commentRanges, Editor, indexToDom, renderDelta } from './editor.js';
+import {
+  COMMENT_ATTR,
+  commentRanges,
+  Editor,
+  indexToDom,
+  MENTION_ATTR,
+  renderDelta,
+  setCurrentUser,
+} from './editor.js';
 import {
   askFor,
   avatar,
@@ -96,6 +104,8 @@ const state = {
   /// A message a search hit is on its way to, held until the thread has been
   /// built from the snapshot and the node exists to scroll to.
   revealBlip: null,
+  /// The open mention picker: which editor, which `@…`, and what it matched.
+  mention: null,
   /// Whether settled threads are on show. Off by default: the point of
   /// resolving one is to get it out of the margin.
   showResolved: false,
@@ -495,6 +505,7 @@ function teardownWave() {
   state.toolbarHome = null;
   state.doomed.clear();
   state.revealBlip = null;
+  closeMentionPicker();
   state.commentRail = null;
   state.activeComment = null;
   state.showResolved = false;
@@ -778,6 +789,133 @@ function modeControl() {
     );
   }
   return select;
+}
+
+// --- mentions -----------------------------------------------------------
+
+/**
+ * Show or hide the list of people the caret's `@…` could be naming.
+ *
+ * Offers the wave's participants only. Naming somebody who cannot see the
+ * message is a way to think you have reached them and be wrong, which is worse
+ * than having no mentions at all.
+ */
+function updateMentionPicker(editor) {
+  const at = editor.mentionQuery && editor.mentionQuery();
+  const root = rootWavelet();
+  if (!at || !root) return closeMentionPicker();
+
+  const query = at.query.toLowerCase();
+  const matches = root.participants
+    .filter((p) => p.name.toLowerCase().startsWith(query)
+      || p.displayName.toLowerCase().startsWith(query))
+    .slice(0, 6);
+  if (matches.length === 0) return closeMentionPicker();
+
+  // Keep the highlighted row while the same `@…` is being typed at. Every
+  // keystroke ends in a keyup, which reports the selection and brings us back
+  // here — so rebuilding from scratch each time meant an arrow key moved the
+  // highlight and the keyup immediately moved it back, and Enter always chose
+  // the first name in the list.
+  const previous = state.mention;
+  const sameQuery = previous
+    && previous.at.index === at.index
+    && previous.at.query === at.query;
+  const active = sameQuery ? Math.min(previous.active, matches.length - 1) : 0;
+
+  state.mention = { editor, at, matches, active };
+  renderMentionPicker();
+}
+
+function closeMentionPicker() {
+  state.mention = null;
+  const node = document.getElementById('mention-picker');
+  if (node) node.remove();
+}
+
+function renderMentionPicker() {
+  const { editor, matches, active } = state.mention;
+  let host = document.getElementById('mention-picker');
+  if (!host) {
+    host = el('div', {
+      class: 'mention-picker',
+      id: 'mention-picker',
+      role: 'listbox',
+      'aria-label': 'People you can mention',
+    });
+    document.body.appendChild(host);
+  }
+  clear(host);
+
+  matches.forEach((person, i) => {
+    host.appendChild(el('button', {
+      class: `mention-option ${i === active ? 'active' : ''}`,
+      role: 'option',
+      'aria-selected': i === active ? 'true' : 'false',
+      // Chosen on mousedown, not click: clicking moves the focus out of the
+      // editor first, and the caret goes with it.
+      onMouseDown: (e) => {
+        e.preventDefault();
+        chooseMention(i);
+      },
+    }, [
+      avatar(person, { size: 20 }),
+      el('span', { class: 'mention-name', text: person.displayName }),
+      el('span', { class: 'mention-handle', text: `@${person.name}` }),
+    ]));
+  });
+
+  // Beside the caret. Falls back to the editor's own corner when the browser
+  // will not give a rectangle, which happens at the very start of an empty run.
+  const box = caretRect(editor) || editor.root.getBoundingClientRect();
+  host.style.left = `${Math.round(box.left)}px`;
+  host.style.top = `${Math.round(box.bottom + 6)}px`;
+}
+
+function caretRect(editor) {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0).cloneRange();
+  range.collapse(true);
+  const rects = range.getClientRects();
+  if (rects.length > 0) return rects[0];
+  if (!editor.root.isConnected) return null;
+  return null;
+}
+
+function chooseMention(index) {
+  if (!state.mention) return;
+  const { editor, at, matches } = state.mention;
+  const person = matches[index];
+  closeMentionPicker();
+  if (person) editor.insertMention(person, at);
+}
+
+/**
+ * Keys the picker takes while it is open.
+ *
+ * Returns true when it has handled the key, so the editor does not also act on
+ * it — Enter in particular, which would otherwise send the message.
+ */
+function mentionKey(event) {
+  if (!state.mention) return false;
+  const { matches, active } = state.mention;
+
+  if (event.key === 'Escape') {
+    closeMentionPicker();
+    return true;
+  }
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    const step = event.key === 'ArrowDown' ? 1 : -1;
+    state.mention.active = (active + step + matches.length) % matches.length;
+    renderMentionPicker();
+    return true;
+  }
+  if (event.key === 'Enter' || event.key === 'Tab') {
+    chooseMention(active);
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -1167,6 +1305,7 @@ function blipElement(blip, depth, { grouped = false } = {}) {
       onSelectionChange: (selection) => {
         state.activeEditor = editor;
         dockToolbar();
+        updateMentionPicker(editor);
         conn.send({
           type: 'cursor',
           waveId: state.waveId,
@@ -1176,6 +1315,7 @@ function blipElement(blip, depth, { grouped = false } = {}) {
         });
       },
     });
+    editor.onPickerKey = mentionKey;
     // Keep the model and the editor pointing at the same document object.
     editor.doc = doc.doc;
     editor.blipId = blip.id;
@@ -2166,6 +2306,9 @@ conn.on('status', updateStatus);
 
 conn.on('welcome', (message) => {
   state.me = message.user;
+  // The renderer needs to know who is reading, so a mention of them can be
+  // drawn as one.
+  setCurrentUser(state.me.id);
   state.inbox = new Map(message.inbox.map((row) => [row.id, row]));
   renderShell();
   // Restore the wave named in the URL, so a link to a wave works.

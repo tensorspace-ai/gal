@@ -98,6 +98,27 @@ id_type!(/// Identifies a blip — a single message document.
 id_type!(/// Identifies a comment thread anchored to a range of text.
     CommentId, "c-");
 
+impl UserId {
+    /// Longest identifier accepted from a client.
+    pub const MAX_LEN: usize = 64;
+
+    /// Is this the shape of an id this server mints?
+    ///
+    /// A user id is never *created* by a client, but one arrives inside a
+    /// document as the value of a [`MENTION_ATTRIBUTE`], and from there it
+    /// reaches the wire and the DOM. Checking the shape is what keeps a
+    /// mention from being a way to store arbitrary strings in a message, and
+    /// costs nothing.
+    pub fn is_well_formed(&self) -> bool {
+        let Some(rest) = self.0.strip_prefix("u-") else {
+            return false;
+        };
+        !rest.is_empty()
+            && self.0.len() <= Self::MAX_LEN
+            && rest.chars().all(|c| c.is_ascii_alphanumeric())
+    }
+}
+
 impl CommentId {
     /// Longest identifier accepted from a client.
     ///
@@ -138,6 +159,18 @@ impl CommentId {
 /// anchor goes with it, which is what leaves the thread detached rather than
 /// pointing at unrelated words.
 pub const COMMENT_ATTRIBUTE: &str = "comment";
+
+/// The document attribute that marks a run of text as naming someone.
+///
+/// An attribute rather than an embed, for exactly the reason above: a mention
+/// is carried along by the transforms the engines already perform, so it
+/// survives whatever anyone types around it, and it splits and merges with the
+/// text it covers instead of needing a position of its own.
+///
+/// Its value is the mentioned user's id, not their name. Names are display
+/// text and change; the id is what makes "does this name me?" still true after
+/// someone edits the words or changes what they are called.
+pub const MENTION_ATTRIBUTE: &str = "mention";
 
 // --- users --------------------------------------------------------------
 

@@ -280,6 +280,17 @@ other request, WebSockets included.
   other two thirds of the limit: cap the runs, and accept only the attributes
   this application defines, in the shapes it defines. Adding a new attribute to
   the client means adding it to `check_attributes` too.
+- An attribute whose value is an *identifier* is checked for shape, not for
+  meaning. `COMMENT_ATTRIBUTE` and `MENTION_ATTRIBUTE` both hold ids that reach
+  SQL, the wire and the DOM, so `is_well_formed` is what stops an attribute
+  being a place to keep arbitrary strings. Whether the id names something that
+  exists is deliberately not checked: a mention of a non-participant renders as
+  a name and reaches nobody, and the check would need wave context that
+  `check_attributes` does not have and should not acquire.
+- An attribute that is a *choice a person made* rather than a style must not be
+  inherited by text typed after it. `inheritable()` strips the comment anchor
+  and the mention; without that, typing after a mention quietly makes the rest
+  of the sentence part of somebody's name.
 - `check_attributes` bounds a link's size, not its scheme. Which URLs are safe
   to turn into anchors is `safeUrl`'s judgement in `web/editor.js`; a second
   copy of that rule on the server would be one that could drift out of step

@@ -895,6 +895,66 @@ try {
   check('and it is the message that actually contains the word',
     (await gwen.textContent('.blip.revealed')).includes('pangolin'));
 
+  // --- mentions -----------------------------------------------------------
+
+  section('Mentions');
+
+  const mia = await signUp('mia');
+  const mo = await signUp('mo');
+  await createWave(mia, 'Naming names');
+  await addParticipant(mia, 'mo');
+
+  await mia.click('.blip .editor');
+  await mia.keyboard.type('can you look at this ');
+  await mia.keyboard.type('@m');
+  await mia.waitForTimeout(500);
+  check('typing @ offers the people in the wave',
+    (await mia.locator('.mention-option').count()) >= 1);
+  check('and only people in the wave',
+    await mia.evaluate(() => [...document.querySelectorAll('.mention-handle')]
+      .every((n) => ['@mia', '@mo'].includes(n.textContent))));
+
+  // Enter chooses the person rather than sending the message.
+  await mia.keyboard.press('ArrowDown');
+  await mia.keyboard.press('Enter');
+  await mia.waitForTimeout(700);
+  check('the picker closes once someone is chosen',
+    (await mia.locator('.mention-picker').count()) === 0);
+  check('the mention is marked up, not just typed',
+    (await mia.locator('.blip .editor .mention').count()) === 1);
+  check('and it carries the id, not the name',
+    (await mia.getAttribute('.blip .editor .mention', 'data-user') || '').startsWith('u-'));
+
+  const named = await mia.textContent('.blip .editor .mention');
+  await mia.keyboard.type('please');
+  await mia.waitForTimeout(600);
+  check('typing after a mention does not extend it',
+    (await mia.textContent('.blip .editor .mention')) === named,
+    await mia.textContent('.blip .editor .mention'));
+
+  // The person named sees it differently from everyone else.
+  await mo.waitForSelector('.inbox-row', { timeout: 15000 });
+  await mo.click('.inbox-row');
+  await mo.waitForSelector('.blip .editor', { timeout: 15000 });
+  await mo.waitForTimeout(900);
+  check('the arrow key chose the second name, not the first', named === '@Mo', named);
+  check('the person named sees the mention highlighted as theirs',
+    (await mo.locator('.blip .editor .mention-you').count()) === 1);
+  check('and the author does not see it as naming them',
+    (await mia.locator('.blip .editor .mention-you').count()) === 0);
+
+  // The anchor is an attribute, so it survives edits around it like bold does.
+  await mia.click('.blip .editor');
+  await mia.keyboard.press('Home');
+  await mia.keyboard.type('URGENT: ');
+  await mia.waitForTimeout(800);
+  check('a mention survives text inserted before it',
+    (await mia.locator('.blip .editor .mention').count()) === 1
+      && (await mia.textContent('.blip .editor .mention')) === named);
+  await mo.waitForTimeout(900);
+  check('and the other client agrees',
+    (await mo.locator('.blip .editor .mention').count()) === 1);
+
   // --- undo ---------------------------------------------------------------
 
   section('Undo');

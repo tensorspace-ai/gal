@@ -1719,6 +1719,14 @@ fn check_attributes(delta: &Delta) -> Result<(), Box<ServerMessage>> {
                 COMMENT_ATTRIBUTE => value
                     .as_str()
                     .is_some_and(|id| CommentId::from(id).is_well_formed()),
+                // Shape only, like a link's length: whether the person named is
+                // actually in this wave is not checked, because a mention of
+                // somebody who is not is text that renders as a name and
+                // reaches nobody. Validating the shape is what keeps it from
+                // being a place to store arbitrary strings.
+                MENTION_ATTRIBUTE => value
+                    .as_str()
+                    .is_some_and(|id| UserId::from(id).is_well_formed()),
                 _ => false,
             };
             if !ok {

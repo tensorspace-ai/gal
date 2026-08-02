@@ -70,6 +70,29 @@ const EMBED_CHAR = '￼';
 export const COMMENT_ATTR = 'comment';
 
 /**
+ * A mention, carrying the id of the person named.
+ *
+ * An attribute rather than an embed, for the same reason a comment anchor is
+ * one: it is transformed by the code that already transforms bold, so a mention
+ * survives everything anyone types around it without a line of its own. Keeping
+ * the id — rather than trusting the text — is what lets "did this name me?"
+ * stay true after somebody renames themselves or edits the words.
+ *
+ * Must match `MENTION_ATTRIBUTE` in `gal-core/src/model.rs`.
+ */
+export const MENTION_ATTR = 'mention';
+
+/** Who this delta names, as a set of user ids. */
+export function mentionedUsers(delta) {
+  const ids = new Set();
+  for (const op of delta.ops || []) {
+    const id = op.attributes && op.attributes[MENTION_ATTR];
+    if (typeof id === 'string' && id) ids.add(id);
+  }
+  return ids;
+}
+
+/**
  * Formatting that text typed *after* a run should inherit from it.
  *
  * Everything except the comment anchor. Typing at the end of a bold word should
@@ -78,9 +101,15 @@ export const COMMENT_ATTR = 'comment';
  * chose, not a style that spreads.
  */
 function inheritable(attributes) {
-  if (!attributes || attributes[COMMENT_ATTR] === undefined) return attributes;
+  if (!attributes) return attributes;
+  if (attributes[COMMENT_ATTR] === undefined && attributes[MENTION_ATTR] === undefined) {
+    return attributes;
+  }
   const inherited = { ...attributes };
   delete inherited[COMMENT_ATTR];
+  // A mention is a name, not a style. Typing after one must not extend it, or
+  // the rest of the sentence quietly becomes part of who was named.
+  delete inherited[MENTION_ATTR];
   return inherited;
 }
 
@@ -234,6 +263,19 @@ function safeUrl(url) {
   return null;
 }
 
+/**
+ * Who is reading, so a mention of them can be drawn differently.
+ *
+ * Set once at sign-in. renderRun is called for every run of every message on
+ * every render, and threading an identity through all of it to answer one
+ * question would be worse than this.
+ */
+const CURRENT_USER = { id: null };
+
+export function setCurrentUser(id) {
+  CURRENT_USER.id = id;
+}
+
 /** Build the DOM for one run of text with its formatting. */
 function renderRun(text, attributes = {}) {
   let node = document.createTextNode(text);
@@ -253,6 +295,15 @@ function renderRun(text, attributes = {}) {
     anchor.appendChild(node);
     node = anchor;
   }
+  const mention = attributes[MENTION_ATTR];
+  if (typeof mention === 'string' && mention) {
+    const named = document.createElement('span');
+    named.className = mention === CURRENT_USER.id ? 'mention mention-you' : 'mention';
+    named.dataset.user = mention;
+    named.appendChild(node);
+    node = named;
+  }
+
   // Outermost, so the highlight covers the run whatever else it is wearing. A
   // plain <span> is transparent to every walker below, so it costs no offsets.
   const comment = attributes[COMMENT_ATTR];
@@ -667,6 +718,14 @@ export class Editor {
       return;
     }
 
+    // A picker open over the caret gets first refusal on the keys it uses —
+    // Enter above all, which would otherwise send the message instead of
+    // choosing the person being named.
+    if (this.onPickerKey && this.onPickerKey(event)) {
+      event.preventDefault();
+      return;
+    }
+
     // Let the toolbar shortcuts through to the document handler.
     if (event.key === 'Enter' && !event.shiftKey && this.onEnter) {
       if (this.onEnter(event) === false) return;
@@ -816,6 +875,57 @@ export class Editor {
       renderDelta(this.root, this.doc);
       this.setSelection(caret);
     }
+    this.reportSelection();
+  }
+
+  /**
+   * The `@word` the caret is sitting at the end of, if any.
+   *
+   * Returns `{ query, index }` where `index` is where the `@` is. Anchored to
+   * the caret rather than found by scanning the document: an `@` somewhere else
+   * in the message is a thing somebody wrote, not a thing they are typing.
+   */
+  mentionQuery() {
+    const selection = this.getSelection();
+    if (!selection || selection.length > 0) return null;
+    const text = this.doc.toPlainText().slice(0, selection.index);
+
+    const at = text.lastIndexOf('@');
+    if (at === -1) return null;
+    // Must start a word, or an email address offers to name people.
+    if (at > 0 && !/[\s(\[]/.test(text[at - 1])) return null;
+
+    const query = text.slice(at + 1);
+    // A name has no spaces, and a long run without a match is somebody writing
+    // prose that happens to contain an @.
+    if (/[\s@]/.test(query) || query.length > 32) return null;
+    return { query, index: at };
+  }
+
+  /**
+   * Replace the `@query` at the caret with a mention of `user`.
+   *
+   * The inserted text is the display name; the id rides along as the attribute,
+   * which is what keeps the mention meaning the same person after the words are
+   * edited or the name is changed.
+   */
+  insertMention(user, at) {
+    const total = this.doc.toPlainText().length;
+    const index = Math.max(0, Math.min(at.index, total));
+    const length = Math.min(at.query.length + 1, total - index);
+
+    const delta = new Delta()
+      .retain(index)
+      .delete(length)
+      .insert(`@${user.displayName}`, { [MENTION_ATTR]: user.id })
+      // A trailing space, unmentioned, so the next word does not run into the
+      // name and is not part of it.
+      .insert(' ');
+
+    this.pendingFormat = null;
+    this.applyLocal(delta, { selection: { index, length } });
+    renderDelta(this.root, this.doc);
+    this.setSelection(index + user.displayName.length + 2);
     this.reportSelection();
   }
 

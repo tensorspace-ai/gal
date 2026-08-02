@@ -460,6 +460,70 @@ textarea {
   }
 }
 
+/* A mention is a name, drawn as one. Not a link: it goes nowhere, and dressing
+   it as something clickable would promise a profile page that does not exist. */
+.mention {
+  color: var(--accent);
+  font-weight: 550;
+  border-radius: 4px;
+  padding: 0 2px;
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+
+/* Being named is the whole point of the feature, so it has to be findable by
+   eye in a long message rather than merely present. */
+.mention-you {
+  color: #fff;
+  background: var(--accent);
+}
+
+.mention-picker {
+  position: fixed;
+  z-index: 250;
+  min-width: 220px;
+  max-width: 320px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-2);
+  display: flex;
+  flex-direction: column;
+}
+
+.mention-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mention-option.active,
+.mention-option:hover {
+  background: var(--accent-soft);
+}
+
+.mention-name {
+  font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mention-handle {
+  color: var(--text-faint);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
 .empty-note {
   padding: 22px 12px;
   color: var(--text-faint);
