@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Gal — an Apache Wave-style real-time collaboration server"
 # An application rather than a library, but published all the same so it can be
 # installed with `cargo install gal-server`. It depends on both library crates,
@@ -36,8 +41,8 @@ base64 = "0.22"
 sha2 = "0.10"
 dashmap = "6"
 futures = "0.3"
-gal-core = { path = "../gal-core", version = "0.1.0" }
-gal-ot = { path = "../gal-ot", version = "0.1.0" }
+gal-core = { path = "../gal-core", version = "0.2.0" }
+gal-ot = { path = "../gal-ot", version = "0.2.0" }
 
 [dev-dependencies]
 tempfile = "3"

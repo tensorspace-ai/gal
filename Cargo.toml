@@ -3,12 +3,13 @@ resolver = "2"
 members = ["crates/gal-ot", "crates/gal-core", "crates/gal-server"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.87"
 license = "MIT"
 authors = ["TensorSpace, Inc."]
 repository = "https://github.com/tensorspace-ai/gal"
+homepage = "https://github.com/tensorspace-ai/gal"
 keywords = ["collaboration", "operational-transformation", "realtime", "websocket", "wave"]
 categories = ["web-programming::websocket", "text-editors"]
 
