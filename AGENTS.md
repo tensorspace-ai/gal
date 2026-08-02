@@ -239,6 +239,21 @@ other request, WebSockets included.
   widen this to trust the uploader's `Content-Type` or the extension: `script-src
   'self'` allows same-origin scripts, so a stored file served inline as HTML runs
   in every participant's session.
+- A document's limits apply to every *edit*, not only to the content a blip is
+  created with. `MAX_BLIP_UNITS` was enforced in `seed_content` alone for a
+  long time, which bounded nothing: documents are grown a keystroke at a time.
+  The check lives in `apply_op`, on the result, with a rollback — the same one
+  the persistence-failure path uses, because an op left in the resident
+  document but absent from the log corrupts everything that transforms over it.
+- Length is not a bound on its own. An attribute map costs no document *units*
+  however much JSON it holds, so `MAX_BLIP_RUNS` and `check_attributes` are the
+  other two thirds of the limit: cap the runs, and accept only the attributes
+  this application defines, in the shapes it defines. Adding a new attribute to
+  the client means adding it to `check_attributes` too.
+- `check_attributes` bounds a link's size, not its scheme. Which URLs are safe
+  to turn into anchors is `safeUrl`'s judgement in `web/editor.js`; a second
+  copy of that rule on the server would be one that could drift out of step
+  with the one that actually protects anyone.
 - Report security-relevant findings rather than quietly fixing them in a large
   unrelated change.
 

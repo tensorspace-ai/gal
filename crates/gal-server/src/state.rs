@@ -36,6 +36,26 @@ pub type ConnId = u64;
 /// participant would dominate the server's work, so updates are batched.
 const INBOX_DEBOUNCE_MS: u64 = 600;
 
+/// Largest document a single blip may hold, in UTF-16 code units.
+///
+/// A resident wave keeps every blip's document *and* the history needed to
+/// rebase against it, so an unbounded blip is an unbounded allocation in the
+/// server, not merely a large row.
+pub const MAX_BLIP_UNITS: usize = 256 * 1024;
+
+/// Most separately-formatted runs a document may be split into.
+///
+/// Length alone does not bound a document's cost. Every run carries its own
+/// attribute map, so a document within the length limit can still be made
+/// arbitrarily large by alternating formatting character by character —
+/// `MAX_BLIP_UNITS` runs, each holding an attribute map, is megabytes of JSON
+/// for a message of a quarter-million characters. Bounding the runs as well as
+/// the characters is what makes the pair of limits actually bound the memory.
+///
+/// Far above anything written by a person: a message split into sixteen
+/// thousand differently-formatted pieces is not formatting, it is a payload.
+pub const MAX_BLIP_RUNS: usize = 16 * 1024;
+
 /// A blip's document plus the OT history needed to rebase concurrent edits.
 pub struct LiveBlip {
     pub meta: Blip,
@@ -736,6 +756,28 @@ impl AppState {
                 return Err(ServerMessage::resync(blip_id.clone(), e.to_string()));
             }
         };
+
+        // Growth is checked here, on the *result*, and not on the submitted op.
+        // The limits used to be applied only to a blip's initial content, so a
+        // document could be grown without bound one edit at a time — which is
+        // the way documents are actually written, and the only way that matters
+        // for a limit whose stated purpose is bounding what the server holds in
+        // memory. Checking the op instead would be inexact: it arrives written
+        // against an older revision and is rebased before it lands.
+        let content = blip.doc.content();
+        let (units, runs) = (content.len(), content.ops.len());
+        if units > MAX_BLIP_UNITS || runs > MAX_BLIP_RUNS {
+            // Same rollback the persistence failure below uses: the op has
+            // already been applied to the resident document, and leaving it
+            // there would let later ops transform over an op the log never
+            // receives.
+            blip.doc.rollback_last();
+            blip.sync();
+            return Err(ServerMessage::resync(
+                blip_id.clone(),
+                "This message has reached its maximum size.",
+            ));
+        }
 
         blip.sync();
         blip.meta.record_contributor(author);

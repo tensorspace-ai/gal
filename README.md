@@ -410,6 +410,14 @@ The interesting parts:
 - **Only the wave's creator can remove someone else**, and anyone may remove
   themselves. Letting any participant evict any other made a hostile takeover of
   a wave trivial and irreversible.
+- **A document is bounded in what it can hold**, and the bound is applied to
+  every edit rather than only to a message's first draft. Three things are
+  capped, because any one alone leaves the other two free: its length
+  (256K UTF-16 units), the number of separately-formatted runs it is split into
+  (16K), and what a run's formatting may be — the attributes a document carries
+  are the ones this application defines, with values of the shape it defines.
+  Without the last of those, a delta's attribute map is arbitrary JSON of
+  arbitrary size hung off text that costs nothing against a length limit.
 
 ### Not implemented
 
@@ -432,8 +440,9 @@ Disclosed rather than hidden, because some of these matter for how you deploy it
 - **No end-to-end encryption.** The server can read everything; private replies
   are enforced by the server, not by cryptography.
 - **Quotas are coarse.** Login, registration, and username lookup are rate
-  limited per client, and message size is capped, but an authenticated user can
-  still create a large number of waves.
+  limited per client, and a single document is bounded in length, runs and
+  formatting, but an authenticated user can still create a large number of
+  waves and a large number of messages in them.
 
 Gal suits a team or community that broadly trusts its members. Close
 registration (`GAL_OPEN_REGISTRATION=0`) on anything internet-facing.

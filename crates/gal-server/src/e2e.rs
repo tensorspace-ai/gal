@@ -2764,3 +2764,162 @@ async fn a_comment_cannot_be_hung_on_a_comment() {
         .await;
     assert_eq!(code, ErrorCode::BadRequest);
 }
+
+// --- document limits -----------------------------------------------------
+
+/// The limits existed but were only ever applied to a blip's *initial* content,
+/// which is not how documents are written.
+#[tokio::test]
+async fn a_blip_cannot_be_grown_past_its_limit_one_edit_at_a_time() {
+    use crate::state::MAX_BLIP_UNITS;
+
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    let (wave_id, _, blip_id) = create_wave(&mut alice, "Big", vec![]).await;
+    alice.edit(&blip_id, Delta::new().insert("keep")).await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    alice.drain().await;
+
+    // Sent raw rather than through `edit`, so the client mirror is not left
+    // holding work the server was always going to refuse.
+    alice
+        .send(ClientMessage::Submit {
+            blip_id: blip_id.clone(),
+            revision: 1,
+            delta: Delta::new()
+                .retain(4)
+                .insert("a".repeat(MAX_BLIP_UNITS + 10)),
+            op_id: Some("too-big".into()),
+        })
+        .await;
+    let (code, named) = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, blip_id, .. } => Some((*code, blip_id.clone())),
+            ServerMessage::Ack { .. } => Some((ErrorCode::Internal, None)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::Resync, "an oversized edit must not land");
+    assert_eq!(
+        named.as_ref(),
+        Some(&blip_id),
+        "a refusal must name the document to reset, or the client retries forever"
+    );
+
+    // The rollback is the point: an op left in the resident document but absent
+    // from the log would have later ops transforming over something that exists
+    // nowhere else.
+    let mut fresh = server.connect(&cookie).await;
+    fresh.open(&wave_id).await;
+    assert_eq!(fresh.text(&blip_id), "keep", "the document is untouched");
+
+    // And the blip still works afterwards.
+    fresh
+        .edit(&blip_id, Delta::new().retain(4).insert(" going"))
+        .await;
+    fresh
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    assert_eq!(fresh.text(&blip_id), "keep going");
+}
+
+/// Length counts units; an attribute map costs none however much it carries, so
+/// the run count is the other half of the bound.
+#[tokio::test]
+async fn a_document_cannot_be_shattered_into_unlimited_runs() {
+    use crate::state::MAX_BLIP_RUNS;
+
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    let (wave_id, _, blip_id) = create_wave(&mut alice, "Runs", vec![]).await;
+
+    // One character per run, alternating so nothing merges them back together.
+    let mut delta = Delta::new();
+    for i in 0..=MAX_BLIP_RUNS {
+        let mut attrs = gal_ot::Attributes::new();
+        attrs.insert("bold".into(), serde_json::json!(i % 2 == 0));
+        delta = delta.insert_with("x", attrs);
+    }
+    alice
+        .send(ClientMessage::Submit {
+            blip_id: blip_id.clone(),
+            revision: 0,
+            delta,
+            op_id: Some("shatter".into()),
+        })
+        .await;
+
+    let code = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::Ack { .. } => Some(ErrorCode::Internal),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::Resync);
+
+    let mut fresh = server.connect(&cookie).await;
+    fresh.open(&wave_id).await;
+    assert_eq!(fresh.text(&blip_id), "", "nothing was kept");
+}
+
+#[tokio::test]
+async fn an_attribute_the_document_model_does_not_define_is_refused_by_name() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+
+    let (wave_id, _, blip_id) = create_wave(&mut alice, "Attrs", vec![]).await;
+    alice.edit(&blip_id, Delta::new().insert("hello")).await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    alice.drain().await;
+
+    let mut attrs = gal_ot::Attributes::new();
+    attrs.insert("payload".into(), serde_json::json!("x".repeat(200_000)));
+    alice
+        .send(ClientMessage::Submit {
+            blip_id: blip_id.clone(),
+            revision: 1,
+            delta: Delta::new().retain_with(5, attrs),
+            op_id: Some("junk".into()),
+        })
+        .await;
+
+    let (code, named) = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, blip_id, .. } => Some((*code, blip_id.clone())),
+            ServerMessage::Ack { .. } => Some((ErrorCode::Internal, None)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::BadRequest);
+    assert_eq!(
+        named.as_ref(),
+        Some(&blip_id),
+        "named, like every op refusal"
+    );
+
+    let mut fresh = server.connect(&cookie).await;
+    fresh.open(&wave_id).await;
+    assert_eq!(fresh.text(&blip_id), "hello");
+
+    // Formatting the client really does send still works, so the check bounds
+    // rather than breaks.
+    let mut bold = gal_ot::Attributes::new();
+    bold.insert("bold".into(), serde_json::json!(true));
+    fresh
+        .edit(&blip_id, Delta::new().retain_with(5, bold))
+        .await;
+    fresh
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    assert_eq!(fresh.text(&blip_id), "hello");
+}

@@ -34,6 +34,26 @@ Schema v5 adds a `comments` table and a `blips.comment` column. **Take a backup
 before upgrading**; a database this migration has touched cannot be read by
 0.2.0.
 
+### Fixed — a document's size limits now apply to editing it
+
+`MAX_BLIP_UNITS` was checked only against the content a blip was *created*
+with. Documents are grown a keystroke at a time, so the limit bounded nothing:
+any participant could take a single message past it, and a resident wave holds
+every document plus the history needed to rebase against it. The check now runs
+on the result of each edit, rolling the operation back if it would not fit.
+
+Length alone was not a bound either. A delta's attribute map is arbitrary JSON
+and costs no document *units* however much it carries, so a message inside the
+length limit could still hold unlimited data — nothing validated attributes at
+all. Two limits close that: the number of separately-formatted runs a document
+may be split into, and a check that its attributes are the ones this
+application defines, with the values it defines. Unknown attributes are refused
+rather than stored, as unknown message fields already are.
+
+This is invisible to the shipped client, which sends only the formatting it has
+always sent. A third-party client that invented its own attributes will now be
+refused by name.
+
 ## [0.2.0] — 2026-08-02
 
 ### Changed — a field the server does not define is now refused

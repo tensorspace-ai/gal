@@ -27,11 +27,7 @@ const OUTBOUND_CAPACITY: usize = 512;
 /// could be used to exhaust server memory.
 const MAX_FRAME_BYTES: usize = 1 << 20;
 
-/// Largest document a single blip may hold, in UTF-16 code units.
-///
-/// Documents are held in memory with their edit history, so an unbounded blip is
-/// an unbounded allocation.
-const MAX_BLIP_UNITS: usize = 256 * 1024;
+use crate::state::{MAX_BLIP_RUNS, MAX_BLIP_UNITS};
 
 pub async fn handler(
     upgrade: WebSocketUpgrade,
@@ -201,7 +197,7 @@ async fn dispatch(
             // Named, like every other refusal of an op: a bare one leaves the
             // client holding work it retries forever, and everything typed
             // afterwards piles up behind it.
-            if let Err(refusal) = check_embeds(&delta) {
+            if let Err(refusal) = check_embeds(&delta).and_then(|_| check_attributes(&delta)) {
                 return Err(name_blip(*refusal, &blip_id));
             }
             let (_, wave) = find_blip(state, session, &blip_id).await?;
@@ -1411,13 +1407,14 @@ fn seed_content(content: Option<Delta>) -> Result<Option<Delta>, Box<ServerMessa
             "Initial content must consist only of insertions.",
         )));
     }
-    if content.len() > MAX_BLIP_UNITS {
+    if content.len() > MAX_BLIP_UNITS || content.ops.len() > MAX_BLIP_RUNS {
         return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             "That message is too large.",
         )));
     }
     check_embeds(&content)?;
+    check_attributes(&content)?;
     Ok(Some(content))
 }
 
@@ -1439,6 +1436,65 @@ fn name_blip(mut refusal: ServerMessage, blip_id: &BlipId) -> ServerMessage {
         *target = Some(blip_id.clone());
     }
     refusal
+}
+
+/// Longest `link` value a document may carry.
+///
+/// Browsers stop honouring URLs well before this. It is here to bound what a
+/// run can hold, not to have an opinion about addresses.
+const MAX_LINK_BYTES: usize = 1024;
+
+/// The boolean attributes this application's documents use.
+const FLAG_ATTRIBUTES: [&str; 5] = ["bold", "italic", "underline", "strike", "code"];
+
+/// Reject attributes that are not part of the document model.
+///
+/// A delta's attribute map is `String -> serde_json::Value`, so without this a
+/// participant could hang arbitrary JSON of arbitrary size off every run of a
+/// document. Nothing else bounded it: `check_embeds` covers embeds only, and the
+/// length limits count *units*, of which an attribute map costs none however
+/// much it carries.
+///
+/// Unknown keys are refused rather than ignored, which is the same choice this
+/// protocol already makes for unknown message fields — silently keeping
+/// something the server does not understand is how a document ends up holding
+/// data no version of this program will ever read again.
+///
+/// Note what this deliberately does not do: it bounds a link's *size*, not its
+/// scheme. Which URLs are safe to turn into anchors is the renderer's judgement
+/// (`safeUrl` in `web/editor.js`), and a second copy of that rule here would be
+/// one that could drift out of step with the one that actually protects anyone.
+fn check_attributes(delta: &Delta) -> Result<(), Box<ServerMessage>> {
+    let refuse = |what: &str| {
+        Err(Box::new(ServerMessage::error(
+            ErrorCode::BadRequest,
+            format!("That formatting is not something this server accepts: {what}."),
+        )))
+    };
+
+    for op in &delta.ops {
+        for (key, value) in &op.attributes {
+            // A null value *removes* an attribute, which is how a retain strips
+            // formatting. It carries nothing, so there is nothing to check.
+            if value.is_null() {
+                continue;
+            }
+            let ok = match key.as_str() {
+                k if FLAG_ATTRIBUTES.contains(&k) => value.is_boolean(),
+                "link" => value
+                    .as_str()
+                    .is_some_and(|url| url.len() <= MAX_LINK_BYTES),
+                COMMENT_ATTRIBUTE => value
+                    .as_str()
+                    .is_some_and(|id| CommentId::from(id).is_well_formed()),
+                _ => false,
+            };
+            if !ok {
+                return refuse(key);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject embeds that are not small JSON objects.
@@ -1542,5 +1598,63 @@ mod tests {
     #[test]
     fn ordinary_text_passes_the_embed_check() {
         assert!(check_embeds(&Delta::document("just words")).is_ok());
+    }
+
+    /// Everything the shipped client actually sends must survive the check, or
+    /// the limit is a bug rather than a bound.
+    #[test]
+    fn the_formatting_the_client_uses_is_accepted() {
+        let mut attrs = gal_ot::Attributes::new();
+        for flag in FLAG_ATTRIBUTES {
+            attrs.insert(flag.to_string(), serde_json::json!(true));
+        }
+        attrs.insert("link".into(), serde_json::json!("https://example.com/x"));
+        attrs.insert(
+            COMMENT_ATTRIBUTE.into(),
+            serde_json::json!(CommentId::new().as_str()),
+        );
+        assert!(check_attributes(&Delta::new().insert_with("hello", attrs)).is_ok());
+
+        // A bare domain: the client stores what was typed and normalises it at
+        // render time, so the server must not insist on a scheme.
+        let mut bare = gal_ot::Attributes::new();
+        bare.insert("link".into(), serde_json::json!("example.com/plan"));
+        assert!(check_attributes(&Delta::new().insert_with("x", bare)).is_ok());
+
+        // A retain that strips formatting carries nulls, which remove rather
+        // than store and so have nothing to bound.
+        let mut removals = gal_ot::Attributes::new();
+        removals.insert("bold".into(), serde_json::Value::Null);
+        removals.insert(COMMENT_ATTRIBUTE.into(), serde_json::Value::Null);
+        assert!(check_attributes(&Delta::new().retain_with(3, removals)).is_ok());
+
+        assert!(check_attributes(&Delta::document("plain")).is_ok());
+    }
+
+    /// An attribute map is `String -> Value` and costs no document *units*, so
+    /// nothing else stood between a participant and hanging arbitrary JSON off
+    /// every run of a document.
+    #[test]
+    fn attributes_outside_the_document_model_are_refused() {
+        let case = |key: &str, value: serde_json::Value| {
+            let mut attrs = gal_ot::Attributes::new();
+            attrs.insert(key.to_string(), value);
+            check_attributes(&Delta::new().insert_with("x", attrs))
+        };
+
+        // A key this server has never heard of, holding as much as it likes.
+        assert!(case("payload", serde_json::json!("x".repeat(100_000))).is_err());
+        assert!(case("payload", serde_json::json!({ "nested": [1, 2, 3] })).is_err());
+        // Real keys, wrong shapes — a "flag" is a boolean, not a place to put
+        // half a megabyte.
+        assert!(case("bold", serde_json::json!("x".repeat(500_000))).is_err());
+        assert!(case("bold", serde_json::json!({ "on": true })).is_err());
+        assert!(case("link", serde_json::json!("x".repeat(MAX_LINK_BYTES + 1))).is_err());
+        assert!(case("link", serde_json::json!(["https://example.com"])).is_err());
+        // A comment id reaches SQL, the wire and the DOM, so the same rule
+        // applies to it here as when a thread is opened.
+        assert!(case(COMMENT_ATTRIBUTE, serde_json::json!("not-a-comment-id")).is_err());
+        assert!(case(COMMENT_ATTRIBUTE, serde_json::json!("c-<script>")).is_err());
+        assert!(case(COMMENT_ATTRIBUTE, serde_json::json!(true)).is_err());
     }
 }
