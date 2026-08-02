@@ -104,7 +104,21 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
     };
 
     // Greet with the user's identity and inbox.
-    let inbox = state.db.inbox(&user.id).await.unwrap_or_default();
+    //
+    // An empty inbox on a database error reads to the user as "my conversations
+    // are gone" — the exact failure `migrate` refuses to start rather than
+    // cause. Say the inbox could not be loaded instead, and let them retry.
+    let inbox = match state.db.inbox(&user.id).await {
+        Ok(inbox) => inbox,
+        Err(err) => {
+            tracing::error!(user = %user.id, error = %err, "loading inbox for welcome");
+            let _ = session.tx.try_send(ServerMessage::error(
+                ErrorCode::Internal,
+                "could not load your inbox; reconnect to try again",
+            ));
+            return;
+        }
+    };
     let _ = session.tx.try_send(ServerMessage::Welcome {
         user: user.public(),
         inbox,

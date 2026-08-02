@@ -1123,7 +1123,10 @@ impl Storage {
             let mut frames = Vec::new();
             for row in rows {
                 let (blip_id, revision, author, timestamp, delta) = row?;
-                let delta: Delta = serde_json::from_str(&delta).unwrap_or_default();
+                // An op that will not parse makes the history wrong from this
+                // frame on. Playback showing a confidently incorrect past is
+                // worse than playback that refuses to run.
+                let delta: Delta = stored_json(4, &delta)?;
                 frames.push(PlaybackFrame {
                     created: revision == 1,
                     blip_id,
@@ -1389,12 +1392,31 @@ fn row_to_blip(row: &Row<'_>) -> rusqlite::Result<Blip> {
         parent: row.get::<_, Option<String>>(3)?.map(BlipId),
         seq: row.get(4)?,
         author: UserId(row.get(5)?),
-        contributors: serde_json::from_str(&contributors).unwrap_or_default(),
+        contributors: stored_json(6, &contributors)?,
         created_at: row.get(7)?,
         last_modified: row.get(8)?,
-        content: serde_json::from_str(&content).unwrap_or_default(),
+        // Refusing beats defaulting, as it does for a wave's mode. An empty
+        // Delta is a *valid* document, so falling back to one showed the blip
+        // as blank rather than as broken — and the next keystroke composed
+        // against that blank and wrote it back over the row. The message was
+        // then gone for good, with nothing logged and nobody told.
+        content: stored_json(9, &content)?,
         revision: row.get::<_, i64>(10)? as u64,
         deleted: row.get::<_, i64>(11)? != 0,
+    })
+}
+
+/// Parses a JSON column, reporting a failure rather than substituting a default.
+///
+/// Every caller of this holds user-authored content. Whatever a corrupt row
+/// means, it does not mean "the user wrote nothing".
+fn stored_json<T: serde::de::DeserializeOwned>(column: usize, raw: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
     })
 }
 
@@ -1607,6 +1629,54 @@ mod tests {
              PRAGMA user_version = 0;",
         )
         .unwrap();
+    }
+
+    /// An empty Delta is a *valid* document, so defaulting a corrupt row
+    /// showed the message as blank rather than as broken — and the next
+    /// keystroke composed against that blank and wrote it back, losing the
+    /// original for good with nothing logged.
+    #[tokio::test]
+    async fn a_corrupt_blip_is_reported_rather_than_read_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = Storage::open(&path).unwrap();
+
+        let alice = make_user(&storage, "alice").await;
+        let (wave, wavelet) = storage
+            .create_wave(
+                alice.id.clone(),
+                "Corruptible".into(),
+                vec![alice.id.clone()],
+                WaveMode::Document,
+            )
+            .await
+            .unwrap();
+        let mut blip = Blip::new(
+            wave.id.clone(),
+            wavelet.id.clone(),
+            alice.id.clone(),
+            None,
+            0,
+        );
+        blip.content = Delta::document("words worth keeping");
+        blip.revision = 1;
+        storage.insert_blip(blip.clone()).await.unwrap();
+
+        // Whatever would corrupt this row in the wild, the result is the same:
+        // a column that will not parse as a Delta.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE blips SET content = ?1 WHERE id = ?2",
+                rusqlite::params!["{ this is not json", blip.id.0],
+            )
+            .unwrap();
+
+        let err = storage.blips_of_wave(&wave.id).await;
+        assert!(
+            err.is_err(),
+            "a blip that will not parse must not read as an empty one"
+        );
     }
 
     fn schema_version(path: &std::path::Path) -> i64 {
