@@ -4,7 +4,7 @@
 
 Please report security issues privately. Do not open a public issue.
 
-- **Email:** security@tensorspace.ai
+- **Email:** support@tensorspace.ai
 - **GitHub:** use [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)
   on this repository.
 
@@ -12,13 +12,17 @@ Please include the version or commit, a description of the issue, and the steps
 to reproduce it. If you have a proof of concept, include it — it makes triage
 much faster.
 
-We aim to acknowledge a report within 3 working days and to ship a fix or a
-mitigation plan within 30 days. We will credit you in the release notes unless
-you ask us not to.
+This is a small project with no staffed security team, so no response time is
+promised. Reports are read and triaged as maintainers are available, and where
+one is agreed to be a vulnerability the aim is to fix it before it is described
+publicly. Reporters are credited in the advisory unless they ask not to be.
+None of this is a commitment or a term of service; it describes intent.
 
 ## Supported versions
 
-Only the latest release receives security fixes.
+Security fixes land on the latest release. No version carries a support
+commitment, and the software is provided as is, without warranty, as the
+[LICENSE](LICENSE) sets out — nothing on this page changes that.
 
 ## Threat model
 

@@ -28,8 +28,8 @@ Examples of unacceptable behaviour:
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behaviour may be
-reported to the maintainers at conduct@tensorspace.ai. All complaints will be
-reviewed and investigated promptly and fairly. Maintainers are obligated to
+reported to the maintainers at support@tensorspace.ai. Reports are reviewed as
+maintainers are available; no response time is promised. Maintainers aim to
 respect the privacy and security of the reporter.
 
 Maintainers may remove, edit, or reject comments, commits, code, issues, and

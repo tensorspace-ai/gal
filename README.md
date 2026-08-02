@@ -390,6 +390,10 @@ registration (`GAL_OPEN_REGISTRATION=0`) on anything internet-facing.
 
 MIT — Copyright (c) 2026 TensorSpace, Inc. See [LICENSE](LICENSE).
 
+Provided as is, without warranty of any kind, as the license sets out. It is
+pre-1.0 software that stores other people's conversations — keep your own
+backups.
+
 Third-party components and the notices required when redistributing binaries are
 listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). SQLite is compiled in
 and is public domain.
