@@ -677,11 +677,23 @@ async fn static_asset(uri: axum::http::Uri) -> Response {
 /// nothing legitimate needs `unsafe-inline`. `frame-ancestors 'none'` is what
 /// stops the confirmation dialogs (remove participant, delete message) from
 /// being clickjacked.
+///
+/// `connect-src` is `'self'` and nothing else. It used to read `'self' ws:
+/// wss:`, which looks like "allow the WebSocket" and is not: in a source list
+/// `ws:` and `wss:` are *scheme* sources, and a scheme source matches every
+/// host. That turned the one directive standing between a script and the
+/// network into a permit for streaming a participant's inbox anywhere on the
+/// internet, which is most of what an XSS would want. `'self'` covers the
+/// client's actual socket — CSP resolves it against the document's origin
+/// including its `ws:`/`wss:` variant, and `/ws` is same-origin by
+/// construction, since the client derives the URL from `location` and the
+/// server enforces that with its own `Origin` check on the upgrade.
 fn security_headers(config: &crate::config::Config) -> Vec<(header::HeaderName, &'static str)> {
     let mut headers = vec![
         (
             header::CONTENT_SECURITY_POLICY,
-            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:;              connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+             connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         (header::X_FRAME_OPTIONS, "DENY"),
@@ -790,5 +802,39 @@ mod tests {
             assert!(!content_type.is_empty());
             assert!(paths.insert(*path), "{path} is routed twice");
         }
+    }
+
+    /// A bare scheme in a CSP source list matches *every host* using that
+    /// scheme, so `ws:` written to mean "our own WebSocket" silently permits a
+    /// socket to anywhere. That is an exfiltration channel wearing the costume
+    /// of a connectivity fix, and it is an easy one to reintroduce.
+    #[test]
+    fn the_csp_never_widens_a_directive_to_a_whole_scheme() {
+        let config = crate::config::Config::default();
+        let headers = security_headers(&config);
+        let (_, csp) = headers
+            .iter()
+            .find(|(name, _)| name == header::CONTENT_SECURITY_POLICY)
+            .expect("a CSP is sent on every response");
+
+        for directive in csp.split(';').map(str::trim) {
+            let (name, sources) = directive.split_once(' ').unwrap_or((directive, ""));
+            for source in sources.split_whitespace() {
+                // `data:` in img-src is deliberate: pasted screenshots render
+                // from a data URI before the upload completes. It carries no
+                // host, so it grants no reach off this origin.
+                if source == "data:" && name == "img-src" {
+                    continue;
+                }
+                assert!(
+                    !source.ends_with(':'),
+                    "{name} allows the whole {source} scheme, which matches every host"
+                );
+            }
+        }
+        assert!(
+            csp.contains("connect-src 'self';"),
+            "connect-src must stay pinned to this origin: {csp}"
+        );
     }
 }
