@@ -190,16 +190,46 @@ export function dayLabel(timestamp) {
   });
 }
 
-/** Transient message in the corner. */
+/**
+ * Message in the corner.
+ *
+ * Toasts are this client's entire error surface, which puts two requirements on
+ * them that they did not meet. They carry `role`, so a screen reader hears
+ * them — every failure in the product was previously silent, since a bare `div`
+ * appearing in the corner is not an event any assistive technology reports. And
+ * an *error* stays until it is dismissed: it used to fade after six seconds
+ * from a container that was `pointer-events: none`, so it could not be read
+ * twice, copied, or acted on, and an error you happened to miss was an error
+ * that never happened.
+ */
 export function toast(message, kind = 'info') {
   const host = document.getElementById('toasts');
   if (!host) return;
-  const node = el('div', { class: `toast toast-${kind}`, text: message });
-  host.appendChild(node);
-  setTimeout(() => {
+
+  const node = el('div', {
+    class: `toast toast-${kind}`,
+    // `alert` is assertive and interrupts; right for a failure, too much for
+    // "Reconnecting this wave…".
+    role: kind === 'error' ? 'alert' : 'status',
+  }, [el('span', { class: 'toast-text', text: message })]);
+
+  const dismiss = () => {
     node.classList.add('leaving');
     setTimeout(() => node.remove(), 250);
-  }, kind === 'error' ? 6000 : 3200);
+  };
+
+  if (kind === 'error') {
+    node.appendChild(el('button', {
+      class: 'toast-close',
+      text: '×',
+      'aria-label': 'Dismiss',
+      onClick: dismiss,
+    }));
+  } else {
+    setTimeout(dismiss, 3200);
+  }
+
+  host.appendChild(node);
 }
 
 /**

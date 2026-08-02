@@ -904,10 +904,36 @@ try {
   await frank.keyboard.type('before the outage');
   await frank.waitForTimeout(700);
 
+  // A phone-sized second session. Below 860px the sidebar — and with it the
+  // status dot that was the entire offline indication — is hidden while a wave
+  // is open, so this is the viewport where being offline used to be invisible.
+  const offlinePhone = await signUp('frankie', { width: 390, height: 780 });
+  await createWave(offlinePhone, 'On a phone');
+  await offlinePhone.waitForTimeout(500);
+
   stopServer();
   await sleep(1800);
   check('the connection is reported as lost',
     (await frank.getAttribute('#status', 'class')).includes('offline'));
+  check('and said in words, not only as a coloured dot',
+    await frank.isVisible('#offline-banner'));
+  check('the banner says what it means for what you type',
+    (await frank.textContent('#offline-banner')).includes('keep typing'));
+  check('and it is a live region, so it is announced rather than just drawn',
+    (await frank.getAttribute('#offline-banner', 'role')) === 'status');
+  check('it is visible on a phone, where the sidebar is not',
+    await offlinePhone.isVisible('#offline-banner') && !(await offlinePhone.isVisible('.sidebar')));
+  // Being visible is not the same as being placed. The banner is fixed, so
+  // without the layout giving up the space it is drawn straight over the
+  // header — the wave's title and buttons, and the sidebar's.
+  check('and it does not cover what it sits above',
+    !(await frank.evaluate(() => {
+      const banner = document.getElementById('offline-banner').getBoundingClientRect();
+      return ['.sidebar-head', '.wave-head', '.wave-actions']
+        .map((s) => document.querySelector(s))
+        .filter(Boolean)
+        .some((node) => node.getBoundingClientRect().top < banner.bottom);
+    })));
 
   // Keep typing into a dead connection.
   await frank.click('.editor');
@@ -922,6 +948,8 @@ try {
   check('it reconnects on its own',
     (await frank.getAttribute('#status', 'class')).includes('online'),
     await frank.getAttribute('#status', 'class'));
+  check('and the banner goes away again',
+    !(await frank.isVisible('#offline-banner')));
 
   // The real question: did the offline typing reach storage?
   const verify = await signIn('frank');

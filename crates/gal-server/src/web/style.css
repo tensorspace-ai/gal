@@ -15,6 +15,9 @@
   --accent: #2f6df6;
   --accent-soft: #e8f0fe;
   --danger: #d3453b;
+  /* Dark enough to carry white text at 4.5:1, which the obvious amber is not.
+     The offline banner is small bold text and is the only thing wearing it. */
+  --warn: #8a5a12;
   --unread: #2f6df6;
   --radius: 10px;
   --radius-sm: 7px;
@@ -38,6 +41,7 @@
     --accent: #5b8dff;
     --accent-soft: #1b2a49;
     --danger: #f0736a;
+    --warn: #a06a15;
     --unread: #5b8dff;
     --shadow-1: 0 1px 2px rgb(0 0 0 / 40%);
     --shadow-2: 0 12px 32px rgb(0 0 0 / 55%);
@@ -1400,6 +1404,9 @@ textarea {
 }
 
 .toast {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   background: #22262e;
   color: #fff;
   padding: 8px 15px;
@@ -1407,10 +1414,57 @@ textarea {
   font-size: 13px;
   box-shadow: var(--shadow-2);
   animation: rise 180ms ease;
+  max-width: min(560px, calc(100vw - 32px));
 }
 
 .toast-error {
   background: var(--danger);
+  /* The container is click-through so toasts never block the page. An error
+     stays until dismissed, so it has to take the click that dismisses it. */
+  pointer-events: auto;
+}
+
+.toast-close {
+  flex: none;
+  background: none;
+  border: 0;
+  color: inherit;
+  font-size: 17px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.toast-close:hover {
+  opacity: 1;
+}
+
+.toast-close:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+  opacity: 1;
+}
+
+/* Says the connection is gone somewhere that cannot be missed, and — unlike the
+   sidebar it replaces — somewhere that still exists on a phone. */
+.offline-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 300;
+  padding: 7px 14px;
+  text-align: center;
+  font-size: 12.5px;
+  font-weight: 550;
+  color: #fff;
+  background: var(--warn);
+  box-shadow: var(--shadow-2);
+}
+
+.offline-banner[hidden] {
+  display: none;
 }
 
 .toast.leaving {

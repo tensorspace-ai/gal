@@ -261,6 +261,17 @@ function renderShell() {
     ]),
   ]);
 
+  // Above the layout rather than inside the sidebar. The whole account a person
+  // got of being offline was a 7px dot in the sidebar footer, with the
+  // explanation in a `title` — and below 860px the sidebar is hidden entirely
+  // while a wave is open, so on a phone there was no indication at all.
+  app.appendChild(el('div', {
+    class: 'offline-banner',
+    id: 'offline-banner',
+    role: 'status',
+    'aria-live': 'polite',
+    hidden: true,
+  }));
   app.appendChild(el('div', { class: 'layout' }, [
     sidebar,
     el('main', { class: 'wave-pane', id: 'wave-pane' }),
@@ -386,9 +397,32 @@ function showInbox(show) {
 
 function updateStatus(status) {
   const dot = document.getElementById('status');
-  if (!dot) return;
-  dot.className = `status-dot ${status}`;
-  dot.title = status === 'online' ? 'Connected' : 'Reconnecting…';
+  if (dot) {
+    dot.className = `status-dot ${status}`;
+    dot.title = status === 'online' ? 'Connected' : 'Reconnecting…';
+  }
+
+  const banner = document.getElementById('offline-banner');
+  if (!banner) return;
+  const offline = status !== 'online';
+  banner.hidden = !offline;
+  // Rewritten rather than left in place, so a screen reader announces the
+  // change instead of a region that was already saying this.
+  banner.textContent = offline
+    ? 'Offline — reconnecting. You can keep typing; your changes will be sent.'
+    : '';
+
+  // The banner is fixed, so the layout has to give up the space or it is drawn
+  // over the header — over the wave's own title and buttons, and over the
+  // sidebar's. Measured rather than assumed: on a narrow screen the sentence
+  // wraps to two lines and a hardcoded height would still cover something.
+  //
+  // Rounded up from the fractional rect rather than taken from offsetHeight,
+  // which is an integer: a banner 33.375px tall reserved 33 and covered the
+  // header by the difference.
+  const layout = document.querySelector('.layout');
+  const height = Math.ceil(banner.getBoundingClientRect().height);
+  if (layout) layout.style.paddingTop = offline ? `${height}px` : '';
 }
 
 // --- wave view ----------------------------------------------------------
