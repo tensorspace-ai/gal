@@ -1042,11 +1042,22 @@ function allComments() {
   return state.wave.wavelets.flatMap((w) => w.comments || []);
 }
 
-/// The remarks in a thread, oldest first.
-function remarksOf(commentId) {
-  return allBlips()
-    .filter((b) => b.comment === commentId)
-    .sort((a, b) => a.seq - b.seq || a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
+/// The remarks of every thread, oldest first, in one pass.
+///
+/// Built once per render rather than per card: walking every blip in the wave
+/// for each thread made drawing the margin cost the square of what is in it.
+function remarksByComment() {
+  const byThread = new Map();
+  for (const blip of allBlips()) {
+    if (!blip.comment) continue;
+    const list = byThread.get(blip.comment);
+    if (list) list.push(blip);
+    else byThread.set(blip.comment, [blip]);
+  }
+  for (const list of byThread.values()) {
+    list.sort((a, b) => a.seq - b.seq || a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
+  }
+  return byThread;
 }
 
 /// Where each thread is anchored, read out of the live documents.
@@ -1230,9 +1241,12 @@ function renderComments() {
   // from the stale snapshot content when its thread is finally revealed, so the
   // next thing typed into it is submitted against a revision the server left
   // behind long ago.
-  for (const blip of allBlips()) {
-    if (blip.comment && !state.docs.has(blip.id)) {
-      state.docs.set(blip.id, new BlipDoc(blip.id, blip.content, blip.revision));
+  const remarks = remarksByComment();
+  for (const list of remarks.values()) {
+    for (const blip of list) {
+      if (!state.docs.has(blip.id)) {
+        state.docs.set(blip.id, new BlipDoc(blip.id, blip.content, blip.revision));
+      }
     }
   }
 
@@ -1254,7 +1268,7 @@ function renderComments() {
   }
 
   for (const thread of shown) {
-    rail.appendChild(commentCard(thread, anchors.get(thread.id) || null));
+    rail.appendChild(commentCard(thread, anchors.get(thread.id) || null, remarks));
   }
   layoutComments();
 }
@@ -1275,9 +1289,9 @@ function markAnchors(threads) {
   }
 }
 
-function commentCard(thread, anchor) {
+function commentCard(thread, anchor, remarksByThread) {
   const author = lookupUser(thread.author);
-  const remarks = remarksOf(thread.id);
+  const remarks = remarksByThread.get(thread.id) || [];
   const active = state.activeComment === thread.id;
   const resolved = Boolean(thread.resolvedBy);
 
@@ -1496,12 +1510,16 @@ function layoutComments() {
   // Detached cards have no line to sit beside, so they sink to the bottom.
   placed.sort((a, b) => a.want - b.want);
   const base = rail.getBoundingClientRect().top;
+  // Every height read before the first `top` is written. Interleaving them
+  // forces the browser to lay the page out again between each pair, on a path
+  // that runs on every keystroke.
+  for (const entry of placed) entry.height = entry.card.offsetHeight;
 
   let floor = 0;
-  for (const { card, want } of placed) {
+  for (const { card, want, height } of placed) {
     const top = Math.max(floor, Number.isFinite(want) ? want - base : floor);
     card.style.top = `${top}px`;
-    floor = top + card.offsetHeight + 8;
+    floor = top + height + 8;
   }
   // Absolutely positioned children do not stretch their parent, and without a
   // height the last cards would be unreachable in a short document.
