@@ -895,6 +895,76 @@ try {
   check('and it is the message that actually contains the word',
     (await gwen.textContent('.blip.revealed')).includes('pangolin'));
 
+  // --- keyboard and focus ------------------------------------------------
+
+  section('Reachable without a mouse');
+
+  const kate = await signUp('kate');
+  await createWave(kate, 'Keyboard');
+
+  // Renaming was a click handler on an h1: not focusable, and no key opened it.
+  const titleFocusable = await kate.evaluate(() => {
+    const button = document.querySelector('.wave-title-button');
+    if (!button) return false;
+    button.focus();
+    return document.activeElement === button;
+  });
+  check('the wave title can be focused', titleFocusable);
+  await kate.keyboard.press('Enter');
+  await kate.waitForSelector('.dialog', { timeout: 5000 });
+  check('and Enter opens the rename dialog', await kate.isVisible('.dialog'));
+
+  check('the dialog says it is one', (await kate.getAttribute('.dialog', 'role')) === 'dialog');
+  check('and is labelled by its own heading', await kate.evaluate(() => {
+    const dialog = document.querySelector('.dialog');
+    const id = dialog.getAttribute('aria-labelledby');
+    return Boolean(id && dialog.querySelector(`#${id}`));
+  }));
+  check('focus starts inside it', await kate.evaluate(() =>
+    document.querySelector('.dialog').contains(document.activeElement)));
+
+  // Tab must not walk out of a modal into the page behind it.
+  for (let i = 0; i < 8; i += 1) await kate.keyboard.press('Tab');
+  check('and Tab stays inside it', await kate.evaluate(() =>
+    document.querySelector('.dialog').contains(document.activeElement)));
+
+  await kate.keyboard.press('Escape');
+  await kate.waitForTimeout(300);
+  check('Escape closes it', !(await kate.isVisible('.dialog')));
+  check('and focus goes back where it came from', await kate.evaluate(() =>
+    document.activeElement === document.querySelector('.wave-title-button')));
+
+  // confirmAction had no Escape handler at all and focused nothing. Someone
+  // else has to be here first: leaving a wave you are alone in is refused with
+  // an explanation rather than a dialog.
+  await addParticipant(kate, 'alice');
+  await kate.click('.wave-actions .btn.ghost:has-text("Leave")');
+  await kate.waitForSelector('.dialog');
+  check('a confirmation focuses its safe choice, not its destructive one',
+    (await kate.evaluate(() => document.activeElement.textContent)) === 'Cancel');
+  await kate.keyboard.press('Escape');
+  await kate.waitForTimeout(300);
+  check('and Escape dismisses it too', !(await kate.isVisible('.dialog')));
+
+  check('a participant can be reached by keyboard', await kate.evaluate(() => {
+    const button = document.querySelector('.participant-button');
+    if (!button) return false;
+    button.focus();
+    return document.activeElement === button;
+  }));
+
+  // The editor sets outline:none, so the card has to show which one has the
+  // caret. It used to shift the border by about two per cent of luminance.
+  await kate.click('.blip .editor');
+  await kate.waitForTimeout(200);
+  const ring = await kate.evaluate(() => {
+    const blip = document.querySelector('.blip');
+    const style = getComputedStyle(blip);
+    return { shadow: style.boxShadow, border: style.borderColor };
+  });
+  check('the message holding the caret is visibly marked',
+    ring.shadow !== 'none' && ring.shadow !== '');
+
   // --- surviving an outage ----------------------------------------------
 
   section('Surviving an outage');

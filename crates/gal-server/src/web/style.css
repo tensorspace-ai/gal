@@ -11,7 +11,11 @@
   --border-strong: #d0d5dd;
   --text: #16191d;
   --text-dim: #666e7a;
-  --text-faint: #98a0ac;
+  /* Was #98a0ac, about 2.6:1 on white — below WCAG AA and below even the
+     large-text threshold. It is not decoration: timestamps, file sizes, the
+     "Reply…" placeholder and the Reply/Privately/Delete labels are all drawn in
+     it. 4.8:1 here, still a step lighter than --text-dim. */
+  --text-faint: #6b7383;
   --accent: #2f6df6;
   --accent-soft: #e8f0fe;
   --danger: #d3453b;
@@ -37,7 +41,8 @@
     --border-strong: #333a45;
     --text: #e7eaef;
     --text-dim: #9aa3b0;
-    --text-faint: #6b7480;
+    /* Was #6b7480, 3.8:1 on the dark surface. 5.3:1. */
+    --text-faint: #838b98;
     --accent: #5b8dff;
     --accent-soft: #1b2a49;
     --danger: #f0736a;
@@ -50,6 +55,20 @@
 
 * {
   box-sizing: border-box;
+}
+
+/* Honour the system setting. There is an infinite pulse on the offline dot and
+   another on the upload spinner, and cards in the comment margin slide to their
+   new positions — all of which is motion nobody asked this page for. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 html,
@@ -541,6 +560,17 @@ textarea {
 
 .wave-title {
   margin: 0;
+  min-width: 0;
+}
+
+.wave-title-button {
+  display: block;
+  max-width: 100%;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
   font-size: 19px;
   font-weight: 620;
   letter-spacing: -0.015em;
@@ -553,8 +583,19 @@ textarea {
   white-space: nowrap;
 }
 
-.wave-title:hover {
+.wave-title-button:hover {
   background: var(--surface-2);
+}
+
+/* The avatar carries the picture; the button carries the behaviour. */
+.participant-button {
+  border: 0;
+  background: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  border-radius: 50%;
+  line-height: 0;
 }
 
 .wave-sub {
@@ -872,8 +913,18 @@ textarea {
   opacity: 0.65;
 }
 
-.blip:focus-within {
-  border-color: var(--border-strong);
+/* Which message has the caret.
+ *
+ * This used to move the border from #e2e5ea to #d0d5dd — about two per cent of
+ * luminance, which is to say invisible. The editor sets `outline: none`, so in
+ * a threaded wave full of identical cards there was nothing at all telling a
+ * keyboard user where their next keystroke was going to land. */
+/* `:focus-within` matches every ancestor, and replies nest inside the message
+   they answer — so the innermost card and every card containing it all lit up
+   at once. Only the one actually holding the caret should. */
+.blip:focus-within:not(:has(.blip:focus-within)) {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
 .blip.unread {

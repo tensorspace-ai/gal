@@ -324,15 +324,12 @@ export function askFor(
       type: password ? 'password' : 'text',
     });
     let settled = false;
+    let close;
     const finish = (result) => {
       if (settled) return;
       settled = true;
-      overlay.remove();
-      document.removeEventListener('keydown', onKey);
+      close();
       resolve(result);
-    };
-    const onKey = (e) => {
-      if (e.key === 'Escape') finish(null);
     };
 
     const dialog = el('div', { class: 'dialog' }, [
@@ -349,10 +346,6 @@ export function askFor(
       ]),
     ]);
 
-    const overlay = el('div', { class: 'overlay', onClick: (e) => {
-      if (e.target === overlay) finish(null);
-    } }, [dialog]);
-
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
@@ -360,34 +353,110 @@ export function askFor(
       }
     });
 
-    document.addEventListener('keydown', onKey);
-    document.body.appendChild(overlay);
-    input.focus();
+    close = mountDialog(dialog, () => finish(null), { initialFocus: input });
   });
 }
 
 /** Yes/no confirmation. Resolves to a boolean. */
 export function confirmAction(title, message, { confirmLabel = 'Confirm', danger = false } = {}) {
   return new Promise((resolve) => {
+    let close;
     const finish = (result) => {
-      overlay.remove();
+      close();
       resolve(result);
     };
+    const confirm = el('button', {
+      class: `btn ${danger ? 'danger' : 'primary'}`,
+      text: confirmLabel,
+      onClick: () => finish(true),
+    });
+    const cancel = el('button', {
+      class: 'btn ghost',
+      text: 'Cancel',
+      onClick: () => finish(false),
+    });
     const dialog = el('div', { class: 'dialog' }, [
       el('h2', { text: title }),
       el('p', { class: 'dialog-note', text: message }),
-      el('div', { class: 'dialog-actions' }, [
-        el('button', { class: 'btn ghost', text: 'Cancel', onClick: () => finish(false) }),
-        el('button', {
-          class: `btn ${danger ? 'danger' : 'primary'}`,
-          text: confirmLabel,
-          onClick: () => finish(true),
-        }),
-      ]),
+      el('div', { class: 'dialog-actions' }, [cancel, confirm]),
     ]);
-    const overlay = el('div', { class: 'overlay', onClick: (e) => {
-      if (e.target === overlay) finish(false);
-    } }, [dialog]);
-    document.body.appendChild(overlay);
+
+    close = mountDialog(dialog, () => finish(false), {
+      // Destructive actions open with Cancel focused, so Enter on a dialog that
+      // appeared under your hands does not delete anything.
+      initialFocus: danger ? cancel : confirm,
+    });
   });
+}
+
+let dialogCount = 0;
+
+/**
+ * Put a dialog on the page and take responsibility for focus while it is there.
+ *
+ * Both dialogs used to be a plain div in a plain overlay: no role, so nothing
+ * announced them as dialogs; no focus management, so `confirmAction` opened
+ * without focusing anything at all and a keyboard user had to tab into it from
+ * wherever they happened to be; no trap, so tabbing carried you out into a page
+ * that is still there, still looks interactive, and is not; and no Escape
+ * handler on the confirmation, which is the one people reach for when a
+ * "Delete this message?" appears unexpectedly.
+ *
+ * Returns a function that tears the dialog down and puts focus back where it
+ * came from.
+ */
+function mountDialog(dialog, onDismiss, { initialFocus = null } = {}) {
+  const returnFocusTo = document.activeElement;
+
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  const heading = dialog.querySelector('h2');
+  if (heading) {
+    heading.id = `dialog-title-${(dialogCount += 1)}`;
+    dialog.setAttribute('aria-labelledby', heading.id);
+  }
+
+  const overlay = el('div', {
+    class: 'overlay',
+    onClick: (e) => {
+      if (e.target === overlay) onDismiss();
+    },
+  }, [dialog]);
+
+  const focusable = () =>
+    [...dialog.querySelectorAll('button, input, select, textarea, [href]')]
+      .filter((node) => !node.disabled && node.getClientRects().length > 0);
+
+  const onKey = (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      onDismiss();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    const items = focusable();
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+
+  // Captured, so it runs before anything in the page behind the overlay.
+  document.addEventListener('keydown', onKey, true);
+  document.body.appendChild(overlay);
+  (initialFocus || focusable()[0])?.focus();
+
+  return () => {
+    overlay.remove();
+    document.removeEventListener('keydown', onKey, true);
+    // Where the caret was before a dialog interrupted it — usually a message
+    // being written. Losing it means the next keystroke goes nowhere.
+    if (returnFocusTo && returnFocusTo.isConnected) returnFocusTo.focus();
+  };
 }

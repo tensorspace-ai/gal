@@ -525,16 +525,21 @@ function renderWave() {
       onClick: () => showInbox(true),
     }),
     el('div', { class: 'wave-head-main' }, [
-      el('h1', {
-        class: 'wave-title',
-        title: 'Click to rename',
-        onClick: async () => {
-          const next = await askFor('Rename wave', { value: title, confirmLabel: 'Rename' });
-          if (next && root) conn.send({ type: 'setTitle', waveletId: root.id, title: next });
-        },
-      }, [
-        mode.is('chat') ? el('span', { class: 'channel-hash', text: '#' }) : null,
-        el('span', { class: 'wave-title-text', text: title }),
+      // A real button inside the heading rather than a click handler on the
+      // heading itself: an h1 is not focusable and does not take Enter, so
+      // renaming a wave was reachable with a mouse and by no other means.
+      el('h1', { class: 'wave-title' }, [
+        el('button', {
+          class: 'wave-title-button',
+          title: 'Rename this wave',
+          onClick: async () => {
+            const next = await askFor('Rename wave', { value: title, confirmLabel: 'Rename' });
+            if (next && root) conn.send({ type: 'setTitle', waveletId: root.id, title: next });
+          },
+        }, [
+          mode.is('chat') ? el('span', { class: 'channel-hash', text: '#' }) : null,
+          el('span', { class: 'wave-title-text', text: title }),
+        ]),
       ]),
       el('div', { class: 'wave-sub' }, [
         el('span', { class: 'presence', id: 'presence' }),
@@ -806,9 +811,15 @@ function renderParticipants() {
 
   for (const participant of root.participants) {
     const isMe = participant.id === state.me.id;
-    const face = avatar(participant, { size: 24 });
-    face.classList.add('clickable');
-    face.title = isMe ? 'Leave this wave' : `Remove ${participant.displayName}`;
+    const label = isMe ? 'Leave this wave' : `Remove ${participant.displayName}`;
+    // Wrapped in a button rather than given a click handler on the avatar span,
+    // which was not focusable and took no key: managing who is in a wave was a
+    // mouse-only capability.
+    const face = el('button', {
+      class: 'participant-button',
+      title: label,
+      'aria-label': label,
+    }, [avatar(participant, { size: 24 })]);
     const act = async () => {
       // Clicking your own face used to do nothing at all, so there was no way
       // out of a wave from the client even though the server has always allowed
