@@ -494,6 +494,13 @@ function renderWave() {
     if (mark && mark.dataset.comment) setActiveComment(mark.dataset.comment);
   });
 
+  // A card slides to its new position, and someone else's caret may be inside
+  // it. The layout pass redraws the carets, but it does so before the slide has
+  // happened — so they have to be redrawn again when it has.
+  rail.addEventListener('transitionend', (event) => {
+    if (event.propertyName === 'top' && state.cursorLayer) state.cursorLayer.render();
+  });
+
   pane.appendChild(header);
   pane.appendChild(scroller);
   // A sibling of the scroller, not a child of it: a composer that scrolls out
@@ -1079,11 +1086,41 @@ function anchorRect(anchor) {
   }
 }
 
+/**
+ * Bring a thread forward: light its card and its highlight, and move the reply
+ * box to it.
+ *
+ * Deliberately not a rebuild of the margin. A click that activates a card has
+ * usually landed *in* one of its remarks, and rebuilding would replace the
+ * editor the click was on its way into — so the caret would never arrive and
+ * the remark would look uneditable.
+ */
 function setActiveComment(commentId) {
   if (state.activeComment === commentId) return;
   state.activeComment = commentId;
   state.commentReplyFocused = false;
-  renderComments();
+
+  const rail = state.commentRail;
+  if (!rail) return;
+  const threads = allComments();
+  for (const card of rail.querySelectorAll('.comment-card')) {
+    const active = card.dataset.comment === commentId;
+    card.classList.toggle('active', active);
+
+    const box = card.querySelector('.comment-compose');
+    if (box && !active) {
+      if (box.replyEditor) box.replyEditor.destroy();
+      box.remove();
+    }
+    if (active && !box) {
+      const thread = threads.find((t) => t.id === commentId);
+      if (thread && !thread.resolvedBy && mode.allowsComments()) {
+        card.appendChild(commentReply(thread));
+      }
+    }
+  }
+  markAnchors(threads);
+  layoutComments();
 }
 
 /// Start a thread on whatever is selected.
@@ -1236,7 +1273,7 @@ function commentCard(thread, anchor) {
     text: 'The text this was about has been edited away.',
   }));
 
-  for (const remark of remarks) card.appendChild(commentRemark(remark));
+  remarks.forEach((remark, i) => card.appendChild(commentRemark(remark, i === 0)));
 
   const actions = el('div', { class: 'comment-actions' });
   if (mode.allowsResolve()) {
@@ -1268,21 +1305,25 @@ function commentCard(thread, anchor) {
 
 /// One remark, editable by whoever the mode allows — it is a blip like any
 /// other, so it gets the same live co-editing as the page.
-function commentRemark(blip) {
+function commentRemark(blip, first) {
   const author = lookupUser(blip.author);
   const doc = state.docs.get(blip.id) || new BlipDoc(blip.id, blip.content, blip.revision);
   state.docs.set(blip.id, doc);
 
   const editorRoot = el('div', { class: 'editor comment-text' });
   const row = el('div', { class: 'comment-remark' }, [
-    el('div', { class: 'comment-remark-head' }, [
-      el('span', { class: 'comment-author', text: author.displayName }),
-      el('time', {
-        class: 'comment-time',
-        text: relativeTime(blip.lastModified),
-        title: fullTime(blip.lastModified),
-      }),
-    ]),
+    // The card's own header already names whoever started the thread, and the
+    // first remark is theirs by construction. Repeating it reads as two people.
+    first
+      ? null
+      : el('div', { class: 'comment-remark-head' }, [
+          el('span', { class: 'comment-author', text: author.displayName }),
+          el('time', {
+            class: 'comment-time',
+            text: relativeTime(blip.lastModified),
+            title: fullTime(blip.lastModified),
+          }),
+        ]),
     editorRoot,
   ]);
 
@@ -1295,9 +1336,19 @@ function commentRemark(blip) {
 
   const editor = new Editor(editorRoot, doc.doc, {
     onChange: (delta) => onLocalEdit(blip.id, delta),
-    onSelectionChange: () => {
+    onSelectionChange: (selection) => {
       state.activeEditor = editor;
       dockToolbar();
+      // Reported like any other document, so a caret in the margin shows up in
+      // the margin. A remark lives in the same wavelet as the page it is about,
+      // so this reveals nothing the reader could not already see.
+      conn.send({
+        type: 'cursor',
+        waveId: state.waveId,
+        blipId: blip.id,
+        index: selection.index,
+        length: selection.length,
+      });
     },
   });
   editor.doc = doc.doc;
@@ -1403,6 +1454,10 @@ function layoutComments() {
   // Absolutely positioned children do not stretch their parent, and without a
   // height the last cards would be unreachable in a short document.
   rail.style.height = `${floor}px`;
+  // A card is a document like any other, so someone else's caret can be inside
+  // one. Having just moved the cards, every such caret is drawn where its card
+  // used to be.
+  if (state.cursorLayer) state.cursorLayer.render();
 }
 
 /// Resolve a user id to a profile for display.

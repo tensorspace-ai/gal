@@ -122,7 +122,7 @@ upgrading.
   | **Document** *(default)* | anyone | anyone edits anything | threaded |
   | **Chat** | anyone | only your own messages | a channel: flat, with a composer |
   | **Announcement** | the creator | only the author | a notice with replies |
-  | **Notepad** | nobody | anyone edits everything | one shared page |
+  | **Notepad** | nobody | anyone edits everything | one shared page, with comments |
   | **Frozen** | nobody | nobody | read-only |
 
   Switching is non-destructive and reversible: moving a threaded wave to Chat
@@ -149,6 +149,28 @@ upgrading.
   And in **Frozen**, seen by the creator: no composer, nothing editable, and a
   line saying why. Every message written in Chat is still there, and switching
   back to Document restores the threading it was hiding.
+- **Comments on a notepad.** A notepad admits no new messages by design, which
+  left nowhere to disagree with a sentence except by rewriting it. Select some
+  words and comment on them: the remark goes in the margin, level with the text
+  it is about.
+
+  ![A notepad with two phrases highlighted and a comment card beside each in the
+  right-hand margin, one of them holding a reply and a reply
+  box](docs/screenshots/mode-notepad.png)
+
+  Where a comment points is not stored as a position. The range is marked in the
+  document itself, so the anchor is transformed by the same code that transforms
+  bold: type a paragraph above a commented sentence and the highlight moves with
+  the sentence on every client. Delete the sentence and the comment is left
+  *detached* rather than pointing at whatever words moved into those offsets —
+  the remarks are kept, because losing the discussion of why a line was wrong,
+  at the moment somebody acted on it, is the opposite of the point.
+
+  Comments are ordinary messages underneath, so they are co-edited live, carry
+  contributors and unread marks, are searchable, and appear in playback.
+  Resolving one takes it out of the margin without deleting anything, and it can
+  be reopened. Threads stay visible if the wave is switched to another mode;
+  only starting a new one is a notepad's privilege.
 - **Private replies.** Branch a side conversation off any message with a subset
   of the wave's participants. The server never sends it to anyone else — not in
   live updates, not in snapshots, not in search results, not in the inbox
@@ -228,8 +250,14 @@ Wave                  a conversation; the unit that appears in your inbox
 ```
 
 Ids are opaque and prefixed by kind of *object*, not kind of wavelet: `w-` for a
-wave, `s-` for a wavelet, `b-` for a blip. Which sort of wavelet it is lives in
-its `kind` column.
+wave, `s-` for a wavelet, `b-` for a blip, `c-` for a comment thread. Which sort
+of wavelet it is lives in its `kind` column.
+
+A comment thread hangs off this rather than extending it. It holds no text: its
+remarks are blips tagged with its id, and where it points is a run of the blip
+it annotates carrying that id as a document attribute — so the anchor is
+transformed along with the text instead of being an offset kept beside it. The
+thread row is keyed to the wavelet, for the same reason attachments are.
 
 Access control lives on the **wavelet**, not the wave. That is the whole trick
 behind private replies: one wave can hold a public thread and a side conversation
@@ -393,6 +421,10 @@ Disclosed rather than hidden, because some of these matter for how you deploy it
 - **No account deletion or data export.**
 - **No moderation surface.** No way to suspend an account or audit participant
   changes.
+- **Comments do not overlap.** A range carries one anchor, so a second comment
+  cannot cover words a first already covers; the client says so rather than
+  quietly detaching the older one. Nor can a comment be deleted — resolving is
+  how one is retracted, and it keeps the record.
 - **No federation** between servers.
 - **No end-to-end encryption.** The server can read everything; private replies
   are enforced by the server, not by cryptography.

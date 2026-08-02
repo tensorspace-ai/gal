@@ -1496,12 +1496,6 @@ textarea {
   border-top: 1px solid var(--border);
 }
 
-/* The first remark's byline repeats the card header, which already names the
-   person who started the thread. */
-.comment-remark:first-of-type .comment-remark-head {
-  display: none;
-}
-
 .comment-remark-head {
   display: flex;
   align-items: baseline;

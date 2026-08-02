@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — comments on a notepad
+
+A notepad admits no new messages by design, so the only way to disagree with a
+sentence was to rewrite it. Select some words and comment on them instead: the
+remark goes in the margin, level with the text it is about, and can be replied
+to and resolved.
+
+Where a comment points is not stored as a position. The range is marked in the
+document with an attribute, so the anchor is transformed by the same code that
+transforms bold — type above a commented sentence and the highlight moves with
+the sentence on every client. Deleting the sentence leaves the thread
+*detached*, keeping the remarks rather than pointing them at unrelated words.
+
+The remarks are ordinary blips, so they are co-edited live and carry
+contributors, unread marks, search and playback. A thread is never deleted;
+resolving takes it out of the margin and can be undone. Existing threads stay
+visible and settleable in every mode, so switching a commented page to another
+mode still destroys nothing — only *starting* a thread is a notepad's
+privilege, and a frozen wave refuses even to resolve.
+
+Schema v5 adds a `comments` table and a `blips.comment` column. **Take a backup
+before upgrading**; a database this migration has touched cannot be read by
+0.2.0.
+
 ## [0.2.0] — 2026-08-02
 
 ### Changed — a field the server does not define is now refused

@@ -57,7 +57,7 @@ project's history where a plausible-looking test proved nothing:
 
 ## The README's screenshots are part of the UI
 
-`docs/screenshots/` holds four images the README leans on to describe the client.
+`docs/screenshots/` holds five images the README leans on to describe the client.
 They are captures of a real client driven through three browser sessions, not
 drawings, which is the only reason they are worth anything — and it also means a
 UI change can quietly falsify them. If you change how the client looks,
@@ -159,7 +159,33 @@ Never reconstruct a document from `state.wave...blips[].content` in the client.
 That is the snapshot from when the wave was opened; every edit since arrived as
 an operation. Reopen the wave for authoritative content instead.
 
-### 7. Schema changes need a version bump and a migration
+### 7. A comment's anchor is a document attribute, never an offset
+
+A comment thread points at a range of text by marking that range with
+`COMMENT_ATTRIBUTE` in the blip's own document. Nothing anywhere stores an
+index for it, and nothing should start: an offset kept beside a document that
+other people are editing is wrong from the first keystroke, and wrong silently —
+the highlight lands on the wrong words rather than failing.
+
+Because the anchor is part of the document, it is transformed by the code that
+already transforms every other attribute, in both engines, for free. Two
+consequences follow and both are load-bearing:
+
+- Positions are *derived* on the way past, never cached. `commentRanges` reads
+  them out of the delta and the client's layout pass re-reads them each time.
+  Cards did cache their anchor at first, and the highlight then moved with its
+  sentence while the card stayed where the sentence used to be.
+- Typed text must not inherit it. Formatting is inherited from the character
+  before the caret, which is what keeps typing at the end of a bold word bold;
+  applied to a comment it silently drags the next words into somebody else's
+  thread. `inheritable()` in `editor.js` is the one place that strips it, and
+  every path that inherits attributes goes through it.
+
+A thread always has at least one remark, which is why a remark cannot be deleted
+in any mode. Deleting the first would leave a thread nothing can draw and the
+protocol cannot repair. Resolving is the retraction, and it keeps the record.
+
+### 8. Schema changes need a version bump and a migration
 
 `schema.sql` is a **frozen v1 baseline** — do not add columns to it. Every change
 since is a migration step: bump `SCHEMA_VERSION` in `crates/gal-server/src/db.rs`
@@ -171,14 +197,14 @@ The server refuses to start against a schema it does not recognise. That is
 deliberate: starting cleanly and then serving empty inboxes looks like data loss
 to the user.
 
-### 8. Nothing reaches the wire in snake_case
+### 9. Nothing reaches the wire in snake_case
 
 Serde's container-level `rename_all` renames *variants*, not fields. Each variant
 needs its own `#[serde(rename_all = "camelCase")]`. Forgetting it is invisible to
 a Rust round-trip test — both sides agree on the wrong name — and fatal to the
 browser client. `no_message_field_is_snake_case` guards this.
 
-### 9. Keep expensive work off the async reactor
+### 10. Keep expensive work off the async reactor
 
 Password hashing runs in `spawn_blocking`. Argon2 costs ~19 MiB and tens of
 milliseconds; running it inline lets a handful of concurrent logins stall every

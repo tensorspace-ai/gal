@@ -326,6 +326,65 @@ try {
   await alice.waitForTimeout(4000);
   await shot(alice, 'mode-frozen.png');
 
+  // --- a notepad, with comments in the margin ---------------------------
+
+  console.log('Release notes');
+  await createWave(alice, 'Release notes');
+  await addParticipant(alice, 'bob');
+  await addParticipant(alice, 'carol');
+
+  // Written as a document first, because Notepad admits no new messages: the
+  // page is the one blip a wave starts with.
+  await alice.click('.blip .editor');
+  await type(
+    alice,
+    'Gal 1.0 ships on Friday. Modes are the headline: a wave can be a document, '
+      + 'a channel, an announcement, a shared page, or frozen, and switching '
+      + 'between them destroys nothing.',
+  );
+  await setMode(alice, 'notepad');
+  await openWave(bob, 'Release notes');
+  await openWave(carol, 'Release notes');
+  await bob.waitForTimeout(700);
+
+  /// Select a phrase in the page and say something about it.
+  const commentOn = async (page, phrase, remark) => {
+    await selectWord(page, '.blip .editor', phrase);
+    await page.click('.tool-comment');
+    await page.waitForSelector('.comment-card.active', { timeout: 10000 });
+    await type(page, remark);
+    await page.waitForTimeout(700);
+  };
+
+  await commentOn(carol, 'Friday', 'Friday is the 3rd — the migration note is not written yet.');
+  await commentOn(bob, 'destroys nothing', 'Worth saying that this is true of storage, not just the UI.');
+
+  // A reply, so the shot shows a thread rather than two isolated remarks.
+  await carol.click('.comment-card:has-text("Worth saying")');
+  await carol.waitForTimeout(400);
+  await carol.click('.comment-compose-input');
+  await type(carol, 'Agreed. I will add a line to the modes section.');
+  await carol.keyboard.press('Enter');
+  await alice.waitForTimeout(1200);
+
+  // Park the others' carets in their own cards. They would otherwise sit in the
+  // page, and a remote caret's name label is drawn over the line it is on —
+  // covering the very words these comments are about.
+  // Each in their own remark, and at the end of it, so the name labels land in
+  // the whitespace after the text rather than across it.
+  await bob.click('.comment-card:has-text("Worth saying") .comment-text');
+  await bob.keyboard.press('End');
+  await carol.click('.comment-card:has-text("Friday is the 3rd") .comment-text');
+  await carol.keyboard.press('End');
+  await alice.waitForTimeout(900);
+
+  // Alice's view, with one thread open. The mouse is parked away from the page
+  // so no highlight is lit by a hover rather than by being selected.
+  await alice.click('.comment-card:has-text("Friday is the 3rd")');
+  await alice.mouse.move(700, 660);
+  await alice.waitForTimeout(4000);
+  await shot(alice, 'mode-notepad.png');
+
   console.log('\nDone. Check docs/screenshots, and the README text that describes them.');
 } finally {
   await browser.close();
