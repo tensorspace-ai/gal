@@ -411,7 +411,10 @@ The interesting parts:
   username.
 - **Only the wave's creator can remove someone else**, and anyone may remove
   themselves. Letting any participant evict any other made a hostile takeover of
-  a wave trivial and irreversible.
+  a wave trivial and irreversible. Removing someone from the wave removes them
+  from its private replies as well — access is per wavelet, so an eviction that
+  stopped at the main thread left every side conversation they were in intact,
+  and the creator usually could not reach into those to finish the job.
 - **A document is bounded in what it can hold**, and the bound is applied to
   every edit rather than only to a message's first draft. Three things are
   capped, because any one alone leaves the other two free: its length

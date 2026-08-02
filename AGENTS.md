@@ -137,6 +137,21 @@ person is editing, which reveals that a private thread exists and when it is
 active, even though the content stays hidden. There is a test for this; keep it
 passing.
 
+Membership runs the other way too, and it is asymmetric on purpose.
+`add_participant` refuses to put anyone into a private reply who is not already
+in the conversation, so being in the wave *is* being in its conversation —
+which means `remove_participant` has to take the private replies with it when
+the wavelet it is removing from is the conversation. It did not for a long
+time, and because `may_view` asks whether the user is in *any* wavelet, someone
+evicted from the roster everybody was looking at kept every side conversation
+they had been in. The creator could not repair it either: removing someone from
+a private reply requires being in that private reply.
+
+The cascade deliberately has no minimum-participant guard, unlike the
+conversation it follows. A private reply whose last member leaves the wave is
+left empty and unreadable; keeping them in it to avoid the empty state is the
+bug, not the fix.
+
 ### 4. Persist before acknowledging, and roll back on failure
 
 An op is written to storage before the author is told it landed. If the write

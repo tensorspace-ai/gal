@@ -764,6 +764,94 @@ async fn a_private_reply_is_never_sent_to_outsiders() {
     assert_eq!(bob2.text(&secret_blip), "just between us");
 }
 
+/// Removing someone from the conversation has to remove them from the wave's
+/// private replies too. It did not: `may_view` asks whether the user is in any
+/// wavelet, so an evicted participant kept every side conversation they were in
+/// — and the creator could not clean it up by hand, because removing someone
+/// from a private reply requires being in that private reply.
+#[tokio::test]
+async fn removing_someone_from_a_wave_takes_their_private_replies_with_them() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let carol_cookie = server.register("carol").await;
+
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+    let mut carol = server.connect(&carol_cookie).await;
+
+    let (wave_id, wavelet_id, root_blip) =
+        create_wave(&mut alice, "Team", vec!["bob".into(), "carol".into()]).await;
+    bob.open(&wave_id).await;
+    carol.open(&wave_id).await;
+
+    // Bob and Carol have a side conversation Alice is not in — so Alice, the
+    // creator, has no way to reach into it herself.
+    bob.send(ClientMessage::PrivateReply {
+        wavelet_id: wavelet_id.clone(),
+        anchor: root_blip,
+        participants: vec!["carol".into()],
+    })
+    .await;
+
+    let private = carol
+        .recv_until(|m| match m {
+            ServerMessage::WaveletAdded { wavelet, .. } => Some(wavelet.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(private.kind, WaveletKind::PrivateReply);
+    let secret_blip = private.blips[0].id.clone();
+    carol
+        .edit(&secret_blip, Delta::new().insert("side channel"))
+        .await;
+    carol
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+
+    // Alice evicts Bob from the conversation.
+    let bob_id = bob.user.id.clone();
+    alice
+        .send(ClientMessage::RemoveParticipant {
+            wavelet_id: wavelet_id.clone(),
+            user_id: bob_id.clone(),
+        })
+        .await;
+    alice
+        .recv_until(|m| {
+            matches!(m, ServerMessage::ParticipantRemoved { user_id, .. } if user_id == &bob_id)
+                .then_some(())
+        })
+        .await;
+
+    // A fresh session is the honest test: it asks the server what Bob may see
+    // now, rather than what his old connection happens to still hold.
+    let mut bob2 = server.connect(&bob_cookie).await;
+    bob2.send(ClientMessage::Open {
+        wave_id: wave_id.clone(),
+    })
+    .await;
+    let code = bob2
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            ServerMessage::WaveState { .. } => {
+                panic!("a removed participant still opened the wave through his private reply")
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::NotFound);
+
+    // Carol, who was not removed, keeps the thread and its content.
+    let mut carol2 = server.connect(&carol_cookie).await;
+    carol2.open(&wave_id).await;
+    assert_eq!(
+        carol2.text(&secret_blip),
+        "side channel",
+        "the remaining participant lost the private reply"
+    );
+}
+
 #[tokio::test]
 async fn a_non_participant_cannot_open_a_wave() {
     let server = start_server().await;

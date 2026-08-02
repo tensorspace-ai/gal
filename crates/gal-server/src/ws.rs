@@ -1095,6 +1095,7 @@ async fn remove_participant(
         ));
     }
 
+    let kind = live.wavelet(&wavelet_id).map(|w| w.kind);
     let Some(wavelet) = live.wavelet_mut(&wavelet_id) else {
         return Err(not_found());
     };
@@ -1118,6 +1119,43 @@ async fn remove_participant(
             user_id: user_id.clone(),
         },
     );
+
+    // Being in the wave *is* being in its conversation: `add_participant`
+    // refuses to put anyone into a private reply who is not in the conversation
+    // first. Leaving the conversation therefore has to take the private replies
+    // with it, or that invariant holds in one direction only.
+    //
+    // It did. `may_view` asks whether the user is in *any* wavelet, so someone
+    // removed from the conversation kept every side conversation they had been
+    // in — its live updates, its search hits, its playback and its attachments
+    // — and kept them silently, since the roster they disappeared from was the
+    // only one anybody was looking at. The creator generally could not repair
+    // it by hand either: removing someone from a private reply requires being
+    // in that private reply, and by construction they may not be.
+    let mut cascaded = Vec::new();
+    if kind == Some(WaveletKind::Conversation) {
+        for wavelet in live.wavelets.iter_mut() {
+            if wavelet.kind == WaveletKind::PrivateReply && wavelet.has_participant(&user_id) {
+                wavelet.participants.retain(|p| p != &user_id);
+                cascaded.push(wavelet.id.clone());
+            }
+        }
+        // No minimum-participant guard here, unlike the conversation above. A
+        // private reply whose last member leaves the wave is left empty and
+        // therefore unreadable, which is the right outcome: the alternative is
+        // keeping them in it to avoid the empty state, and that is the bug.
+        for id in &cascaded {
+            live.broadcast(
+                id,
+                None,
+                ServerMessage::ParticipantRemoved {
+                    wave_id: wave_id.clone(),
+                    wavelet_id: id.clone(),
+                    user_id: user_id.clone(),
+                },
+            );
+        }
+    }
 
     // If the removed user can no longer see the wave at all, evict their
     // subscriptions so they stop receiving updates immediately.
@@ -1145,6 +1183,13 @@ async fn remove_participant(
         .remove_participant(&wavelet_id, &user_id)
         .await
         .map_err(internal)?;
+    for id in &cascaded {
+        state
+            .db
+            .remove_participant(id, &user_id)
+            .await
+            .map_err(internal)?;
+    }
     state.schedule_inbox_update(&wave_id);
     Ok(())
 }
