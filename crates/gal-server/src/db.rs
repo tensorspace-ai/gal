@@ -252,6 +252,43 @@ impl Storage {
         .await
     }
 
+    /// Revoke every session a user has except the one asking.
+    ///
+    /// Until this existed the only way to end a session on a device you no
+    /// longer had was to change your password, which is a strange thing to have
+    /// to do about a lost laptop — and impossible to reason about, because
+    /// nothing told you how many sessions there were. Returns how many went.
+    pub async fn revoke_other_sessions(
+        &self,
+        user_id: &UserId,
+        keep_token_hash: String,
+    ) -> Result<usize> {
+        let id = user_id.clone();
+        self.run(move |conn| {
+            let gone = conn.execute(
+                "DELETE FROM sessions WHERE user_id = ?1 AND token_hash != ?2",
+                params![id.as_str(), keep_token_hash],
+            )?;
+            Ok(gone)
+        })
+        .await
+    }
+
+    /// How many sessions this user has, including the one asking.
+    pub async fn session_count(&self, user_id: &UserId) -> Result<usize> {
+        let id = user_id.clone();
+        let now_ms = now();
+        self.run(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE user_id = ?1 AND expires_at > ?2",
+                params![id.as_str(), now_ms],
+                |row| row.get(0),
+            )?;
+            Ok(count as usize)
+        })
+        .await
+    }
+
     pub async fn delete_session(&self, token_hash: String) -> Result<()> {
         self.run(move |conn| {
             conn.execute(

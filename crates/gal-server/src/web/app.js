@@ -252,6 +252,12 @@ function renderShell() {
       }),
       el('button', {
         class: 'btn link',
+        text: 'Sessions',
+        title: 'Sign out every other browser and device',
+        onClick: signOutEverywhere,
+      }),
+      el('button', {
+        class: 'btn link',
         text: 'Sign out',
         onClick: async () => {
           await api('/api/logout', { method: 'POST' });
@@ -2084,7 +2090,9 @@ async function changePassword() {
   });
   if (!current) return;
   const next = await askFor('Change password', {
-    placeholder: 'new password (at least 8 characters)',
+    placeholder: 'new password',
+    description: 'At least 12 characters, and not your username or a password '
+      + 'everyone else has already picked.',
     confirmLabel: 'Change',
     password: true,
   });
@@ -2096,6 +2104,46 @@ async function changePassword() {
       body: JSON.stringify({ currentPassword: current, newPassword: next }),
     });
     toast('Password changed. Other sessions were signed out.');
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+/**
+ * End every other session on this account.
+ *
+ * Changing your password was the only way to do this, which is a strange thing
+ * to have to do about a laptop left on a train — and it gave no idea how many
+ * sessions there were to end.
+ */
+async function signOutEverywhere() {
+  let sessions = null;
+  try {
+    ({ sessions } = await api('/api/sessions'));
+  } catch {
+    // Fall through: not knowing the count is no reason to refuse the action.
+  }
+  const others = sessions === null ? null : Math.max(0, sessions - 1);
+  if (others === 0) {
+    toast('This is your only signed-in session.');
+    return;
+  }
+
+  const ok = await confirmAction(
+    'Sign out everywhere else',
+    others === null
+      ? 'Every other browser and device signed in to this account will be signed out.'
+      : `${others} other ${others === 1 ? 'session' : 'sessions'} will be signed out.`
+        + ' This one stays signed in.',
+    { confirmLabel: 'Sign out others', danger: true },
+  );
+  if (!ok) return;
+
+  try {
+    const { revoked } = await api('/api/sessions/revoke', { method: 'POST' });
+    toast(revoked === 0
+      ? 'There was nothing else to sign out.'
+      : `Signed out ${revoked} other ${revoked === 1 ? 'session' : 'sessions'}.`);
   } catch (e) {
     toast(e.message, 'error');
   }

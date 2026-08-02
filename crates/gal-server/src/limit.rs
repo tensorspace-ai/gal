@@ -58,6 +58,20 @@ impl RateLimiter {
     /// so an expensive call it cannot afford does not also drain what it needs
     /// for the cheap ones.
     pub fn check_cost(&self, key: &str, cost: f64) -> bool {
+        self.take(key, cost, true)
+    }
+
+    /// Whether a call *would* be allowed, taking nothing.
+    ///
+    /// For a limiter charged only on failure: the check has to happen before
+    /// the expensive work, and the charge only after it turns out to have been
+    /// wasted. Peeking with a cost of zero would not do — an empty bucket has
+    /// zero tokens, and zero is not less than zero.
+    pub fn would_allow(&self, key: &str) -> bool {
+        self.take(key, 1.0, false)
+    }
+
+    fn take(&self, key: &str, cost: f64, consume: bool) -> bool {
         let now = Instant::now();
         let mut buckets = match self.buckets.lock() {
             Ok(b) => b,
@@ -83,7 +97,9 @@ impl RateLimiter {
         bucket.last = now;
 
         if bucket.tokens >= cost {
-            bucket.tokens -= cost;
+            if consume {
+                bucket.tokens -= cost;
+            }
             true
         } else {
             false

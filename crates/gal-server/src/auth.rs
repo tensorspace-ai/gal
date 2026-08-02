@@ -107,7 +107,10 @@ pub enum SignupError {
     NameTooLong,
     NameCharacters,
     PasswordTooShort,
-    DisplayNameEmpty,
+    PasswordTooLong,
+    PasswordTooCommon,
+    PasswordContainsName,
+    DisplayNameTooLong,
 }
 
 impl std::fmt::Display for SignupError {
@@ -118,11 +121,91 @@ impl std::fmt::Display for SignupError {
             SignupError::NameCharacters => {
                 "Username may only contain letters, numbers, dots, dashes and underscores."
             }
-            SignupError::PasswordTooShort => "Password must be at least 8 characters.",
-            SignupError::DisplayNameEmpty => "Display name cannot be empty.",
+            SignupError::PasswordTooShort => "Password must be at least 12 characters.",
+            SignupError::PasswordTooLong => "Password must be at most 1024 characters.",
+            SignupError::PasswordTooCommon => {
+                "That password is one of the most common ones in use. Please choose another."
+            }
+            SignupError::PasswordContainsName => "Password must not contain your username.",
+            SignupError::DisplayNameTooLong => "Display name must be at most 64 characters.",
         };
         f.write_str(msg)
     }
+}
+
+/// Shortest password accepted.
+///
+/// Raised from eight. Eight characters of anything, with no other rule, is
+/// inside the reach of an offline attack on a leaked hash and well inside the
+/// reach of an online one spread across enough addresses to stay under a
+/// per-address limiter. Existing passwords keep working; this applies when one
+/// is chosen.
+const MIN_PASSWORD: usize = 12;
+
+/// Longest password accepted.
+///
+/// Not a strength rule. Argon2's cost grows with the length of its input, and
+/// nothing bounded it, so a single registration carrying a ten-megabyte
+/// password was a cheap way to spend a lot of somebody else's CPU — on the
+/// blocking pool that logins share.
+const MAX_PASSWORD: usize = 1024;
+
+/// Passwords common enough that an online attack will try them within its first
+/// few guesses, plus the ones this application's own words invite.
+///
+/// This is deliberately a short list and not a breach corpus: the honest fix is
+/// a k-anonymity check against a service like Have I Been Pwned, which means
+/// making a network request during registration and deciding what to do when it
+/// fails. Until that exists this catches the handful that a rate limiter alone
+/// would still eventually let through.
+/// Every entry must be at least `MIN_PASSWORD` long or it is unreachable —
+/// anything shorter is refused for its length before it gets here. There is a
+/// test for that, because the first draft of this list was mostly dead.
+const COMMON_PASSWORDS: &[&str] = &[
+    "123456789012",
+    "1234567890123",
+    "12345678901234",
+    "111111111111",
+    "aaaaaaaaaaaa",
+    "password1234",
+    "passw0rd1234",
+    "passwordpassword",
+    "qwertyuiop123",
+    "qwertyuiopasdfghjkl",
+    "administrator",
+    "iloveyou1234",
+    "letmein123456",
+    "welcome123456",
+    "abcdefghijklmnop",
+    "thisisapassword",
+    // Famous enough to be in every wordlist that matters, xkcd notwithstanding.
+    "correcthorsebatterystaple",
+];
+
+/// Check a password on its own terms, for registration and for a change alike.
+///
+/// `name` is the account's username, when there is one to compare against: a
+/// password that contains the handle it protects is the first thing anyone
+/// guesses, and it is the one weak password a length rule cannot catch.
+pub fn validate_password(password: &str, name: Option<&str>) -> Result<(), SignupError> {
+    if password.chars().count() < MIN_PASSWORD {
+        return Err(SignupError::PasswordTooShort);
+    }
+    if password.chars().count() > MAX_PASSWORD {
+        return Err(SignupError::PasswordTooLong);
+    }
+
+    let folded = password.to_lowercase();
+    if COMMON_PASSWORDS.contains(&folded.as_str()) {
+        return Err(SignupError::PasswordTooCommon);
+    }
+    if let Some(name) = name {
+        let name = name.trim().to_lowercase();
+        if name.chars().count() >= 3 && folded.contains(&name) {
+            return Err(SignupError::PasswordContainsName);
+        }
+    }
+    Ok(())
 }
 
 /// Validate and normalise sign-up input.
@@ -146,9 +229,7 @@ pub fn validate_signup(
     {
         return Err(SignupError::NameCharacters);
     }
-    if password.chars().count() < 8 {
-        return Err(SignupError::PasswordTooShort);
-    }
+    validate_password(password, Some(&name))?;
 
     // Fall back to the handle when no display name is given, so a user always
     // has something to render.
@@ -159,7 +240,7 @@ pub fn validate_signup(
         display.to_string()
     };
     if display.chars().count() > 64 {
-        return Err(SignupError::DisplayNameEmpty);
+        return Err(SignupError::DisplayNameTooLong);
     }
     Ok((name, display))
 }
@@ -328,20 +409,23 @@ mod tests {
 
     #[test]
     fn signup_validation_normalises_and_rejects() {
-        let (name, display) = validate_signup("  Alice  ", " Alice A ", "longenough").unwrap();
+        // Was "longenough", ten characters, which the minimum has outgrown.
+        const GOOD: &str = "a reasonable passphrase";
+
+        let (name, display) = validate_signup("  Alice  ", " Alice A ", GOOD).unwrap();
         assert_eq!(name, "alice", "handles are canonicalised to lowercase");
         assert_eq!(display, "Alice A");
 
         // Missing display name falls back to the handle.
-        let (_, display) = validate_signup("bob", "  ", "longenough").unwrap();
+        let (_, display) = validate_signup("bob", "  ", GOOD).unwrap();
         assert_eq!(display, "bob");
 
         assert_eq!(
-            validate_signup("a", "A", "longenough"),
+            validate_signup("a", "A", GOOD),
             Err(SignupError::NameTooShort)
         );
         assert_eq!(
-            validate_signup("bad name", "X", "longenough"),
+            validate_signup("bad name", "X", GOOD),
             Err(SignupError::NameCharacters)
         );
         assert_eq!(
@@ -349,8 +433,75 @@ mod tests {
             Err(SignupError::PasswordTooShort)
         );
         assert_eq!(
-            validate_signup("a@b", "X", "longenough"),
+            validate_signup("a@b", "X", GOOD),
             Err(SignupError::NameCharacters)
         );
+        assert_eq!(
+            validate_signup("alice", &"x".repeat(65), GOOD),
+            Err(SignupError::DisplayNameTooLong),
+            "a display name that is too long said the opposite for a long time"
+        );
+    }
+
+    #[test]
+    fn a_password_is_judged_on_more_than_its_length() {
+        assert!(validate_password("a reasonable passphrase", Some("alice")).is_ok());
+
+        assert_eq!(
+            validate_password("elevenchars", None),
+            Err(SignupError::PasswordTooShort),
+            "eleven is one short of the minimum"
+        );
+
+        // Not a strength rule: Argon2's cost grows with its input, and nothing
+        // bounded it, so one registration could spend a lot of somebody else's
+        // CPU on the pool that logins share.
+        assert_eq!(
+            validate_password(&"x".repeat(1025), None),
+            Err(SignupError::PasswordTooLong)
+        );
+
+        assert_eq!(
+            validate_password("password1234", None),
+            Err(SignupError::PasswordTooCommon)
+        );
+        assert_eq!(
+            validate_password("PassWord1234", None),
+            Err(SignupError::PasswordTooCommon),
+            "the check is case-insensitive, or it is trivially sidestepped"
+        );
+
+        // The one weak password a length rule cannot see.
+        assert_eq!(
+            validate_password("alice-in-the-wonderland", Some("alice")),
+            Err(SignupError::PasswordContainsName)
+        );
+        assert_eq!(
+            validate_password("ALICE in the wonderland", Some("Alice")),
+            Err(SignupError::PasswordContainsName)
+        );
+        // A two-character handle appears inside too many ordinary words to
+        // reject on, so it is not compared.
+        assert!(validate_password("a reasonable passphrase", Some("ab")).is_ok());
+    }
+
+    /// The length check runs first, so a common password shorter than the
+    /// minimum can never reach the list — it is refused for being short and the
+    /// entry is decoration. Most of the first version of this list was exactly
+    /// that: "password123" is eleven characters and unreachable behind a
+    /// twelve-character minimum.
+    #[test]
+    fn every_common_password_is_long_enough_to_be_reachable() {
+        for entry in COMMON_PASSWORDS {
+            assert!(
+                entry.chars().count() >= MIN_PASSWORD,
+                "{entry:?} is shorter than the minimum, so it is dead weight"
+            );
+            assert_eq!(
+                validate_password(entry, None),
+                Err(SignupError::PasswordTooCommon),
+                "{entry:?} should be refused as common, not for some other reason"
+            );
+        }
     }
 }

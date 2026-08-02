@@ -440,6 +440,24 @@ The interesting parts:
 - Passwords are hashed with Argon2id. Session tokens are 256 bits of OS
   randomness, and only their SHA-256 hash is stored, so a database leak cannot be
   replayed as live logins.
+- **Passwords are judged on more than length**: at least 12 characters, at most
+  1024 — Argon2's cost grows with its input, so an unbounded one is a cheap way
+  to spend a server's CPU — not one of the passwords everyone picks, and not
+  one containing your own username, which is the weak password a length rule
+  cannot see. The same rules apply to changing a password as to choosing one,
+  which was not previously true.
+- **Repeated wrong guesses lock the account, not just the address.** The
+  per-address limiter throttles one attacker and does nothing about a thousand
+  of them, or one with a list of addresses, all guessing at the same account.
+  Ten failures, then one more every two minutes; only failures are charged, so
+  signing in normally never touches it, and a locked account is refused before
+  the hash so it costs no CPU either.
+- **Sessions can be revoked without changing your password** — "Sessions" in
+  the sidebar ends every other browser and device. Previously the only way to
+  sign out a lost laptop was to change your password.
+- **No email address is collected.** One used to be accepted at registration
+  and written to the database, where nothing ever read it: unverified personal
+  data held for no purpose, with no way to delete it. The client never sent one.
 - Login timing is equalised between existing and unknown accounts.
 - Cookies are `HttpOnly` and `SameSite=Lax`; set `GAL_SECURE_COOKIES` behind
   HTTPS.
@@ -496,9 +514,12 @@ The interesting parts:
 
 Disclosed rather than hidden, because some of these matter for how you deploy it:
 
-- **No password reset.** You can change your password (which signs out every
-  other session), but there is no email-based recovery, so a forgotten password
+- **No password reset.** You can change your password, and you can sign out
+  every other session without changing it, but there is no email-based
+  recovery — Gal sends no mail and holds no address — so a forgotten password
   still needs an operator to intervene in the database.
+- **One factor, and no single sign-on.** Username and password is the only way
+  in. No TOTP, no passkeys, no OIDC or SAML.
 - **No account deletion or data export.**
 - **No moderation surface.** No way to suspend an account or audit participant
   changes.

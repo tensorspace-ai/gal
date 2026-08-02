@@ -471,6 +471,13 @@ pub struct ConnHandle {
     pub tx: mpsc::Sender<ServerMessage>,
 }
 
+/// Bucket key for sign-in failures. Prefixed so it can never collide with the
+/// address keys the other limiters use — `"10.0.0.1"` is a legal username shape
+/// as far as a string map is concerned.
+fn account_key(name: &str) -> String {
+    format!("account:{}", name.trim().to_lowercase())
+}
+
 pub struct AppState {
     pub db: Storage,
     pub config: Config,
@@ -488,6 +495,13 @@ pub struct AppState {
     auth_limiter: RateLimiter,
     /// Username lookup, which is an existence oracle by nature.
     lookup_limiter: RateLimiter,
+    /// Failed sign-ins, keyed by the *account* rather than the caller.
+    ///
+    /// `auth_limiter` is keyed by address, which throttles one attacker and
+    /// does nothing about a thousand of them — or one with a list of addresses
+    /// — all guessing at the same account. This is the other axis, and it is
+    /// the one that matters for a targeted attempt.
+    account_limiter: RateLimiter,
     /// Every WebSocket command, priced by what it costs the server. Keyed by
     /// *user* rather than by address or connection: the socket is authenticated,
     /// so the account is the thing to hold to an allowance, and opening more
@@ -521,6 +535,10 @@ impl AppState {
             // makes ten attempts a second.
             auth_limiter: RateLimiter::new(10.0, 0.5),
             lookup_limiter: RateLimiter::new(30.0, 2.0),
+            // Only *failures* are charged, so somebody signing in normally
+            // never touches it however often they do it. Ten wrong guesses,
+            // then one more every two minutes.
+            account_limiter: RateLimiter::new(10.0, 1.0 / 120.0),
             // Sized so that ordinary use never reaches it and abuse does.
             // Typing is one op per acknowledgement per message, so a fast
             // typist with several messages open runs at tens a second; this
@@ -593,6 +611,20 @@ impl AppState {
             )
                 .into_response(),
         )
+    }
+
+    /// Is this account currently locked out by repeated failed sign-ins?
+    ///
+    /// Checked *before* the password is verified, so a locked account costs no
+    /// Argon2 hash either.
+    pub fn account_is_throttled(&self, name: &str) -> bool {
+        !self.account_limiter.would_allow(&account_key(name))
+    }
+
+    /// Charge one wrong guess against an account.
+    pub fn note_failed_signin(&self, name: &str) {
+        self.account_limiter.check(&account_key(name));
+        self.metrics.rate_limit("signin_failures");
     }
 
     /// Charge a command against its sender's allowance.

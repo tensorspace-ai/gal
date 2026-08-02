@@ -1169,6 +1169,116 @@ async fn one_account_cannot_hold_unlimited_sockets() {
     assert_eq!(code, ErrorCode::TooManyRequests);
 }
 
+/// The address limiter throttles one attacker and does nothing about many of
+/// them, or one with a list of addresses, all guessing at the same account.
+#[tokio::test]
+async fn repeated_wrong_guesses_lock_the_account_not_just_the_address() {
+    // Trusting the forwarded header is what lets this test present itself as a
+    // different client each time, which is the situation being defended against.
+    let server = start_server_with(|config| config.trust_forwarded_for = true).await;
+    server.register("alice").await;
+    let http = reqwest::Client::new();
+
+    let attempt = |password: &'static str, from: &'static str| {
+        let http = http.clone();
+        let base = server.base.clone();
+        async move {
+            http.post(format!("{base}/api/login"))
+                // A different source address each time, which is what defeats
+                // the per-address limiter. Honoured only because this server is
+                // configured to trust the header.
+                .header("x-forwarded-for", from)
+                .json(&serde_json::json!({ "name": "alice", "password": password }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    for i in 0..10 {
+        let from: &'static str = Box::leak(format!("10.0.0.{i}").into_boxed_str());
+        assert_eq!(attempt("wrong guess here", from).await, 400);
+    }
+
+    // Now the right password, from an address that has never been seen.
+    assert_eq!(
+        attempt("correct horse battery", "203.0.113.7").await,
+        400,
+        "the account should be locked regardless of who is asking"
+    );
+}
+
+/// Signing out of a device you no longer have used to mean changing your
+/// password, which is a strange thing to have to do about a lost laptop.
+#[tokio::test]
+async fn sessions_can_be_revoked_without_changing_the_password() {
+    let server = start_server().await;
+    let first = server.register("alice").await;
+    let http = reqwest::Client::new();
+
+    // A second and third sign-in: other devices.
+    let sign_in = || async {
+        http.post(format!("{}/api/login", server.base))
+            .json(&serde_json::json!({ "name": "alice", "password": "correct horse battery" }))
+            .send()
+            .await
+            .unwrap()
+            .headers()
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .expect("no session cookie")
+            .to_string()
+    };
+    let second = sign_in().await;
+    let third = sign_in().await;
+
+    let count = |cookie: String| {
+        let http = http.clone();
+        let base = server.base.clone();
+        async move {
+            http.get(format!("{base}/api/sessions"))
+                .header("cookie", cookie)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()["sessions"]
+                .as_u64()
+                .unwrap()
+        }
+    };
+    assert_eq!(count(first.clone()).await, 3);
+
+    let revoked = http
+        .post(format!("{}/api/sessions/revoke", server.base))
+        .header("cookie", first.clone())
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["revoked"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(revoked, 2);
+
+    // The one that asked survives; the others are gone.
+    assert_eq!(count(first).await, 1);
+    for gone in [second, third] {
+        let status = http
+            .get(format!("{}/api/me", server.base))
+            .header("cookie", gone)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 401, "a revoked session still worked");
+    }
+}
+
 #[tokio::test]
 async fn a_non_participant_cannot_open_a_wave() {
     let server = start_server().await;

@@ -129,6 +129,13 @@ fn server_error(e: anyhow::Error) -> Response {
         .into_response()
 }
 
+/// No `email`. One used to be accepted here and written to the users table,
+/// where nothing ever read it: the client has never sent one, there is no
+/// verification, no password reset to use it for, and no way to delete it. That
+/// is unverified personal data collected for no purpose — the worst kind to
+/// hold. Any value stored by an older build is left alone rather than deleted
+/// out from under an operator; the column is still there and can be cleared
+/// with `UPDATE users SET email = ''`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -136,8 +143,6 @@ struct SignupRequest {
     name: String,
     #[serde(default)]
     display_name: String,
-    #[serde(default)]
-    email: String,
     password: String,
 }
 
@@ -197,7 +202,7 @@ async fn register(
 
     let user = match state
         .db
-        .create_user(name, display_name, body.email.trim().to_string(), hash)
+        .create_user(name, display_name, String::new(), hash)
         .await
     {
         Ok(u) => u,
@@ -217,6 +222,14 @@ async fn login(
 ) -> Response {
     if let Some(response) = state.check_auth_rate(&headers, peer) {
         return response;
+    }
+    // The address limiter throttles one attacker and does nothing about many of
+    // them guessing at one account. Checked before the hash, so a locked
+    // account also costs no CPU — and worded like every other failure, so it
+    // does not become an oracle for which usernames exist.
+    if state.account_is_throttled(&body.name) {
+        tracing::warn!(account = %body.name.trim(), "sign-in throttled after repeated failures");
+        return bad_request("Incorrect username or password.");
     }
 
     let stored = match state.db.user_by_name(body.name.trim()).await {
@@ -240,7 +253,12 @@ async fn login(
 
     match (ok, stored) {
         (true, Some(user)) => issue_session(&state, &user).await,
-        _ => bad_request("Incorrect username or password."),
+        _ => {
+            // Charged on failure only, so signing in normally — however often —
+            // never moves this bucket.
+            state.note_failed_signin(&body.name);
+            bad_request("Incorrect username or password.")
+        }
     }
 }
 
@@ -283,6 +301,34 @@ async fn logout(State(state): State<Arc<AppState>>, identity: Identity) -> Respo
     (headers, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
+/// End every other session this account has.
+///
+/// The only way to do this used to be changing your password, which is an odd
+/// thing to have to do about a laptop left on a train, and gave no idea how
+/// many sessions there were to begin with.
+async fn sign_out_everywhere(State(state): State<Arc<AppState>>, identity: Identity) -> Response {
+    match state
+        .db
+        .revoke_other_sessions(&identity.user.id, identity.token_hash.clone())
+        .await
+    {
+        Ok(revoked) => {
+            tracing::info!(user = %identity.user.id, revoked, "signed out other sessions");
+            Json(serde_json::json!({ "revoked": revoked })).into_response()
+        }
+        Err(e) => server_error(e),
+    }
+}
+
+/// How many sessions this account has, so the client can say what signing out
+/// everywhere would actually do.
+async fn session_info(State(state): State<Arc<AppState>>, identity: Identity) -> Response {
+    match state.db.session_count(&identity.user.id).await {
+        Ok(sessions) => Json(serde_json::json!({ "sessions": sessions })).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -303,8 +349,11 @@ async fn change_password(
     if let Some(response) = state.check_auth_rate(&headers, peer) {
         return response;
     }
-    if body.new_password.chars().count() < 8 {
-        return bad_request("New password must be at least 8 characters.");
+    // The same rules registration applies. They used to differ: registration
+    // checked a minimum and a change checked its own, so the one path a person
+    // uses to *improve* a password was the laxer of the two.
+    if let Err(e) = auth::validate_password(&body.new_password, Some(&identity.user.name)) {
+        return bad_request(e.to_string());
     }
 
     let stored = identity.user.password_hash.clone();
@@ -813,6 +862,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/password", post(change_password))
+        .route("/api/sessions", get(session_info))
+        .route("/api/sessions/revoke", post(sign_out_everywhere))
         .route("/api/me", get(me))
         .route("/api/users", get(users))
         .route("/api/lookup", get(lookup))
