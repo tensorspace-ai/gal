@@ -29,6 +29,59 @@ const INLINE_TAGS = [
  */
 const EMBED_CHAR = '￼';
 
+/**
+ * The attribute that anchors a range of text to a comment thread.
+ *
+ * Must match `COMMENT_ATTRIBUTE` in `gal-core/src/model.rs`. It is only ever an
+ * attribute, never anything the OT engines treat specially, which is the point:
+ * an anchor is transformed by exactly the same code that transforms bold.
+ */
+export const COMMENT_ATTR = 'comment';
+
+/**
+ * Formatting that text typed *after* a run should inherit from it.
+ *
+ * Everything except the comment anchor. Typing at the end of a bold word should
+ * stay bold, but typing at the end of a commented sentence must not silently
+ * pull the new words into someone else's comment: a comment is a range a person
+ * chose, not a style that spreads.
+ */
+function inheritable(attributes) {
+  if (!attributes || attributes[COMMENT_ATTR] === undefined) return attributes;
+  const inherited = { ...attributes };
+  delete inherited[COMMENT_ATTR];
+  return inherited;
+}
+
+/**
+ * Every range of `delta` that is anchored to a comment, as
+ * `{ id, index, length }` in UTF-16 code units.
+ *
+ * Derived from the document each time rather than stored: the document is the
+ * only place an anchor lives, so this can never drift from it. Runs that touch
+ * and share an id are one range — an edit inside a commented sentence splits
+ * the op without splitting the comment.
+ */
+export function commentRanges(delta) {
+  const ranges = [];
+  let index = 0;
+  for (const op of delta.ops) {
+    if (op.insert === undefined) continue;
+    const length = typeof op.insert === 'string' ? op.insert.length : 1;
+    const id = op.attributes && op.attributes[COMMENT_ATTR];
+    if (typeof id === 'string' && id) {
+      const last = ranges[ranges.length - 1];
+      if (last && last.id === id && last.index + last.length === index) {
+        last.length += length;
+      } else {
+        ranges.push({ id, index, length });
+      }
+    }
+    index += length;
+  }
+  return ranges;
+}
+
 /** Is this node an embed — an attachment, or anything else atomic? */
 function isEmbed(node) {
   return node.nodeType === Node.ELEMENT_NODE && node.dataset && node.dataset.embed === '1';
@@ -146,6 +199,16 @@ function renderRun(text, attributes = {}) {
     anchor.rel = 'noopener noreferrer';
     anchor.appendChild(node);
     node = anchor;
+  }
+  // Outermost, so the highlight covers the run whatever else it is wearing. A
+  // plain <span> is transparent to every walker below, so it costs no offsets.
+  const comment = attributes[COMMENT_ATTR];
+  if (typeof comment === 'string' && comment) {
+    const marked = document.createElement('span');
+    marked.className = 'commented';
+    marked.dataset.comment = comment;
+    marked.appendChild(node);
+    node = marked;
   }
   return node;
 }
@@ -556,9 +619,9 @@ export class Editor {
     if (inserted) {
       // Typed text inherits the formatting of the character it follows, which
       // is what makes typing at the end of a bold run stay bold.
-      const attributes =
-        this.pendingFormat ||
-        (index > 0 ? this.doc.attributesAt(index - 1, 1) : {});
+      const attributes = inheritable(
+        this.pendingFormat || (index > 0 ? this.doc.attributesAt(index - 1, 1) : {}),
+      );
       delta.insert(inserted, attributes);
     }
     this.pendingFormat = null;
@@ -579,9 +642,10 @@ export class Editor {
   /** Replace the current selection with `text`, as one op. */
   replaceSelection(text) {
     const selection = this.getSelection() || { index: this.doc.toPlainText().length, length: 0 };
-    const attributes =
+    const attributes = inheritable(
       this.pendingFormat ||
-      (selection.index > 0 ? this.doc.attributesAt(selection.index - 1, 1) : {});
+        (selection.index > 0 ? this.doc.attributesAt(selection.index - 1, 1) : {}),
+    );
 
     const delta = new Delta()
       .retain(selection.index)
@@ -632,7 +696,7 @@ export class Editor {
     if (selection.length === 0) {
       // Nothing selected: remember the toggle and apply it to the next
       // characters typed, the way every other editor behaves.
-      const current = this.doc.attributesAt(Math.max(0, selection.index - 1), 1);
+      const current = inheritable(this.doc.attributesAt(Math.max(0, selection.index - 1), 1));
       this.pendingFormat = { ...current, [name]: value };
       if (value === null) delete this.pendingFormat[name];
       return;

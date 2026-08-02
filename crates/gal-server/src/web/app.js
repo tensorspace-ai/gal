@@ -2,7 +2,7 @@
 
 import { Delta, compose } from './ot.js';
 import { BlipDoc, Connection } from './client.js';
-import { Editor, indexToDom, renderDelta } from './editor.js';
+import { COMMENT_ATTR, commentRanges, Editor, indexToDom, renderDelta } from './editor.js';
 import {
   askFor,
   avatar,
@@ -31,7 +31,11 @@ const MODES = [
   { id: 'document', label: 'Document', hint: 'Everyone can edit every message. Replies nest.' },
   { id: 'chat', label: 'Chat', hint: 'A channel. Only you can edit your own messages.' },
   { id: 'announcement', label: 'Announcement', hint: 'Only you can post; anyone can reply.' },
-  { id: 'notepad', label: 'Notepad', hint: 'One shared page that everyone edits.' },
+  {
+    id: 'notepad',
+    label: 'Notepad',
+    hint: 'One shared page that everyone edits, with comments in the margin.',
+  },
   { id: 'frozen', label: 'Frozen', hint: 'Read-only. Nothing can change until you unfreeze it.' },
 ];
 
@@ -44,6 +48,12 @@ const mode = {
     mode.is('document', 'chat') || (mode.is('announcement') && isCreator()),
   allowsDelete: () => mode.is('document', 'chat', 'announcement'),
   allowsPrivateReply: () => mode.is('document', 'chat', 'announcement'),
+  /// Mirrors WaveMode::allows_comments — a notepad's only way to say something
+  /// about the page rather than in it.
+  allowsComments: () => mode.is('notepad'),
+  /// Wider than allowsComments on purpose, matching WaveMode::allows_resolve:
+  /// leaving Notepad must not strand threads that nothing could then close.
+  allowsResolve: () => !mode.is('frozen'),
   /// Can this user edit this blip? Mirrors WaveMode::allows_edit.
   allowsEdit: (blip) => {
     switch (mode.current()) {
@@ -79,6 +89,17 @@ const state = {
   remoteCursors: new Map(),
   cursorLayer: null,
   activeEditor: null,
+  /// The margin the comment cards sit in, rebuilt with the wave.
+  commentRail: null,
+  /// The thread whose card and highlight are lit up, if any.
+  activeComment: null,
+  /// Whether settled threads are on show. Off by default: the point of
+  /// resolving one is to get it out of the margin.
+  showResolved: false,
+  /// Half-typed replies, by thread, so rebuilding the margin does not throw
+  /// away a sentence someone is in the middle of.
+  commentDrafts: new Map(),
+  commentReplyFocused: false,
   /// The one formatting toolbar, and where it sits when no editor has the
   /// caret. Both are rebuilt with the wave.
   toolbar: null,
@@ -387,6 +408,12 @@ function teardownWave() {
   state.toolbar = null;
   state.toolbarHome = null;
   state.doomed.clear();
+  state.commentRail = null;
+  state.activeComment = null;
+  state.showResolved = false;
+  state.commentReplyFocused = false;
+  // Drafts belong to the wave being left, not to the next one.
+  state.commentDrafts.clear();
 }
 
 function rootWavelet() {
@@ -454,7 +481,18 @@ function renderWave() {
   ]);
 
   const thread = el('div', { class: 'thread', id: 'thread' });
-  const scroller = el('div', { class: 'thread-scroll' }, [thread]);
+  // A sibling of the thread rather than a child: the cards are positioned
+  // against the page's text but must not be part of its flow.
+  const rail = el('div', { class: 'comment-rail', id: 'comment-rail' });
+  const scroller = el('div', { class: 'thread-scroll' }, [thread, rail]);
+  state.commentRail = rail;
+
+  // Clicking a highlighted phrase brings up its thread. Delegated, because the
+  // marks are rebuilt on every render and every remote edit.
+  thread.addEventListener('click', (event) => {
+    const mark = event.target.closest && event.target.closest('.commented');
+    if (mark && mark.dataset.comment) setActiveComment(mark.dataset.comment);
+  });
 
   pane.appendChild(header);
   pane.appendChild(scroller);
@@ -712,7 +750,9 @@ function renderThread() {
 
   clear(host);
 
-  const blips = allBlips();
+  // Remarks are blips too, but they belong beside the page rather than in it.
+  // They are laid out by renderComments() instead.
+  const blips = allBlips().filter((b) => !b.comment);
   const byParent = new Map();
   for (const blip of blips) {
     // Flat modes ignore `parent` when laying out. The server still stores it, so
@@ -794,7 +834,23 @@ function renderThread() {
   // editor — clicking the search box and then having someone post was enough
   // to take bold, links and the paperclip off the page entirely.
   dockToolbar();
+  // The cards hang off the text that was just rebuilt, so their anchors and
+  // their editors have to be rebuilt with it.
+  renderComments();
+  restoreCommentFocus();
   if (chat && pinned) scroller.scrollTop = scroller.scrollHeight;
+}
+
+/// Put the caret back in the active card's reply box after a rebuild.
+///
+/// The page's own editors are covered by captureFocus/restoreFocus, which key
+/// off a blip id; a reply box is a local draft and has none.
+function restoreCommentFocus() {
+  if (!state.commentReplyFocused || !state.commentRail) return;
+  const box = state.commentRail.querySelector('.comment-card.active .comment-compose');
+  if (!box || !box.replyEditor) return;
+  box.replyEditor.root.focus();
+  box.replyEditor.setSelection(box.replyEditor.doc.toPlainText().length);
 }
 
 /// Which message the caret is in, and where, before the thread is rebuilt.
@@ -961,6 +1017,394 @@ function blipElement(blip, depth, { grouped = false } = {}) {
   return article;
 }
 
+// --- comments -----------------------------------------------------------
+//
+// A comment is a remark about a range of the page rather than about the wave.
+// Where it points is not stored anywhere: the range is marked in the document
+// itself with a `comment` attribute, so it is transformed by the same code that
+// transforms bold, and the highlight follows the words as everyone edits around
+// them. Everything below therefore *derives* positions from the document each
+// time rather than remembering them.
+
+/// Every comment thread the viewer can see. The server has already dropped the
+/// ones belonging to wavelets they are not in.
+function allComments() {
+  if (!state.wave) return [];
+  return state.wave.wavelets.flatMap((w) => w.comments || []);
+}
+
+/// The remarks in a thread, oldest first.
+function remarksOf(commentId) {
+  return allBlips()
+    .filter((b) => b.comment === commentId)
+    .sort((a, b) => a.seq - b.seq || a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
+}
+
+/// Where each thread is anchored, read out of the live documents.
+///
+/// Deliberately from `state.docs` and not from `state.wave`: the latter is the
+/// snapshot taken when the wave was opened, and every edit since — including the
+/// ones that moved these ranges — arrived as an operation.
+function anchorsByComment() {
+  const anchors = new Map();
+  for (const blip of allBlips()) {
+    if (blip.comment) continue; // a remark, not the page
+    const doc = state.docs.get(blip.id);
+    if (!doc) continue;
+    for (const range of commentRanges(doc.doc)) {
+      if (!anchors.has(range.id)) anchors.set(range.id, { blipId: blip.id, ...range });
+    }
+  }
+  return anchors;
+}
+
+/// The screen rectangle covering an anchored range, or null if it is not drawn.
+function anchorRect(anchor) {
+  const node = state.blipNodes.get(anchor.blipId);
+  const root = node && node.querySelector('.editor');
+  if (!root || !root.isConnected) return null;
+  try {
+    const from = indexToDom(root, anchor.index);
+    const to = indexToDom(root, anchor.index + anchor.length);
+    if (!from || !to) return null;
+    const range = document.createRange();
+    range.setStart(from.node, from.offset);
+    range.setEnd(to.node, to.offset);
+    const rect = range.getBoundingClientRect();
+    return rect.height ? rect : null;
+  } catch {
+    // A range that cannot be built is a range that cannot be pointed at. The
+    // thread still shows, as detached.
+    return null;
+  }
+}
+
+function setActiveComment(commentId) {
+  if (state.activeComment === commentId) return;
+  state.activeComment = commentId;
+  state.commentReplyFocused = false;
+  renderComments();
+}
+
+/// Start a thread on whatever is selected.
+function startComment() {
+  const editor = state.activeEditor;
+  if (!editor || !editor.blipId || !editor.waveletId) {
+    toast('Select some text on the page first.');
+    return;
+  }
+  // Comments annotate the page, not each other; the server refuses this too.
+  // Catching it here is what keeps the caret from being in a remark — where it
+  // lands as soon as a thread is opened — and the button meaning something else.
+  if (allBlips().some((b) => b.id === editor.blipId && b.comment)) {
+    toast('Select some text on the page first.');
+    return;
+  }
+  const selection = editor.getSelection();
+  if (!selection || selection.length === 0) {
+    toast('Select the words you want to comment on.');
+    return;
+  }
+  // One comment per range: the anchor is a single attribute, so a second id
+  // over the same words would overwrite the first and silently detach it.
+  const existing = editor.doc.attributesAt(selection.index, selection.length)[COMMENT_ATTR];
+  if (existing) {
+    toast('That text already has a comment.');
+    setActiveComment(existing);
+    return;
+  }
+
+  const commentId = newCommentId();
+  conn.send({
+    type: 'createComment',
+    waveletId: editor.waveletId,
+    blipId: editor.blipId,
+    commentId,
+    content: new Delta(),
+  });
+  // Marked straight away, against the revision the selection was made in. There
+  // is nothing to wait for: this is an ordinary op, so if someone else is typing
+  // in the page the server rebases it exactly as it rebases everything else.
+  // Waiting for the thread to be confirmed would mean re-finding a range that
+  // had moved in the meantime.
+  editor.format(COMMENT_ATTR, commentId);
+  state.activeComment = commentId;
+  state.commentReplyFocused = true;
+}
+
+/// An id in the shape the server accepts — see `CommentId::is_well_formed`.
+///
+/// Minted here rather than by the server so the anchor and the thread it names
+/// can be created against the same revision.
+function newCommentId() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return `c-${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/**
+ * Build the margin: one card per open thread, beside the words it is about.
+ *
+ * Split from `layoutComments` because this rebuilds the cards, and a card being
+ * replied to holds a half-typed draft. Anything that only *moves* the text calls
+ * the layout pass alone.
+ */
+function renderComments() {
+  const rail = state.commentRail;
+  if (!rail) return;
+  clear(rail);
+
+  const threads = allComments();
+  const anchors = anchorsByComment();
+  const pane = document.getElementById('wave-pane');
+  const resolvedCount = threads.filter((t) => t.resolvedBy).length;
+  const shown = threads.filter((t) => state.showResolved || !t.resolvedBy);
+
+  if (pane) pane.classList.toggle('has-comments', threads.length > 0);
+  markAnchors(threads);
+  if (threads.length === 0) return;
+
+  if (resolvedCount > 0) {
+    rail.appendChild(el('button', {
+      class: 'btn link comment-toggle',
+      text: state.showResolved
+        ? `Hide ${resolvedCount} resolved`
+        : `Show ${resolvedCount} resolved`,
+      onClick: () => {
+        state.showResolved = !state.showResolved;
+        renderComments();
+      },
+    }));
+  }
+
+  for (const thread of shown) {
+    rail.appendChild(commentCard(thread, anchors.get(thread.id) || null));
+  }
+  layoutComments();
+}
+
+/// Tell the highlights in the page which threads they belong to.
+///
+/// A mark whose thread the client does not know about gets no highlight: that
+/// is what an anchor looks like in the moment between marking the text and the
+/// thread being confirmed, and what it would look like for good if the server
+/// refused the thread. Better to show nothing than a highlight opening onto it.
+function markAnchors(threads) {
+  const byId = new Map(threads.map((t) => [t.id, t]));
+  for (const mark of document.querySelectorAll('.commented')) {
+    const thread = byId.get(mark.dataset.comment);
+    mark.classList.toggle('orphan', !thread);
+    mark.classList.toggle('resolved', Boolean(thread && thread.resolvedBy));
+    mark.classList.toggle('active', Boolean(thread) && thread.id === state.activeComment);
+  }
+}
+
+function commentCard(thread, anchor) {
+  const author = lookupUser(thread.author);
+  const remarks = remarksOf(thread.id);
+  const active = state.activeComment === thread.id;
+  const resolved = Boolean(thread.resolvedBy);
+
+  const card = el('article', {
+    class: `comment-card ${active ? 'active' : ''} ${resolved ? 'resolved' : ''} ${
+      anchor ? '' : 'detached'
+    }`,
+    dataset: { comment: thread.id },
+    onClick: () => setActiveComment(thread.id),
+  });
+
+  const head = el('div', { class: 'comment-head' }, [
+    avatar(author, { size: 22 }),
+    el('span', { class: 'comment-author', text: author.displayName }),
+    el('time', {
+      class: 'comment-time',
+      text: relativeTime(thread.createdAt),
+      title: fullTime(thread.createdAt),
+    }),
+  ]);
+  card.appendChild(head);
+
+  // Always present, shown by the stylesheet only while the card is detached.
+  // Whether it is detached can change with any keystroke in the page, and the
+  // layout pass — which runs on every one — must not have to rebuild the card
+  // to say so, or a reply being typed would be lost each time.
+  //
+  // The remarks are kept either way. Losing the discussion of why a sentence
+  // was wrong, because someone acted on it, is the opposite of the point.
+  card.appendChild(el('p', {
+    class: 'comment-detached',
+    text: 'The text this was about has been edited away.',
+  }));
+
+  for (const remark of remarks) card.appendChild(commentRemark(remark));
+
+  const actions = el('div', { class: 'comment-actions' });
+  if (mode.allowsResolve()) {
+    actions.appendChild(el('button', {
+      class: 'btn link',
+      text: resolved ? 'Reopen' : 'Resolve',
+      onClick: (e) => {
+        e.stopPropagation();
+        conn.send({ type: 'resolveComment', commentId: thread.id, resolved: !resolved });
+      },
+    }));
+  }
+  if (resolved && thread.resolvedBy) {
+    actions.appendChild(el('span', {
+      class: 'comment-settled',
+      text: `Resolved by ${lookupUser(thread.resolvedBy).displayName}`,
+    }));
+  }
+  card.appendChild(actions);
+
+  // Only the card being read gets a reply box, and only while the thread is
+  // open. Giving every card one would put a dozen editors on the page and make
+  // the margin unreadable.
+  if (active && !resolved && mode.allowsComments()) {
+    card.appendChild(commentReply(thread));
+  }
+  return card;
+}
+
+/// One remark, editable by whoever the mode allows — it is a blip like any
+/// other, so it gets the same live co-editing as the page.
+function commentRemark(blip) {
+  const author = lookupUser(blip.author);
+  const doc = state.docs.get(blip.id) || new BlipDoc(blip.id, blip.content, blip.revision);
+  state.docs.set(blip.id, doc);
+
+  const editorRoot = el('div', { class: 'editor comment-text' });
+  const row = el('div', { class: 'comment-remark' }, [
+    el('div', { class: 'comment-remark-head' }, [
+      el('span', { class: 'comment-author', text: author.displayName }),
+      el('time', {
+        class: 'comment-time',
+        text: relativeTime(blip.lastModified),
+        title: fullTime(blip.lastModified),
+      }),
+    ]),
+    editorRoot,
+  ]);
+
+  if (state.playback || !mode.allowsEdit(blip)) {
+    editorRoot.contentEditable = 'false';
+    editorRoot.classList.add('read-only');
+    renderDelta(editorRoot, doc.doc);
+    return row;
+  }
+
+  const editor = new Editor(editorRoot, doc.doc, {
+    onChange: (delta) => onLocalEdit(blip.id, delta),
+    onSelectionChange: () => {
+      state.activeEditor = editor;
+      dockToolbar();
+    },
+  });
+  editor.doc = doc.doc;
+  editor.blipId = blip.id;
+  editor.waveletId = blip.waveletId;
+  state.editors.set(blip.id, editor);
+  return row;
+}
+
+/// The reply box at the foot of the active card.
+function commentReply(thread) {
+  const field = el('div', { class: 'comment-compose-input' });
+  const send = () => {
+    const draft = state.commentDrafts.get(thread.id);
+    if (!draft || !draft.toPlainText().trim()) return;
+    conn.send({ type: 'replyToComment', commentId: thread.id, content: draft });
+    state.commentDrafts.delete(thread.id);
+    editor.reset(new Delta());
+  };
+
+  const box = el('div', { class: 'comment-compose' }, [
+    field,
+    el('button', {
+      class: 'btn primary comment-send',
+      text: 'Reply',
+      onMousedown: (e) => e.preventDefault(),
+      onClick: (e) => {
+        e.stopPropagation();
+        send();
+      },
+    }),
+  ]);
+
+  // Drafts survive a rebuild of the margin, which happens whenever anyone else
+  // adds a remark. Losing half a sentence because someone else was typing is
+  // exactly the failure the thread's own re-render avoids for the page.
+  const draft = state.commentDrafts.get(thread.id) || new Delta();
+  const editor = new Editor(field, draft, {
+    onChange: () => state.commentDrafts.set(thread.id, editor.doc),
+    onSelectionChange: () => {
+      state.activeEditor = editor;
+      state.commentReplyFocused = true;
+      dockToolbar();
+    },
+  });
+  // Enter sends, Shift+Enter is a newline — the same bargain as the chat
+  // composer. The editor only calls this when Shift is up.
+  editor.onEnter = (event) => {
+    event.preventDefault();
+    send();
+    return false;
+  };
+  box.replyEditor = editor;
+  return box;
+}
+
+/**
+ * Put each card beside the text it is about, without letting two overlap.
+ *
+ * Cards are placed top down and pushed past the one above when they would
+ * collide, which is what keeps a run of comments on adjacent lines readable
+ * while still pointing roughly at the right place.
+ */
+function layoutComments() {
+  const rail = state.commentRail;
+  if (!rail || !rail.isConnected) return;
+  const cards = Array.from(rail.querySelectorAll('.comment-card'));
+  if (cards.length === 0) {
+    rail.style.height = '';
+    return;
+  }
+
+  // Read the anchors afresh rather than trusting what the card was built with.
+  // They live in the documents and the documents have moved since — which is
+  // the entire reason for putting them there.
+  const anchors = anchorsByComment();
+  const placed = cards.map((card) => {
+    const anchor = anchors.get(card.dataset.comment) || null;
+    const rect = anchor ? anchorRect(anchor) : null;
+    // A thread whose words have been edited away has nothing to sit beside.
+    card.classList.toggle('detached', !anchor);
+    return { card, want: rect ? rect.top : Number.POSITIVE_INFINITY };
+  });
+
+  // On a narrow screen the margin becomes an ordinary list under the page, and
+  // the stylesheet says so by taking the rail out of absolute positioning.
+  if (getComputedStyle(rail).position === 'static') {
+    for (const { card } of placed) card.style.top = '';
+    rail.style.height = '';
+    return;
+  }
+
+  // Detached cards have no line to sit beside, so they sink to the bottom.
+  placed.sort((a, b) => a.want - b.want);
+  const base = rail.getBoundingClientRect().top;
+
+  let floor = 0;
+  for (const { card, want } of placed) {
+    const top = Math.max(floor, Number.isFinite(want) ? want - base : floor);
+    card.style.top = `${top}px`;
+    floor = top + card.offsetHeight + 8;
+  }
+  // Absolutely positioned children do not stretch their parent, and without a
+  // height the last cards would be unreachable in a short document.
+  rail.style.height = `${floor}px`;
+}
+
 /// Resolve a user id to a profile for display.
 ///
 /// The wave's own participant lists are the primary source: they always contain
@@ -1087,6 +1531,12 @@ function onLocalEdit(blipId, delta) {
       opId: doc.outstandingOpId,
     });
   }
+
+  // Typing in the page moves the words the cards point at, and a re-render of
+  // the editor rebuilds the marks from scratch. Both need the margin to catch
+  // up; neither is a reason to rebuild the cards themselves.
+  markAnchors(allComments());
+  layoutComments();
 }
 
 // --- formatting toolbar -------------------------------------------------
@@ -1135,6 +1585,19 @@ function buildToolbar() {
       updateToolbar();
     },
   }, [icon(ICONS.link)]));
+
+  // Only where the server would take one. Offering it in a chat would put a
+  // button on the page whose only outcome is a refusal.
+  if (mode.allowsComments()) {
+    bar.appendChild(el('button', {
+      class: 'tool tool-comment',
+      type: 'button',
+      title: 'Comment on the selected text',
+      'aria-label': 'Comment on the selected text',
+      onMousedown: (e) => e.preventDefault(),
+      onClick: () => startComment(),
+    }, [icon(ICONS.comment)]));
+  }
 
   // Hidden, and clicked by the button beside it: a bare file input cannot be
   // styled to match anything.
@@ -1424,7 +1887,7 @@ conn.on('waveState', (message) => {
   if (state.composer) {
     state.composer.root.focus();
   } else {
-    const empty = allBlips().find((b) => (b.content.ops || []).length === 0);
+    const empty = allBlips().find((b) => !b.comment && (b.content.ops || []).length === 0);
     if (empty) {
       const editor = state.editors.get(empty.id);
       if (editor) editor.root.focus();
@@ -1444,6 +1907,11 @@ conn.on('op', (message) => {
     if (node) renderDelta(node.querySelector('.editor'), doc.doc);
   }
   if (state.cursorLayer) state.cursorLayer.render();
+  // Someone else's edit moved the text, so it moved the anchors with it. Only
+  // the positions change here — rebuilding the cards would throw away a reply
+  // being typed just because a colleague was typing too.
+  markAnchors(allComments());
+  layoutComments();
 });
 
 conn.on('ack', (message) => {
@@ -1482,13 +1950,56 @@ conn.on('blipAdded', (message) => {
   // a message is *sent*, not created empty and filled in. There the caret
   // belongs in the composer, and pulling it into the message that just left
   // meant the next thing typed silently edited the message already sent.
-  if (message.blip.author === state.me.id && !state.composer) {
+  // A remark is excluded: the caret belongs in the reply box it was just sent
+  // from, and scrolling the page to a card in the margin moves the very text
+  // the comment is about out from under the person reading it.
+  if (message.blip.author === state.me.id && !state.composer && !message.blip.comment) {
     const editor = state.editors.get(message.blip.id);
     if (editor) {
       editor.root.focus();
       editor.root.scrollIntoView({ block: 'center', behavior: 'smooth' });
     }
   }
+});
+
+conn.on('commentAdded', (message) => {
+  if (message.waveId !== state.waveId || !state.wave) return;
+  const wavelet = state.wave.wavelets.find((w) => w.id === message.comment.waveletId);
+  if (!wavelet) return;
+  wavelet.comments = wavelet.comments || [];
+  if (!wavelet.comments.some((c) => c.id === message.comment.id)) {
+    wavelet.comments.push(message.comment);
+  }
+  if (!wavelet.blips.some((b) => b.id === message.blip.id)) wavelet.blips.push(message.blip);
+
+  const mine = message.comment.author === state.me.id;
+  if (mine) state.activeComment = message.comment.id;
+  renderComments();
+
+  // Our own thread opens with the caret in its first remark, which the server
+  // created empty and is waiting to be written. Someone else's just appears.
+  if (mine) {
+    const editor = state.editors.get(message.blip.id);
+    if (editor) editor.root.focus();
+  } else {
+    restoreCommentFocus();
+  }
+});
+
+conn.on('commentResolved', (message) => {
+  if (message.waveId !== state.waveId || !state.wave) return;
+  for (const wavelet of state.wave.wavelets) {
+    const thread = (wavelet.comments || []).find((c) => c.id === message.commentId);
+    if (!thread) continue;
+    thread.resolvedBy = message.resolvedBy;
+    thread.resolvedAt = message.resolvedAt;
+  }
+  // A settled thread leaves the margin, so there is nothing left to be active.
+  if (message.resolvedBy && state.activeComment === message.commentId) {
+    state.activeComment = null;
+    state.commentReplyFocused = false;
+  }
+  renderComments();
 });
 
 conn.on('blipRemoved', (message) => {
@@ -1695,6 +2206,8 @@ document.addEventListener('keydown', (event) => {
 
 window.addEventListener('resize', () => {
   if (state.cursorLayer) state.cursorLayer.render();
+  // Rewrapping the page moves every line, and the cards sit beside lines.
+  layoutComments();
 });
 
 // --- boot ---------------------------------------------------------------

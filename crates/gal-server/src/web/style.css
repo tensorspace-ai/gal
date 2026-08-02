@@ -1384,7 +1384,218 @@ textarea {
   }
 }
 
+/* --- comments ---
+   A comment is about a phrase, so it is drawn beside the phrase rather than
+   under the page. The highlight lives in the text and the card lives in the
+   margin; JS keeps the two level, because only the browser knows where a line
+   wrapped. */
+
+.commented {
+  background: color-mix(in srgb, #e5a83c 26%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, #e5a83c 70%, transparent);
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.commented:hover,
+.commented.active {
+  background: color-mix(in srgb, #e5a83c 46%, transparent);
+}
+
+/* A settled thread keeps its anchor — reopening restores it — but stops
+   colouring the page, which is the point of settling it. */
+.commented.resolved {
+  background: none;
+  border-bottom: 1px solid var(--border-strong);
+}
+
+/* A mark naming a thread this client does not have. It exists for the moment
+   between marking the text and the thread being confirmed; showing a highlight
+   that opens onto nothing would be worse than showing none. */
+.commented.orphan {
+  background: none;
+  border-bottom: none;
+  cursor: auto;
+}
+
+.comment-rail {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 260px;
+  z-index: 4;
+}
+
+.comment-toggle {
+  position: absolute;
+  top: -4px;
+  right: 2px;
+  font-size: 12px;
+}
+
+.comment-card {
+  position: absolute;
+  top: 0;
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
+  padding: 9px 11px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: top 160ms ease, border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.comment-card.active {
+  border-color: color-mix(in srgb, #e5a83c 65%, var(--border));
+  box-shadow: var(--shadow-2);
+  cursor: auto;
+}
+
+.comment-card.resolved {
+  opacity: 0.72;
+}
+
+.comment-card.detached {
+  border-style: dashed;
+}
+
+.comment-card.detached .comment-detached {
+  display: block;
+}
+
+.comment-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.comment-author {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.comment-time {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.comment-detached {
+  display: none;
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.comment-remark + .comment-remark {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border);
+}
+
+/* The first remark's byline repeats the card header, which already names the
+   person who started the thread. */
+.comment-remark:first-of-type .comment-remark-head {
+  display: none;
+}
+
+.comment-remark-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+.comment-text {
+  font-size: 13px;
+  line-height: 1.45;
+  min-height: 1.3em;
+}
+
+.comment-text:empty::before {
+  content: 'Say something…';
+}
+
+.comment-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 11.5px;
+}
+
+.comment-settled {
+  color: var(--text-faint);
+}
+
+.comment-compose {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border);
+}
+
+.comment-compose-input {
+  outline: none;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  min-height: 1.5em;
+  font-size: 13px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 5px 7px;
+  caret-color: var(--accent);
+}
+
+.comment-compose-input:empty::before {
+  content: 'Reply…';
+  color: var(--text-faint);
+  pointer-events: none;
+}
+
+.comment-send {
+  margin-top: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+/* Room for the margin, opened only when there is something to put in it. The
+   page stays centred in what is left. */
+.wave-pane.has-comments .thread-scroll {
+  padding-right: 300px;
+}
+
 /* --- narrow screens --- */
+
+/* Too narrow for a margin: the cards become a list under the page. The layout
+   pass reads `position` back and leaves the tops alone when it is static. */
+@media (max-width: 1100px) {
+  .wave-pane.has-comments .thread-scroll {
+    padding-right: 24px;
+  }
+
+  .comment-rail {
+    position: static;
+    width: auto;
+    max-width: 780px;
+    margin: 20px auto 0;
+    height: auto !important;
+  }
+
+  .comment-card {
+    position: static;
+    margin-bottom: 8px;
+  }
+
+  .comment-toggle {
+    position: static;
+    display: block;
+    margin-bottom: 6px;
+  }
+}
+
 
 @media (max-width: 860px) {
   .layout {

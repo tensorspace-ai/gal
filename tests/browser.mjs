@@ -471,6 +471,162 @@ try {
   check('notepad stays editable by everyone', await editable(mAlice, '.blip .editor'));
   check('notepad adds no new messages', !(await mAlice.isVisible('.thread-foot .btn')));
 
+  // --- comments ---------------------------------------------------------
+
+  section('Comments');
+  const cAlice = await signUp('note_alice', { width: 1400, height: 900 });
+  const cBob = await signUp('note_bob', { width: 1400, height: 900 });
+  await createWave(cAlice, 'Release notes');
+  await cAlice.click('.blip .editor');
+  await cAlice.keyboard.type('We ship on Friday and tell nobody.');
+  await cAlice.waitForTimeout(500);
+  await addParticipant(cAlice, 'note_bob');
+  await setMode(cAlice, 'notepad');
+  await cBob.waitForSelector('.inbox-row', { timeout: 15000 });
+  await cBob.click('.inbox-row:has-text("Release notes")');
+  await cBob.waitForSelector('.blip .editor', { timeout: 15000 });
+  await cBob.waitForTimeout(600);
+
+  check('a notepad offers the comment control', await cAlice.isVisible('.tool-comment'));
+
+  /// Select `word` inside the page editor, the way a person would.
+  const selectWord = async (page, word) =>
+    page.evaluate((needle) => {
+      const root = document.querySelector('.blip .editor');
+      const text = root.textContent;
+      const at = text.indexOf(needle);
+      if (at < 0) return false;
+      // Walk to the text node holding the match. The page is one run here.
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let seen = 0;
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (seen + node.data.length >= at + needle.length) {
+          const range = document.createRange();
+          range.setStart(node, at - seen);
+          range.setEnd(node, at - seen + needle.length);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          root.dispatchEvent(new Event('mouseup', { bubbles: true }));
+          return true;
+        }
+        seen += node.data.length;
+      }
+      return false;
+    }, word);
+
+  check('the phrase can be selected', await selectWord(cAlice, 'Friday'));
+  await cAlice.click('.tool-comment');
+  await cAlice.waitForSelector('.comment-card', { timeout: 10000 });
+  check('commenting marks the text', (await cAlice.locator('.commented').count()) === 1);
+  check('the marked text is the phrase that was selected',
+    (await cAlice.textContent('.commented')) === 'Friday');
+  check('and a card opens beside it', await cAlice.isVisible('.comment-card.active'));
+
+  await cAlice.keyboard.type('Friday is too soon.');
+  await cAlice.waitForTimeout(700);
+  check('the remark is typed into the card',
+    (await cAlice.textContent('.comment-card')).includes('Friday is too soon.'));
+
+  await cBob.waitForSelector('.comment-card', { timeout: 15000 });
+  await cBob.waitForTimeout(400);
+  check('the comment reaches the other participant live',
+    (await cBob.textContent('.comment-card')).includes('Friday is too soon.'));
+  check('and so does the highlight', (await cBob.locator('.commented').count()) === 1);
+
+  // The point of anchoring to the document rather than to an offset: Bob types
+  // in front of the commented phrase and the highlight goes with the words.
+  const cardTopBefore = await cAlice.evaluate(
+    () => document.querySelector('.comment-card').getBoundingClientRect().top,
+  );
+  await cBob.click('.blip .editor');
+  await cBob.keyboard.press('Home');
+  await cBob.keyboard.type('Reminder to everyone:\n\n');
+  await cBob.waitForTimeout(1200);
+  check('the highlight follows its words when text is inserted above',
+    (await cAlice.textContent('.commented')) === 'Friday');
+  check('and the card moves down with them',
+    (await cAlice.evaluate(
+      () => document.querySelector('.comment-card').getBoundingClientRect().top,
+    )) > cardTopBefore);
+
+  // Typing at the end of a commented word must not drag the new letters into
+  // somebody else's comment.
+  await cAlice.click('.commented');
+  await cAlice.waitForTimeout(300);
+  await cAlice.keyboard.press('End');
+  check('a comment does not spread into text typed after it',
+    (await cAlice.textContent('.commented')) === 'Friday');
+
+  await cBob.click('.comment-card');
+  await cBob.waitForTimeout(300);
+  await cBob.click('.comment-compose-input');
+  await cBob.keyboard.type('Agreed, move it.');
+  await cBob.keyboard.press('Enter');
+  await cBob.waitForTimeout(1000);
+  check('a reply joins the thread',
+    (await cAlice.locator('.comment-remark').count()) === 2);
+  check('the margin holds one card, not one per remark',
+    (await cAlice.locator('.comment-card').count()) === 1);
+
+  await cAlice.click('.comment-card .btn.link:has-text("Resolve")');
+  await cAlice.waitForTimeout(900);
+  check('resolving takes the card out of the margin',
+    (await cAlice.locator('.comment-card').count()) === 0);
+  check('and reaches the other participant',
+    (await cBob.locator('.comment-card').count()) === 0);
+  check('the highlight goes quiet but the text stays',
+    (await cAlice.textContent('.blip .editor')).includes('Friday'));
+  check('a resolved thread can be found again',
+    await cAlice.isVisible('.comment-toggle'));
+
+  await cAlice.click('.comment-toggle');
+  await cAlice.waitForTimeout(400);
+  check('showing resolved threads brings the whole thread back',
+    (await cAlice.locator('.comment-remark').count()) === 2);
+  await cAlice.click('.comment-card .btn.link:has-text("Reopen")');
+  await cAlice.waitForTimeout(900);
+  check('reopening restores it', (await cAlice.locator('.comment-card:not(.resolved)').count()) === 1);
+
+  // Deleting the words leaves the discussion of why they were wrong.
+  await cAlice.evaluate(() => {
+    const root = document.querySelector('.blip .editor');
+    const mark = root.querySelector('.commented');
+    const range = document.createRange();
+    range.selectNodeContents(mark);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+  await cAlice.keyboard.press('Backspace');
+  await cAlice.waitForTimeout(1000);
+  check('deleting the commented words removes the highlight',
+    (await cAlice.locator('.commented').count()) === 0);
+  check('but keeps the thread, marked as detached',
+    (await cAlice.locator('.comment-card.detached').count()) === 1);
+  check('and says so', (await cAlice.textContent('.comment-detached')).length > 0);
+
+  // A mode that takes no new comments still has to show, and settle, the ones
+  // already there — mode changes are reversible and destroy nothing.
+  await setMode(cAlice, 'document');
+  await cAlice.waitForTimeout(700);
+  check('leaving notepad keeps the threads on show',
+    (await cAlice.locator('.comment-card').count()) === 1);
+  check('but offers no way to start another', !(await cAlice.isVisible('.tool-comment')));
+  check('a thread can still be settled', await cAlice.isVisible('.btn.link:has-text("Resolve")'));
+
+  await setMode(cAlice, 'frozen');
+  await cAlice.waitForTimeout(700);
+  check('a frozen wave settles nothing', !(await cAlice.isVisible('.btn.link:has-text("Resolve")')));
+
+  await setMode(cAlice, 'notepad');
+  await cAlice.waitForTimeout(700);
+  const survived = await cAlice.textContent('.comment-rail');
+  check('a mode round trip loses no remark',
+    survived.includes('Friday is too soon.') && survived.includes('Agreed, move it.'),
+    survived.slice(0, 100));
+
   // --- attachments ------------------------------------------------------
 
   section('Attachments');
