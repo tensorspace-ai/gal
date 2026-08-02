@@ -46,6 +46,19 @@ jobs:
       - run: cargo build --release -p gal-server
       - run: node tests/browser.mjs
 
+  # Everything above runs in the dev profile. What ships is built with lto and
+  # codegen-units = 1, and nothing was checking that the optimised build behaves
+  # the same. Kept out of run-tests.sh so the local loop stays fast; CI has the
+  # time and runs it alongside the rest.
+  release:
+    name: the optimised build behaves the same
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release
+
   msrv:
     name: minimum supported Rust version
     runs-on: ubuntu-latest
@@ -53,7 +66,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.87.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      # --all-targets, so tests and examples are held to the MSRV too; plain
+      # `cargo check` covers neither, and both are part of the build.
+      - run: cargo check --workspace --all-targets --locked
 
   audit:
     name: dependency advisories

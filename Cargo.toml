@@ -25,4 +25,11 @@ tracing = "0.1"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Deliberately *not* `panic = "abort"`. This is a server holding many people's
+# live connections in one process, and the code is written to contain a failure
+# rather than escalate it: the connection task catches a panicking command, the
+# wave it touched is evicted and reloaded from storage, and the client
+# reconnects and resynchronises. Aborting turned a bug in one edit, in one wave,
+# into an outage for everyone on the box — and it silently made the JoinError
+# arms around the password-hashing and database pools unreachable, so that code
+# claimed to handle something it could never see.

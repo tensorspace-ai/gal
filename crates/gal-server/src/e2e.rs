@@ -27,6 +27,9 @@ struct TestServer {
     base: String,
     _dir: TempDir,
     handle: tokio::task::JoinHandle<()>,
+    /// The same state the router is serving from, so a test can reach in for
+    /// what is not expressible over the wire.
+    state: std::sync::Arc<AppState>,
 }
 
 impl Drop for TestServer {
@@ -46,7 +49,7 @@ async fn start_server() -> TestServer {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = crate::http::router(state);
+    let app = crate::http::router(state.clone());
 
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -56,6 +59,7 @@ async fn start_server() -> TestServer {
         base: format!("http://{addr}"),
         _dir: dir,
         handle,
+        state,
     }
 }
 
@@ -850,6 +854,60 @@ async fn removing_someone_from_a_wave_takes_their_private_replies_with_them() {
         "side channel",
         "the remaining participant lost the private reply"
     );
+}
+
+/// A panic used to abort the process, so one bad edit in one wave disconnected
+/// everybody on the server and lost whatever they had not yet sent. It is now
+/// contained to the connection that caused it.
+#[tokio::test]
+async fn a_panicking_command_takes_down_one_connection_and_no_more() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+
+    let (wave_id, _, root_blip) = create_wave(&mut alice, "Team", vec!["bob".into()]).await;
+    bob.open(&wave_id).await;
+
+    alice.edit(&root_blip, Delta::new().insert("before")).await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+
+    // Alice's next command panics partway through.
+    server
+        .state
+        .panic_next_command
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    alice.send(ClientMessage::Ping).await;
+
+    // The server is still serving: a brand new connection works, and the wave
+    // reloads from storage with the edit that was committed before the panic.
+    //
+    // Bob writes the follow-up rather than a second Alice connection. Op ids
+    // here are `{user}-{counter}` and each client counts from zero, so two
+    // connections for one user reissue each other's ids — the server correctly
+    // treats the second as the replay it is indistinguishable from, acks it,
+    // and applies nothing.
+    let mut bob2 = server.connect(&bob_cookie).await;
+    bob2.open(&wave_id).await;
+    assert_eq!(
+        bob2.text(&root_blip),
+        "before",
+        "the wave did not come back from storage after the panic"
+    );
+
+    // And the wave still works — the eviction did not leave a wreck behind.
+    bob2.edit(&root_blip, Delta::new().retain(6).insert(" and after"))
+        .await;
+    bob2.recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+
+    let mut alice2 = server.connect(&alice_cookie).await;
+    alice2.open(&wave_id).await;
+    assert_eq!(alice2.text(&root_blip), "before and after");
 }
 
 #[tokio::test]

@@ -300,6 +300,37 @@ pub enum ClientMessage {
     Ping,
 }
 
+impl ClientMessage {
+    /// The command's name on the wire, for logging, metrics and rate limiting.
+    ///
+    /// Deliberately not `Debug`: that would print the message's *contents*, and
+    /// these carry the text of private conversations.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Open { .. } => "open",
+            Self::Close { .. } => "close",
+            Self::CreateWave { .. } => "createWave",
+            Self::Submit { .. } => "submit",
+            Self::CreateBlip { .. } => "createBlip",
+            Self::DeleteBlip { .. } => "deleteBlip",
+            Self::SetTitle { .. } => "setTitle",
+            Self::SetMode { .. } => "setMode",
+            Self::AddParticipant { .. } => "addParticipant",
+            Self::RemoveParticipant { .. } => "removeParticipant",
+            Self::CreateComment { .. } => "createComment",
+            Self::ReplyToComment { .. } => "replyToComment",
+            Self::ResolveComment { .. } => "resolveComment",
+            Self::PrivateReply { .. } => "privateReply",
+            Self::Cursor { .. } => "cursor",
+            Self::MarkRead { .. } => "markRead",
+            Self::SetFlags { .. } => "setFlags",
+            Self::RequestPlayback { .. } => "requestPlayback",
+            Self::Search { .. } => "search",
+            Self::Ping => "ping",
+        }
+    }
+}
+
 // --- server to client ---------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -590,13 +621,48 @@ mod tests {
             ClientMessage::Search {
                 query: "launch".into(),
             },
+            ClientMessage::Submit {
+                blip_id: BlipId::from("b-1"),
+                revision: 3,
+                delta: Delta::new().retain(1).insert("x"),
+                op_id: Some("alice-1".into()),
+            },
+            ClientMessage::RemoveParticipant {
+                wavelet_id: WaveletId::from("s-1"),
+                user_id: UserId::from("u-1"),
+            },
+            ClientMessage::SetFlags {
+                wave_id: WaveId::from("w-1"),
+                flags: WaveFlags::default(),
+            },
+            ClientMessage::RequestPlayback {
+                wave_id: WaveId::from("w-1"),
+            },
             ClientMessage::Ping,
         ];
+        // Every variant must appear above, or the two assertions below only
+        // cover the ones somebody remembered.
+        let mut seen = std::collections::HashSet::new();
         for case in cases {
             let json = serde_json::to_string(&case).unwrap();
             let back: ClientMessage = serde_json::from_str(&json).unwrap();
             assert_eq!(json, serde_json::to_string(&back).unwrap());
+
+            // `name()` is what logs, metrics and rate limits are keyed on. If it
+            // drifts from the tag the client actually sends, every one of those
+            // silently starts describing the wrong command.
+            let tag = serde_json::from_str::<serde_json::Value>(&json).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(case.name(), tag, "name() disagrees with the wire tag");
+            seen.insert(tag);
         }
+        assert_eq!(
+            seen.len(),
+            20,
+            "a ClientMessage variant is missing from this test: {seen:?}"
+        );
     }
 
     #[test]

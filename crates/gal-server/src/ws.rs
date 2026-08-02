@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use gal_core::model::*;
 use gal_core::protocol::*;
 use gal_ot::{Delta, Insert, OpKind};
@@ -141,8 +141,41 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         let parsed: Result<ClientMessage, _> = serde_json::from_str(&text);
         match parsed {
             Ok(command) => {
-                if let Err(reply) = dispatch(&state, &mut session, command).await {
-                    let _ = session.tx.try_send(reply);
+                let name = command.name();
+                // A panic in here is a bug, and it used to take the whole
+                // process with it — `panic = "abort"` made one malformed edit
+                // in one wave an outage for every other connection on the box,
+                // which is also why the JoinError arms around the blocking pool
+                // were unreachable. Contain it to this connection instead.
+                let outcome = std::panic::AssertUnwindSafe(dispatch(&state, &mut session, command))
+                    .catch_unwind()
+                    .await;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(reply)) => {
+                        let _ = session.tx.try_send(reply);
+                    }
+                    Err(payload) => {
+                        tracing::error!(
+                            command = name,
+                            user = %session.user.id,
+                            conn = session.conn_id,
+                            panic = panic_message(&payload),
+                            "a command panicked; dropping the connection and its waves"
+                        );
+                        // The panic may have landed between mutating a resident
+                        // document and persisting the op, so the memory cannot
+                        // be trusted. Throw those waves away and let everyone
+                        // watching reload from storage.
+                        for wave_id in session.subscribed.clone() {
+                            state.evict_after_panic(&wave_id).await;
+                        }
+                        let _ = session.tx.try_send(ServerMessage::error(
+                            ErrorCode::Internal,
+                            "Something went wrong handling that. Reconnecting.",
+                        ));
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -162,12 +195,30 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
     writer.abort();
 }
 
+/// The human-readable half of a panic payload, which is a `&str` or a `String`
+/// for every panic raised by `panic!`, `unwrap` or an index out of bounds.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(non-string panic payload)")
+}
+
 /// Handle one client command. `Err` carries a message to send back.
 async fn dispatch(
     state: &Arc<AppState>,
     session: &mut Session,
     command: ClientMessage,
 ) -> Result<(), ServerMessage> {
+    #[cfg(test)]
+    if state
+        .panic_next_command
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        panic!("deliberate panic from a test");
+    }
+
     match command {
         ClientMessage::Ping => {
             let _ = session.tx.try_send(ServerMessage::Pong);

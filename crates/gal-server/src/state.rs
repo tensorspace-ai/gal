@@ -471,6 +471,12 @@ pub struct AppState {
     auth_limiter: RateLimiter,
     /// Username lookup, which is an existence oracle by nature.
     lookup_limiter: RateLimiter,
+    /// Makes the next dispatched command panic, so the containment around it can
+    /// be tested with a real panic on a real connection rather than by trusting
+    /// that it would work. There is no reachable panic to provoke on purpose,
+    /// and a bug that produced one would be fixed rather than kept as a fixture.
+    #[cfg(test)]
+    pub panic_next_command: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -488,6 +494,8 @@ impl AppState {
             // makes ten attempts a second.
             auth_limiter: RateLimiter::new(10.0, 0.5),
             lookup_limiter: RateLimiter::new(30.0, 2.0),
+            #[cfg(test)]
+            panic_next_command: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -646,6 +654,34 @@ impl AppState {
             live.evicted = true;
             self.waves.remove(wave_id);
         }
+    }
+
+    /// Drop a wave from memory after a command panicked partway through it,
+    /// disconnecting everyone watching so they reload from storage.
+    ///
+    /// A panic can land between mutating the resident document and writing the
+    /// op, which is the state `apply_op`'s rollback exists to prevent: leave the
+    /// wave resident and every later op transforms over one that exists nowhere
+    /// else. Storage is the authority, so the repair is to throw the memory away
+    /// and let it be read again.
+    ///
+    /// This is what aborting the process used to do, minus everyone else's
+    /// waves. Unlike `maybe_evict` it does not wait for the wave to be idle —
+    /// the subscribers are exactly who must not keep editing it — and it reuses
+    /// the same eviction tombstone, so a task already holding the `Arc` and
+    /// waiting on the lock observes the flag and reloads.
+    pub async fn evict_after_panic(&self, wave_id: &WaveId) {
+        let _guard = self.residency.lock().await;
+        let Some(entry) = self.waves.get(wave_id).map(|e| e.clone()) else {
+            return;
+        };
+        let mut live = entry.lock().await;
+        let watching: Vec<ConnId> = live.subscribers.keys().copied().collect();
+        // Closing the socket is what forces a resynchronisation, exactly as it
+        // does for a client whose outbound queue overflowed.
+        live.disconnect(&watching);
+        live.evicted = true;
+        self.waves.remove(wave_id);
     }
 
     /// Refresh the cached profile of a user in every resident wave, so a newly

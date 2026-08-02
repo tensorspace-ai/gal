@@ -59,6 +59,8 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    install_panic_logger();
+
     let config = Config::from_env()?;
 
     // `--healthcheck` probes an already-running instance and exits; it does not
@@ -96,6 +98,30 @@ async fn main() -> Result<()> {
     .await
     .context("server error")?;
     Ok(())
+}
+
+/// Send panics to `tracing` as well as to stderr.
+///
+/// A panic in a connection task is contained rather than fatal, and nothing
+/// joins that task, so without this the process carries on and the only record
+/// of the bug is a line on stderr in a different format from every other line —
+/// invisible to anything parsing the log. The default hook still runs, so a
+/// panic on the main thread reports exactly as it did before.
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(
+            location = %info.location().map(|l| l.to_string()).unwrap_or_default(),
+            thread = std::thread::current().name().unwrap_or("unnamed"),
+            "panic: {}",
+            info.payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("(non-string panic payload)"),
+        );
+        default_hook(info);
+    }));
 }
 
 /// Resolve on Ctrl-C or SIGTERM so container stops are clean.
