@@ -6,8 +6,39 @@
 // Anything structural — newlines, paste, formatting, remote ops — is applied to
 // the model and then re-rendered.
 
-import { Delta, diffText } from './ot.js';
+import { compose, Delta, diffText, invert, transform } from './ot.js';
 import { fileSize, icon, ICONS } from './ui.js';
+
+/** Steps of undo kept per message. */
+const MAX_UNDO = 100;
+
+/** Consecutive typing within this long is undone as one step. */
+const COALESCE_MS = 900;
+
+/**
+ * Rebase an undo or redo stack over somebody else's change.
+ *
+ * This is the reason undo cannot just be a list of inverse ops. Every entry was
+ * written against a document that has since moved: while it sat on the stack,
+ * other people were editing the same message, and applying it unchanged would
+ * delete or insert at offsets that now mean something else. Undo in a
+ * collaborative editor also has to be *local* — it must take back your last
+ * edit, not the last edit — which is the same requirement stated differently.
+ *
+ * The threading is what makes it right for entries deeper than the top one.
+ * Each is transformed over the remote change as it currently stands, and the
+ * remote change is then itself transformed over that entry before moving to the
+ * next, so every step is compared against the document it actually applied to.
+ * This is the algorithm Quill uses, for the same reason.
+ */
+function rebaseStack(stack, remote) {
+  let against = remote;
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    const entry = stack[i];
+    stack[i] = { ...entry, delta: transform(against, entry.delta, true) };
+    against = transform(entry.delta, against, false);
+  }
+}
 
 /** Attributes that map to a wrapping element, innermost first. */
 const INLINE_TAGS = [
@@ -444,6 +475,11 @@ export class Editor {
     this.composing = false;
     this.pendingFormat = null;
     this.destroyed = false;
+    /// Local edit history, as ops to apply rather than states to restore: a
+    /// state would overwrite whatever anyone else had written in the meantime.
+    this.history = { undo: [], redo: [] };
+    /// Set while an undo is being applied, so it is not recorded as a new edit.
+    this.replaying = false;
 
     this.root.contentEditable = readOnly ? 'false' : 'true';
     this.root.spellcheck = true;
@@ -527,9 +563,110 @@ export class Editor {
     }
   }
 
+  // --- history --------------------------------------------------------
+
+  /**
+   * Apply a local change: update the model, remember how to take it back, and
+   * hand it to the owner to send.
+   *
+   * Every local edit goes through here, which is the only way undo can be
+   * complete — a path that updated `doc` and called `onChange` directly would
+   * be an edit that cannot be undone, and the person doing it would find that
+   * out at the worst moment.
+   */
+  applyLocal(delta, { coalesce = false, selection = null } = {}) {
+    const before = this.doc;
+    this.doc = this.doc.apply(delta);
+    this.remember(delta, before, coalesce, selection);
+    this.onChange(delta);
+  }
+
+  remember(delta, before, coalesce, selection) {
+    if (this.replaying) return; // an undo is not itself a new thing to undo
+
+    const undo = invert(delta, before);
+    const now = Date.now();
+    const top = this.history.undo[this.history.undo.length - 1];
+
+    // Typing a word is one step, not one per keystroke. Composing in the *other
+    // order* than it reads: to take back op1 then op2, you undo op2 first.
+    if (coalesce && top && top.coalescing && now - top.at < COALESCE_MS) {
+      top.delta = compose(undo, top.delta);
+      top.at = now;
+    } else {
+      this.history.undo.push({ delta: undo, at: now, coalescing: coalesce, selection });
+      if (this.history.undo.length > MAX_UNDO) this.history.undo.shift();
+    }
+    // A fresh edit forks the timeline; there is no future to redo into.
+    this.history.redo.length = 0;
+  }
+
+  undo() {
+    return this.step('undo', 'redo');
+  }
+
+  redo() {
+    return this.step('redo', 'undo');
+  }
+
+  step(from, to) {
+    const entry = this.history[from].pop();
+    if (!entry) return false;
+
+    const before = this.doc;
+    // Derived here rather than stored, so the two directions cannot drift apart
+    // as the stacks are rebased over other people's edits.
+    const reverse = invert(entry.delta, before);
+    const selectionBefore = this.getSelection();
+
+    this.replaying = true;
+    try {
+      this.doc = before.apply(entry.delta);
+      this.onChange(entry.delta);
+    } finally {
+      this.replaying = false;
+    }
+
+    this.history[to].push({
+      delta: reverse,
+      at: Date.now(),
+      coalescing: false,
+      selection: selectionBefore,
+    });
+
+    renderDelta(this.root, this.doc);
+    // Back to where the edit was made. Undoing something off-screen and being
+    // left looking at where you happened to be is disorienting.
+    const target = entry.selection;
+    const length = this.doc.toPlainText().length;
+    if (target) {
+      this.setSelection(Math.min(target.index, length), 0);
+    }
+    this.reportSelection();
+    return true;
+  }
+
   // --- input ----------------------------------------------------------
 
   onKeyDown(event) {
+    // Undo and redo, before anything else looks at the key. The browser's own
+    // contenteditable history is worse than useless here: renderDelta replaces
+    // the DOM wholesale on every structural edit and on every remote op, so the
+    // native stack is repeatedly invalidated and would undo into states this
+    // document was never in.
+    const accel = event.metaKey || event.ctrlKey;
+    if (accel && (event.key === 'z' || event.key === 'Z')) {
+      event.preventDefault();
+      if (event.shiftKey) this.redo();
+      else this.undo();
+      return;
+    }
+    if (accel && (event.key === 'y' || event.key === 'Y')) {
+      event.preventDefault();
+      this.redo();
+      return;
+    }
+
     // Let the toolbar shortcuts through to the document handler.
     if (event.key === 'Enter' && !event.shiftKey && this.onEnter) {
       if (this.onEnter(event) === false) return;
@@ -546,6 +683,20 @@ export class Editor {
     if (event.inputType === 'insertParagraph' || event.inputType === 'insertLineBreak') {
       event.preventDefault();
       this.replaceSelection('\n');
+      return;
+    }
+    // Undo reached by a route that is not a keystroke — the Edit menu, a
+    // trackpad gesture, the Android keyboard. Refused and redirected, because
+    // the browser's own history is of a DOM that renderDelta has replaced
+    // wholesale more than once.
+    if (event.inputType === 'historyUndo') {
+      event.preventDefault();
+      this.undo();
+      return;
+    }
+    if (event.inputType === 'historyRedo') {
+      event.preventDefault();
+      this.redo();
     }
   }
 
@@ -651,8 +802,12 @@ export class Editor {
     }
     this.pendingFormat = null;
 
-    this.doc = this.doc.apply(delta.chop());
-    this.onChange(delta.chop());
+    // Typed runs coalesce; a deletion starts a fresh step, so backspacing does
+    // not get folded into the word it is removing.
+    this.applyLocal(delta.chop(), {
+      coalesce: removed === 0 && !inserted.includes('\n'),
+      selection: { index, length: 0 },
+    });
 
     // Plain characters land in the DOM correctly on their own. Anything that
     // changes structure or formatting needs a re-render to stay canonical.
@@ -683,8 +838,7 @@ export class Editor {
       .insert(text, attributes);
 
     this.pendingFormat = null;
-    this.doc = this.doc.apply(delta);
-    this.onChange(delta);
+    this.applyLocal(delta, { selection });
     renderDelta(this.root, this.doc);
     this.setSelection(selection.index + text.length);
     this.reportSelection();
@@ -710,8 +864,7 @@ export class Editor {
     const delta = new Delta().retain(index).delete(length).insert(value);
 
     this.pendingFormat = null;
-    this.doc = this.doc.apply(delta);
-    this.onChange(delta);
+    this.applyLocal(delta, { selection: { index, length } });
     renderDelta(this.root, this.doc);
     // An embed is one unit wide, whatever it draws.
     this.setSelection(index + 1);
@@ -733,8 +886,7 @@ export class Editor {
     }
 
     const delta = new Delta().retain(selection.index).retain(selection.length, { [name]: value });
-    this.doc = this.doc.apply(delta);
-    this.onChange(delta);
+    this.applyLocal(delta, { selection });
     renderDelta(this.root, this.doc);
     this.setSelection(selection.index, selection.length);
     this.reportSelection();
@@ -759,6 +911,12 @@ export class Editor {
     const selection = this.getSelection();
     const hadFocus = this.root.contains(document.activeElement) || document.activeElement === this.root;
 
+    // Every stored step was written against a document this change has just
+    // moved. Rebase them, or undo starts deleting whatever happens to sit at
+    // the offsets it remembers.
+    rebaseStack(this.history.undo, delta);
+    rebaseStack(this.history.redo, delta);
+
     this.doc = newDoc;
     renderDelta(this.root, this.doc);
 
@@ -775,6 +933,11 @@ export class Editor {
   reset(doc) {
     this.doc = doc;
     this.pendingFormat = null;
+    // The history described a document that is being thrown away. Keeping it
+    // would offer to undo edits against text that no longer exists, which is
+    // worse than offering nothing.
+    this.history.undo.length = 0;
+    this.history.redo.length = 0;
     renderDelta(this.root, this.doc);
   }
 }

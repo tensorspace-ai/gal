@@ -895,6 +895,64 @@ try {
   check('and it is the message that actually contains the word',
     (await gwen.textContent('.blip.revealed')).includes('pangolin'));
 
+  // --- undo ---------------------------------------------------------------
+
+  section('Undo');
+
+  const uma = await signUp('uma');
+  const uri = await signUp('uri');
+  await createWave(uma, 'Undoable');
+  await addParticipant(uma, 'uri');
+  await uma.click('.blip .editor');
+  await uma.keyboard.type('first sentence. ');
+  await uma.waitForTimeout(1100); // past the coalescing window
+  await uma.keyboard.type('second sentence.');
+  await uma.waitForTimeout(700);
+
+  const accel = process.platform === 'darwin' ? 'Meta' : 'Control';
+  await uma.keyboard.press(`${accel}+z`);
+  await uma.waitForTimeout(600);
+  check('undo takes back the last run of typing',
+    (await uma.textContent('.blip .editor')).trim() === 'first sentence.');
+  check('and not the one before it',
+    (await uma.textContent('.blip .editor')).includes('first'));
+
+  await uma.keyboard.press(`${accel}+Shift+z`);
+  await uma.waitForTimeout(600);
+  check('redo puts it back',
+    (await uma.textContent('.blip .editor')).includes('second sentence.'));
+
+  // The undo reached the server as an ordinary op, so the other participant
+  // sees it. A local-only undo would leave the two copies disagreeing.
+  await uri.waitForSelector('.inbox-row', { timeout: 15000 });
+  await uri.click('.inbox-row');
+  await uri.waitForSelector('.blip .editor', { timeout: 15000 });
+  await uri.waitForTimeout(900);
+  check('the other participant sees the same text',
+    (await uri.textContent('.blip .editor')).includes('second sentence.'));
+
+  // The part that is easy to get wrong: somebody else edits, and the stored
+  // undo now refers to offsets that have moved.
+  await uri.click('.blip .editor');
+  await uri.keyboard.press('Home');
+  await uri.keyboard.type('URI WROTE THIS. ');
+  await uri.waitForTimeout(1200);
+  await uma.waitForTimeout(600);
+  check('the remote insert arrives', (await uma.textContent('.blip .editor')).includes('URI WROTE'));
+
+  await uma.click('.blip .editor');
+  await uma.keyboard.press(`${accel}+z`);
+  await uma.waitForTimeout(900);
+  const afterUndo = (await uma.textContent('.blip .editor')).trim();
+  check('undo after a remote edit still removes your own text',
+    !afterUndo.includes('second sentence.'), afterUndo);
+  check('and leaves the other person\'s text alone',
+    afterUndo.includes('URI WROTE THIS.'), afterUndo);
+  check('and the two clients still agree', await (async () => {
+    await uri.waitForTimeout(900);
+    return (await uri.textContent('.blip .editor')).trim() === afterUndo;
+  })());
+
   // --- keyboard and focus ------------------------------------------------
 
   section('Reachable without a mouse');

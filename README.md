@@ -238,6 +238,13 @@ upgrading.
   Frame 102 of 291 for the wave above. The first message stops mid-word, and the
   replies that had not been written yet are empty — this is the op log replayed,
   so the granularity is a keystroke, not a save.
+- **Undo that knows other people exist.** ⌘Z / Ctrl-Z takes back *your* last
+  edit, not the last edit — and it keeps working after somebody else has
+  written in the same message. The stack holds operations rather than saved
+  states, because restoring a state would silently overwrite whatever anyone
+  else had typed meanwhile; each stored step is rebased over every change that
+  arrives, so it still means what it meant when you made it. A run of typing
+  undoes as one step.
 - **Presence and remote cursors.** See who is in a wave and where their caret is.
 - **Rich text** — bold, italic, underline, strikethrough, code, links — carried
   as attributes on the document, so formatting transforms correctly against
