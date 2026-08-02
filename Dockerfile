@@ -1,6 +1,6 @@
 # Build a static-ish single binary. SQLite is compiled from source by
 # libsqlite3-sys, so the builder needs a C toolchain; the runtime image does not.
-FROM rust:1.87-bookworm AS build
+FROM rust:1.97-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
