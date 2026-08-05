@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-05
+
 ### Security
 
 - **The CSP no longer permits a socket to anywhere.** `connect-src` read
@@ -181,8 +183,6 @@ rather than stored, as unknown message fields already are.
 This is invisible to the shipped client, which sends only the formatting it has
 always sent. A third-party client that invented its own attributes will now be
 refused by name.
-
-## [0.2.0] — 2026-08-02
 
 ### Changed — a field the server does not define is now refused
 
