@@ -481,6 +481,10 @@ fn account_key(name: &str) -> String {
 pub struct AppState {
     pub db: Storage,
     pub config: Config,
+    /// The external identity provider, when one is configured. `None` leaves
+    /// the OIDC routes answering 404, so an unconfigured server carries no
+    /// extra surface rather than a disabled one.
+    pub oidc: Option<crate::oidc::Oidc>,
     pub metrics: Arc<crate::metrics::Metrics>,
     waves: DashMap<WaveId, Arc<Mutex<LiveWave>>>,
     conns: DashMap<ConnId, ConnHandle>,
@@ -521,9 +525,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Storage, config: Config) -> Arc<Self> {
+        let oidc = config.oidc.clone().map(crate::oidc::Oidc::new);
         Arc::new(AppState {
             db,
             config,
+            oidc,
             metrics: Arc::new(crate::metrics::Metrics::default()),
             waves: DashMap::new(),
             conns: DashMap::new(),

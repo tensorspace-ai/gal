@@ -32,9 +32,19 @@ anyone auditing the binary knows it is present.
 
 - sync_wrapper 1.0.2
 
+### Apache-2.0 AND ISC
+
+- ring 0.17.14
+
 ### Apache-2.0 OR BSL-1.0
 
 - ryu 1.0.23
+
+### Apache-2.0 OR ISC OR MIT
+
+- hyper-rustls 0.27.9
+- rustls 0.23.43
+- rustls-native-certs 0.8.4
 
 ### Apache-2.0 OR MIT
 
@@ -43,8 +53,10 @@ anyone auditing the binary knows it is present.
 - fastrand 2.5.0
 - idna_adapter 1.2.2
 - pin-project-lite 0.2.17
+- rustc-hash 2.1.3
 - utf8_iter 1.0.4
 - uuid 1.24.0
+- zeroize 1.9.0
 
 ### Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 
@@ -63,11 +75,17 @@ anyone auditing the binary knows it is present.
 
 - subtle 2.6.1
 
+### ISC
+
+- rustls-webpki 0.103.13
+- untrusted 0.9.0
+
 ### MIT
 
 - axum 0.8.9
 - axum-core 0.5.6
 - bytes 1.12.1
+- cfg_aliases 0.2.2
 - dashmap 6.2.1
 - data-encoding 2.11.0
 - generic-array 0.14.7
@@ -82,6 +100,7 @@ anyone auditing the binary knows it is present.
 - r2d2_sqlite 0.25.0
 - redox_syscall 0.5.18
 - rusqlite 0.32.1
+- schannel 0.1.29
 - sharded-slab 0.1.7
 - simd-adler32 0.3.10
 - slab 0.4.12
@@ -98,6 +117,7 @@ anyone auditing the binary knows it is present.
 - tracing-attributes 0.1.31
 - tracing-core 0.1.36
 - tracing-log 0.2.0
+- tracing-serde 0.2.0
 - tracing-subscriber 0.3.23
 - try-lock 0.2.5
 - valuable 0.1.1
@@ -124,6 +144,8 @@ anyone auditing the binary knows it is present.
 - chacha20 0.10.1
 - compression-codecs 0.4.38
 - compression-core 0.4.32
+- core-foundation 0.10.1
+- core-foundation-sys 0.8.7
 - cpufeatures 0.2.17
 - cpufeatures 0.3.0
 - crc32fast 1.5.0
@@ -162,6 +184,7 @@ anyone auditing the binary knows it is present.
 - log 0.4.33
 - mime 0.3.17
 - once_cell 1.21.4
+- openssl-probe 0.2.1
 - parking_lot 0.12.5
 - parking_lot_core 0.9.12
 - password-hash 0.5.0
@@ -169,6 +192,9 @@ anyone auditing the binary knows it is present.
 - pkg-config 0.3.33
 - ppv-lite86 0.2.21
 - proc-macro2 1.0.107
+- quinn 0.11.11
+- quinn-proto 0.11.16
+- quinn-udp 0.5.15
 - quote 1.0.47
 - rand 0.10.2
 - rand 0.8.7
@@ -178,11 +204,15 @@ anyone auditing the binary knows it is present.
 - rand_core 0.10.1
 - rand_core 0.6.4
 - rand_core 0.9.5
+- rand_pcg 0.10.2
 - regex-automata 0.4.16
 - regex-syntax 0.8.11
 - reqwest 0.12.28
+- rustls-pki-types 1.15.1
 - rustversion 1.0.23
 - scopeguard 1.2.0
+- security-framework 3.7.0
+- security-framework-sys 2.17.0
 - serde 1.0.229
 - serde_core 1.0.229
 - serde_derive 1.0.229
@@ -201,6 +231,7 @@ anyone auditing the binary knows it is present.
 - thiserror 2.0.19
 - thiserror-impl 2.0.19
 - thread_local 1.1.10
+- tokio-rustls 0.26.4
 - tungstenite 0.29.0
 - typenum 1.20.1
 - url 2.5.8
@@ -210,13 +241,29 @@ anyone auditing the binary knows it is present.
 - wasm-bindgen-macro-support 0.2.126
 - wasm-bindgen-shared 0.2.126
 - web-sys 0.3.103
+- web-time 1.1.0
 - windows-link 0.2.1
+- windows-sys 0.52.0
 - windows-sys 0.61.2
+- windows-targets 0.52.6
+- windows_aarch64_gnullvm 0.52.6
+- windows_aarch64_msvc 0.52.6
+- windows_i686_gnu 0.52.6
+- windows_i686_gnullvm 0.52.6
+- windows_i686_msvc 0.52.6
+- windows_x86_64_gnu 0.52.6
+- windows_x86_64_gnullvm 0.52.6
+- windows_x86_64_msvc 0.52.6
 
 ### MIT OR Apache-2.0 OR LGPL-2.1-or-later
 
 - r-efi 5.3.0
 - r-efi 6.0.0
+
+### MIT OR Apache-2.0 OR Zlib
+
+- lru-slab 0.1.2
+- tinyvec_macros 0.1.1
 
 ### MIT OR Zlib OR Apache-2.0
 
@@ -258,6 +305,10 @@ anyone auditing the binary knows it is present.
 - aho-corasick 1.1.4
 - memchr 2.8.3
 
+### Zlib OR Apache-2.0 OR MIT
+
+- tinyvec 1.12.0
+
 ## Notices required for binary distribution
 
 - **Apache-2.0 components** (notably `sync_wrapper`, which has no MIT
@@ -267,6 +318,9 @@ anyone auditing the binary knows it is present.
   copyright notice and disclaimer to be reproduced in binary distributions.
 - **Unicode-3.0 components** (`unicode-ident` and the `icu_*` crates) require
   their license text to accompany redistribution.
+- **ISC components** require their copyright notice to be reproduced. Note that
+  `ring` is `Apache-2.0 AND ISC` — a conjunction, not a choice, so both apply.
+  These arrived with the TLS stack that the OpenID Connect client needs.
 
 Full license texts are available in each crate's source, and in the Cargo
 registry cache under `~/.cargo/registry/src/`.

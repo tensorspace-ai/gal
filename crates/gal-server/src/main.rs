@@ -8,6 +8,7 @@ mod e2e;
 mod http;
 mod limit;
 mod metrics;
+mod oidc;
 mod state;
 mod ws;
 

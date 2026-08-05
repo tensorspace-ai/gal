@@ -88,7 +88,7 @@ struct ApiError {
     error: String,
 }
 
-fn bad_request(message: impl Into<String>) -> Response {
+pub(crate) fn bad_request(message: impl Into<String>) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(ApiError {
@@ -98,7 +98,7 @@ fn bad_request(message: impl Into<String>) -> Response {
         .into_response()
 }
 
-fn not_found(message: impl Into<String>) -> Response {
+pub(crate) fn not_found(message: impl Into<String>) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(ApiError {
@@ -118,7 +118,7 @@ fn payload_too_large() -> Response {
         .into_response()
 }
 
-fn server_error(e: anyhow::Error) -> Response {
+pub(crate) fn server_error(e: anyhow::Error) -> Response {
     tracing::error!(error = %e, "request failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -641,6 +641,10 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     Json(serde_json::json!({
         "openRegistration": state.config.open_registration,
         "version": env!("CARGO_PKG_VERSION"),
+        // `null` when no provider is configured, which is the only thing that
+        // decides whether the sign-in button is drawn. The client is never told
+        // the issuer or the client id.
+        "oidc": crate::oidc::provider_info(&state),
     }))
     .into_response()
 }
@@ -865,6 +869,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(session_info))
         .route("/api/sessions/revoke", post(sign_out_everywhere))
         .route("/api/me", get(me))
+        .route("/api/oauth/start", get(crate::oidc::start))
+        .route("/api/oauth/callback", get(crate::oidc::callback))
         .route("/api/users", get(users))
         .route("/api/lookup", get(lookup))
         .route("/api/server", get(server_info))

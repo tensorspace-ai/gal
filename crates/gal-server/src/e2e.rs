@@ -3438,3 +3438,578 @@ async fn an_attribute_the_document_model_does_not_define_is_refused_by_name() {
         .await;
     assert_eq!(fresh.text(&blip_id), "hello");
 }
+
+// --- signing in through an identity provider -----------------------------
+//
+// A real provider is stood up on a loopback port rather than mocked behind a
+// trait. The failures worth catching in this flow are about what actually
+// crosses the wire — the client authentication on the token request, the PKCE
+// verifier, the shape of the discovery document — and a mock built from our own
+// assumptions would agree with those assumptions. The server reaches it over
+// plain HTTP because it is loopback, which is the exception `config` makes.
+
+/// What the fake provider was asked for, so a test can assert on the request
+/// and not only on the outcome.
+#[derive(Default)]
+struct ProviderSeen {
+    token_form: Vec<(String, String)>,
+    token_auth: Option<String>,
+    userinfo_bearer: Option<String>,
+}
+
+#[derive(Clone)]
+struct FakeProvider {
+    base: String,
+    /// Overrides the issuer the discovery document claims. Defaults to `base`.
+    issuer_claim: Option<String>,
+    sub: String,
+    preferred_username: Option<String>,
+    name: Option<String>,
+    seen: std::sync::Arc<std::sync::Mutex<ProviderSeen>>,
+}
+
+impl FakeProvider {
+    async fn start() -> FakeProvider {
+        FakeProvider::start_with(|_| {}).await
+    }
+
+    async fn start_with(adjust: impl FnOnce(&mut FakeProvider)) -> FakeProvider {
+        use axum::routing::{get, post};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut provider = FakeProvider {
+            base: format!("http://127.0.0.1:{}", addr.port()),
+            issuer_claim: None,
+            sub: "provider-subject-1".to_string(),
+            preferred_username: Some("alice".to_string()),
+            name: Some("Alice Example".to_string()),
+            seen: std::sync::Arc::new(std::sync::Mutex::new(ProviderSeen::default())),
+        };
+        adjust(&mut provider);
+
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(
+                    |axum::extract::State(p): axum::extract::State<FakeProvider>| async move {
+                        let b = &p.base;
+                        axum::Json(serde_json::json!({
+                            "issuer": p.issuer_claim.clone().unwrap_or_else(|| b.clone()),
+                            "authorization_endpoint": format!("{b}/authorize"),
+                            "token_endpoint": format!("{b}/token"),
+                            "userinfo_endpoint": format!("{b}/userinfo"),
+                        }))
+                    },
+                ),
+            )
+            .route("/token", post(fake_token))
+            .route("/userinfo", get(fake_userinfo))
+            .with_state(provider.clone());
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        provider
+    }
+}
+
+async fn fake_token(
+    axum::extract::State(provider): axum::extract::State<FakeProvider>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let form: Vec<(String, String)> = body
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .map(|(k, v)| (percent_decode(k), percent_decode(v)))
+        .collect();
+    {
+        let mut seen = provider.seen.lock().unwrap();
+        seen.token_form = form.clone();
+        seen.token_auth = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+    }
+
+    let code = form
+        .iter()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.as_str());
+    if code != Some("the-code") {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": "invalid_grant" })),
+        )
+            .into_response();
+    }
+    axum::Json(serde_json::json!({
+        "access_token": "the-access-token",
+        "token_type": "bearer",
+        // Present and deliberately unparseable. Nothing reads it, and a test
+        // that passed only because this was a well-formed JWT would be
+        // testing the wrong thing.
+        "id_token": "not.a.jwt",
+    }))
+    .into_response()
+}
+
+async fn fake_userinfo(
+    axum::extract::State(provider): axum::extract::State<FakeProvider>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+    provider.seen.lock().unwrap().userinfo_bearer = bearer.clone();
+    if bearer.as_deref() != Some("the-access-token") {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut claims = serde_json::json!({ "sub": provider.sub });
+    if let Some(u) = &provider.preferred_username {
+        claims["preferred_username"] = serde_json::json!(u);
+    }
+    if let Some(n) = &provider.name {
+        claims["name"] = serde_json::json!(n);
+    }
+    axum::Json(claims).into_response()
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                match u8::from_str_radix(
+                    std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                    16,
+                ) {
+                    Ok(v) => {
+                        out.push(v);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// A client that does not chase redirects, so a test can read the `Location`
+/// and the cookies off the hop itself.
+fn no_redirects() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+/// Start a Gal server pointed at `provider`.
+async fn server_with_provider(provider: &FakeProvider) -> TestServer {
+    let issuer = provider.base.clone();
+    start_server_with(move |config| {
+        config.oidc = Some(crate::config::OidcConfig {
+            issuer,
+            client_id: "the-client".to_string(),
+            client_secret: "the-secret".to_string(),
+            redirect_url: "http://127.0.0.1:8080/api/oauth/callback".to_string(),
+            scopes: "openid profile".to_string(),
+            label: "Example".to_string(),
+        });
+    })
+    .await
+}
+
+/// The `name=value` pair of a `Set-Cookie` that actually sets something. A
+/// cleared cookie has an empty value and is not a credential.
+fn cookie_named(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|v| {
+            let pair = v.split(';').next()?;
+            let (key, value) = pair.split_once('=')?;
+            (key == name && !value.is_empty()).then(|| pair.to_string())
+        })
+}
+
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let (_, query) = url.split_once('?')?;
+    query.split('&').find_map(|p| {
+        let (k, v) = p.split_once('=')?;
+        (k == key).then(|| percent_decode(v))
+    })
+}
+
+impl TestServer {
+    /// Walk the flow the way a browser would: start, then come back to the
+    /// callback with a code. Returns the callback's response.
+    async fn sign_in_with_provider(&self, code: &str) -> reqwest::Response {
+        let http = no_redirects();
+        let started = http
+            .get(format!("{}/api/oauth/start", self.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            started.status(),
+            303,
+            "start should redirect to the provider"
+        );
+        let location = started
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let state = query_param(&location, "state").expect("no state in the authorize URL");
+        let flow = cookie_named(&started, "gal_oauth").expect("no flow cookie set");
+
+        http.get(format!(
+            "{}/api/oauth/callback?code={code}&state={state}",
+            self.base
+        ))
+        .header("cookie", flow)
+        .send()
+        .await
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_first_provider_sign_in_creates_an_account_and_a_working_session() {
+    let provider = FakeProvider::start().await;
+    let server = server_with_provider(&provider).await;
+
+    let done = server.sign_in_with_provider("the-code").await;
+    assert_eq!(done.status(), 303, "the callback sends the browser back");
+    assert_eq!(done.headers().get("location").unwrap(), "/");
+
+    let session = cookie_named(&done, "gal_session").expect("no session cookie issued");
+    // The flow cookie is cleared on the way out, so it cannot be replayed.
+    assert!(
+        cookie_named(&done, "gal_oauth").is_none(),
+        "the flow cookie should be spent"
+    );
+
+    // The cookie on its own is a working credential — the client is handed no
+    // token, exactly as with a password sign-in.
+    let http = reqwest::Client::new();
+    let me = http
+        .get(format!("{}/api/me", server.base))
+        .header("cookie", &session)
+        .send()
+        .await
+        .unwrap();
+    assert!(me.status().is_success());
+    let body: serde_json::Value = me.json().await.unwrap();
+    assert_eq!(
+        body["user"]["name"], "alice",
+        "the name comes from preferred_username: {body}"
+    );
+    assert_eq!(body["user"]["displayName"], "Alice Example");
+}
+
+#[tokio::test]
+async fn the_token_request_authenticates_the_client_and_carries_the_verifier() {
+    let provider = FakeProvider::start().await;
+    let server = server_with_provider(&provider).await;
+    server.sign_in_with_provider("the-code").await;
+
+    let seen = provider.seen.lock().unwrap();
+    let field = |k: &str| {
+        seen.token_form
+            .iter()
+            .find(|(f, _)| f == k)
+            .map(|(_, v)| v.clone())
+    };
+
+    assert_eq!(field("grant_type").as_deref(), Some("authorization_code"));
+    assert_eq!(field("code").as_deref(), Some("the-code"));
+    assert_eq!(
+        field("redirect_uri").as_deref(),
+        Some("http://127.0.0.1:8080/api/oauth/callback"),
+        "the redirect URI has to be repeated exactly or a conforming provider refuses"
+    );
+    let verifier = field("code_verifier").expect("no PKCE verifier sent");
+    assert!(
+        verifier.len() >= 43,
+        "expected 256 bits of verifier, got {verifier:?}"
+    );
+
+    // client_secret_basic, and the secret never rides in the body.
+    let auth = seen.token_auth.clone().expect("no client authentication");
+    assert!(auth.starts_with("Basic "), "got {auth:?}");
+    assert!(
+        !seen.token_form.iter().any(|(k, _)| k == "client_secret"),
+        "the secret should authenticate the request, not travel as a form field"
+    );
+    assert_eq!(seen.userinfo_bearer.as_deref(), Some("the-access-token"));
+}
+
+#[tokio::test]
+async fn the_same_subject_comes_back_to_the_same_account() {
+    let provider = FakeProvider::start().await;
+    let server = server_with_provider(&provider).await;
+
+    let first = server.sign_in_with_provider("the-code").await;
+    let first_session = cookie_named(&first, "gal_session").unwrap();
+    let second = server.sign_in_with_provider("the-code").await;
+    let second_session = cookie_named(&second, "gal_session").unwrap();
+    assert_ne!(
+        first_session, second_session,
+        "a distinct session each time"
+    );
+
+    assert_eq!(
+        server.state.db.user_count().await.unwrap(),
+        1,
+        "a second sign-in must not create a second account"
+    );
+}
+
+#[tokio::test]
+async fn a_callback_that_did_not_start_here_is_refused() {
+    let provider = FakeProvider::start().await;
+    let server = server_with_provider(&provider).await;
+    let http = no_redirects();
+
+    // No flow cookie at all: somebody pasted a callback URL.
+    let bare = http
+        .get(format!(
+            "{}/api/oauth/callback?code=the-code&state=anything",
+            server.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 400);
+    assert!(cookie_named(&bare, "gal_session").is_none());
+
+    // A real flow, but a state that is not the one this browser was given —
+    // which is what feeding somebody else's authorization code looks like.
+    let started = http
+        .get(format!("{}/api/oauth/start", server.base))
+        .send()
+        .await
+        .unwrap();
+    let flow = cookie_named(&started, "gal_oauth").unwrap();
+    let forged = http
+        .get(format!(
+            "{}/api/oauth/callback?code=the-code&state=not-the-state",
+            server.base
+        ))
+        .header("cookie", flow)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), 400, "a mismatched state signs nobody in");
+    assert!(cookie_named(&forged, "gal_session").is_none());
+    assert_eq!(server.state.db.user_count().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_callback_cannot_be_replayed() {
+    let provider = FakeProvider::start().await;
+    let server = server_with_provider(&provider).await;
+    let http = no_redirects();
+
+    let started = http
+        .get(format!("{}/api/oauth/start", server.base))
+        .send()
+        .await
+        .unwrap();
+    let location = started
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let state = query_param(&location, "state").unwrap();
+    let flow = cookie_named(&started, "gal_oauth").unwrap();
+    let url = format!(
+        "{}/api/oauth/callback?code=the-code&state={state}",
+        server.base
+    );
+
+    let first = http.get(&url).header("cookie", &flow).send().await.unwrap();
+    assert_eq!(first.status(), 303);
+
+    // The same URL and cookie again. The flow was consumed, so there is
+    // nothing left to match.
+    let again = http.get(&url).header("cookie", &flow).send().await.unwrap();
+    assert_eq!(again.status(), 400);
+    assert!(cookie_named(&again, "gal_session").is_none());
+}
+
+#[tokio::test]
+async fn a_provider_that_refuses_sends_the_browser_home_without_a_session() {
+    let provider = FakeProvider::start().await;
+    let server = server_with_provider(&provider).await;
+    let http = no_redirects();
+
+    let started = http
+        .get(format!("{}/api/oauth/start", server.base))
+        .send()
+        .await
+        .unwrap();
+    let flow = cookie_named(&started, "gal_oauth").unwrap();
+    // What a provider sends when somebody presses cancel.
+    let denied = http
+        .get(format!(
+            "{}/api/oauth/callback?error=access_denied&error_description=nope",
+            server.base
+        ))
+        .header("cookie", flow)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(denied.status(), 303);
+    assert!(
+        cookie_named(&denied, "gal_session").is_none(),
+        "a refusal must not issue a session"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_code_fails_without_repeating_the_provider_s_complaint() {
+    let provider = FakeProvider::start().await;
+    let server = server_with_provider(&provider).await;
+
+    let response = server.sign_in_with_provider("wrong-code").await;
+    assert_eq!(response.status(), 500);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["error"], "Something went wrong.",
+        "the token endpoint's answer is logged, not forwarded: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_discovery_document_naming_another_issuer_is_refused() {
+    // The issuer is half the primary key of every identity row. If the document
+    // disagrees with what was configured, the two would file one subject under
+    // two keys.
+    let provider =
+        FakeProvider::start_with(|p| p.issuer_claim = Some("https://somewhere.else".to_string()))
+            .await;
+    let server = server_with_provider(&provider).await;
+
+    let started = no_redirects()
+        .get(format!("{}/api/oauth/start", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 500);
+    assert!(cookie_named(&started, "gal_oauth").is_none());
+}
+
+#[tokio::test]
+async fn a_provider_name_that_is_not_a_username_still_yields_an_account() {
+    let provider = FakeProvider::start_with(|p| {
+        p.preferred_username = Some("Ünüsable ✨".to_string());
+        p.name = None;
+    })
+    .await;
+    let server = server_with_provider(&provider).await;
+
+    let done = server.sign_in_with_provider("the-code").await;
+    assert_eq!(done.status(), 303);
+    let session = cookie_named(&done, "gal_session").unwrap();
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/me", server.base))
+        .header("cookie", session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["user"]["name"], "nsable",
+        "what survives the character class, rather than a refusal: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_name_already_taken_is_numbered() {
+    let provider = FakeProvider::start().await;
+    let server = server_with_provider(&provider).await;
+    // Somebody already registered `alice` with a password.
+    server.register("alice").await;
+
+    let done = server.sign_in_with_provider("the-code").await;
+    let session = cookie_named(&done, "gal_session").unwrap();
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/me", server.base))
+        .header("cookie", session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["user"]["name"], "alice2");
+}
+
+#[tokio::test]
+async fn the_login_screen_is_told_whether_a_provider_exists() {
+    let provider = FakeProvider::start().await;
+    let server = server_with_provider(&provider).await;
+    let info: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/server", server.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["oidc"]["label"], "Example");
+
+    // With nothing configured the routes are absent rather than disabled, and
+    // the client has nothing to draw.
+    let plain = start_server().await;
+    let info: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/server", plain.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(info["oidc"].is_null(), "{info}");
+
+    let started = reqwest::Client::new()
+        .get(format!("{}/api/oauth/start", plain.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 404);
+}

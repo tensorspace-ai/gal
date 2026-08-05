@@ -39,7 +39,7 @@ pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// table, so without this a new column would simply never be added: the server
 /// would start cleanly, then fail at query time in ways that look like data loss
 /// to the user.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The version `schema.sql` describes.
 ///
@@ -127,6 +127,81 @@ impl Storage {
         })
         .await?;
         Ok(user)
+    }
+
+    /// Resolve an external identity to an account, creating one the first time
+    /// that identity is seen.
+    ///
+    /// The lookup, the name deconfliction and both inserts share one immediate
+    /// transaction. Two tabs finishing a first sign-in at the same moment would
+    /// otherwise both find no identity, both create an account, and the loser
+    /// would meet the primary key with its user row already written.
+    ///
+    /// `name_hint` must already satisfy the account-name rules — see
+    /// [`crate::auth::name_from_external`]. This only makes it unique.
+    pub async fn user_for_oauth_identity(
+        &self,
+        issuer: String,
+        subject: String,
+        name_hint: String,
+        display_name: String,
+    ) -> Result<OauthLogin> {
+        self.run(move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+            let existing = tx
+                .query_row(
+                    "SELECT u.* FROM oauth_identities i JOIN users u ON u.id = i.user_id
+                     WHERE i.issuer = ?1 AND i.subject = ?2",
+                    params![issuer, subject],
+                    row_to_user,
+                )
+                .optional()?;
+            if let Some(user) = existing {
+                return Ok(OauthLogin::Existing(user));
+            }
+
+            let name = free_name(&tx, &name_hint)?;
+            let user = User {
+                id: UserId::new(),
+                color: color_for(&name),
+                name,
+                display_name,
+                // Registration stopped populating this long ago, and an OIDC
+                // login is not the place to start: an address that is never
+                // read is an address that cannot leak, and matching on one is
+                // exactly what this feature refuses to do.
+                email: String::new(),
+                // A value no Argon2 hash can equal, so `verify_password` fails
+                // against it for every input. An account that arrived through a
+                // provider has no local password by construction rather than
+                // because some check remembers to say so.
+                password_hash: "!".to_string(),
+                created_at: now(),
+            };
+
+            tx.execute(
+                "INSERT INTO users (id, name, display_name, email, password_hash, color, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    user.id.as_str(),
+                    user.name,
+                    user.display_name,
+                    user.email,
+                    user.password_hash,
+                    user.color,
+                    user.created_at
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO oauth_identities (issuer, subject, user_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![issuer, subject, user.id.as_str(), user.created_at],
+            )?;
+            tx.commit()?;
+            Ok(OauthLogin::Created(user))
+        })
+        .await
     }
 
     pub async fn user_by_name(&self, name: &str) -> Result<Option<User>> {
@@ -1518,6 +1593,42 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tracing::debug!("migrated database schema to v5");
     }
 
+    if version == 5 {
+        let tx = conn.transaction()?;
+        // Accounts reachable through an external OpenID Connect provider.
+        //
+        // Keyed on (issuer, subject), never on an email address. The subject is
+        // the one claim OIDC promises is stable and unique within an issuer; an
+        // address is neither, and a provider that lets someone set an unverified
+        // one — or releases an address and later reassigns it — would otherwise
+        // be a route into an existing account. There is deliberately no email
+        // column here to match on, rather than a rule saying not to. `users`
+        // has one, unread since registration stopped populating it, and this is
+        // not the feature that revives it.
+        //
+        // The issuer is half the key because subjects are only unique within
+        // one. Numbering that starts at 1 is common enough that a collision
+        // between two providers is a question of when.
+        //
+        // No provider tokens are stored. The access token is spent once during
+        // the callback to read the subject, and then dropped; what remains is
+        // an ordinary session row.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS oauth_identities (
+                 issuer     TEXT NOT NULL,
+                 subject    TEXT NOT NULL,
+                 user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY (issuer, subject)
+             );
+             CREATE INDEX IF NOT EXISTS oauth_identities_user ON oauth_identities(user_id);",
+        )?;
+        tx.pragma_update(None, "user_version", 6)?;
+        tx.commit()?;
+        version = 6;
+        tracing::debug!("migrated database schema to v6");
+    }
+
     if version < SCHEMA_VERSION {
         anyhow::bail!(
             "no migration available from schema v{version} to v{SCHEMA_VERSION}; \
@@ -1557,6 +1668,65 @@ fn adopt_legacy(conn: &Connection) -> Result<()> {
 }
 
 // --- row mapping --------------------------------------------------------
+
+/// What [`Storage::user_for_oauth_identity`] did.
+///
+/// Two variants rather than an `Option<User>`, because the caller wants to log
+/// the difference: an account appearing out of a sign-in is worth a line, and
+/// the same person returning is not.
+#[derive(Debug)]
+pub enum OauthLogin {
+    /// The identity was already linked to this account.
+    Existing(User),
+    /// First sight of this identity; the account was created for it.
+    Created(User),
+}
+
+/// How many numbered variants of a name to try before giving up. Reaching this
+/// means a thousand accounts share a stem, which is a stuck provider rather
+/// than a coincidence worth looping over.
+const MAX_NAME_ATTEMPTS: u32 = 1000;
+
+/// The first free account name at or after `base`: `base`, `base2`, `base3`, …
+///
+/// Two people called `alice` at the provider, or one whose provider name is
+/// already somebody else's account here, both need somewhere to live. Numbering
+/// keeps the name recognisable, which a random suffix would not.
+///
+/// Runs inside the caller's transaction, so a name found free is still free
+/// when the insert lands.
+fn free_name(tx: &rusqlite::Transaction<'_>, base: &str) -> Result<String> {
+    for n in 0..MAX_NAME_ATTEMPTS {
+        let candidate = numbered_name(base, n);
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM users WHERE name = ?1)",
+            params![candidate],
+            |row| row.get(0),
+        )?;
+        if !taken {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("could not find a free account name based on {base:?}")
+}
+
+/// `base` with `n` appended, shortened so the result still fits in 32
+/// characters.
+///
+/// The stem is truncated rather than the number dropped, and any separator the
+/// cut exposes is trimmed: `alice-` is not a name `validate_signup` accepts, so
+/// slicing a long one at exactly the wrong byte would produce a row the
+/// application would refuse to create itself.
+fn numbered_name(base: &str, n: u32) -> String {
+    if n == 0 {
+        return base.to_string();
+    }
+    let suffix = (n + 1).to_string();
+    let room = 32usize.saturating_sub(suffix.len());
+    // Names are ASCII by `validate_signup`, so this cannot split a character.
+    let stem = base[..base.len().min(room)].trim_end_matches(['.', '-', '_']);
+    format!("{stem}{suffix}")
+}
 
 fn row_to_user(row: &Row<'_>) -> rusqlite::Result<User> {
     Ok(User {
@@ -1793,6 +1963,97 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(dir.path().join("test.db")).unwrap();
         (storage, dir)
+    }
+
+    #[tokio::test]
+    async fn an_external_identity_creates_an_account_once_and_is_known_after() {
+        let (storage, _dir) = temp_storage().await;
+        let iss = "https://idp.example.com";
+
+        let first = storage
+            .user_for_oauth_identity(iss.into(), "sub-1".into(), "alice".into(), "Alice".into())
+            .await
+            .unwrap();
+        let OauthLogin::Created(created) = first else {
+            panic!("first sight should create an account, got {first:?}");
+        };
+        assert_eq!(created.name, "alice");
+        // No local password can ever open it: the sentinel is not a PHC string.
+        assert!(!crate::auth::verify_password("", &created.password_hash));
+        assert!(!crate::auth::verify_password("!", &created.password_hash));
+
+        let again = storage
+            .user_for_oauth_identity(iss.into(), "sub-1".into(), "alice".into(), "Renamed".into())
+            .await
+            .unwrap();
+        let OauthLogin::Existing(found) = again else {
+            panic!("a known identity must not create a second account, got {again:?}");
+        };
+        assert_eq!(found.id, created.id);
+        assert_eq!(storage.user_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_providers_may_both_number_their_subjects_from_one() {
+        let (storage, _dir) = temp_storage().await;
+        let a = storage
+            .user_for_oauth_identity(
+                "https://a.example".into(),
+                "1".into(),
+                "alice".into(),
+                "A".into(),
+            )
+            .await
+            .unwrap();
+        let b = storage
+            .user_for_oauth_identity(
+                "https://b.example".into(),
+                "1".into(),
+                "bob".into(),
+                "B".into(),
+            )
+            .await
+            .unwrap();
+        let (OauthLogin::Created(a), OauthLogin::Created(b)) = (a, b) else {
+            panic!("both are first sightings");
+        };
+        assert_ne!(a.id, b.id, "the issuer is half the key, so these differ");
+    }
+
+    #[tokio::test]
+    async fn a_taken_name_is_numbered_rather_than_refused() {
+        let (storage, _dir) = temp_storage().await;
+        // Somebody already registered `alice` with a password.
+        make_user(&storage, "alice").await;
+
+        for (subject, expected) in [("sub-1", "alice2"), ("sub-2", "alice3")] {
+            let out = storage
+                .user_for_oauth_identity(
+                    "https://idp.example".into(),
+                    subject.into(),
+                    "alice".into(),
+                    "Alice".into(),
+                )
+                .await
+                .unwrap();
+            let OauthLogin::Created(user) = out else {
+                panic!("{subject} should have created an account")
+            };
+            assert_eq!(user.name, expected, "the name stays recognisable");
+        }
+    }
+
+    #[test]
+    fn numbering_a_long_name_keeps_it_inside_the_rules() {
+        // Truncating to make room for the suffix must not leave a trailing
+        // separator, which `validate_name` rejects.
+        let base = format!("{}-", "a".repeat(30));
+        let numbered = numbered_name(&base, 1);
+        assert_eq!(numbered.len(), 31);
+        assert!(numbered.ends_with('2'));
+        crate::auth::validate_name(&numbered).unwrap();
+
+        assert_eq!(numbered_name("alice", 0), "alice", "zero is the bare name");
     }
 
     /// An allowance no test upload can exhaust, for the tests that are about

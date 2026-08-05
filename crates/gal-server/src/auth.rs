@@ -211,11 +211,12 @@ pub fn validate_password(password: &str, name: Option<&str>) -> Result<(), Signu
 /// Validate and normalise sign-up input.
 ///
 /// Returns the canonical (lowercased, trimmed) username and display name.
-pub fn validate_signup(
-    name: &str,
-    display_name: &str,
-    password: &str,
-) -> Result<(String, String), SignupError> {
+/// Check an account name on its own terms, returning it canonicalised.
+///
+/// Split out from [`validate_signup`] so that a name arriving from somewhere
+/// other than the sign-up form — an identity provider, say — is held to exactly
+/// the same rule rather than to a second copy of it that can drift.
+pub fn validate_name(name: &str) -> Result<String, SignupError> {
     let name = name.trim().to_lowercase();
     if name.chars().count() < 2 {
         return Err(SignupError::NameTooShort);
@@ -229,6 +230,15 @@ pub fn validate_signup(
     {
         return Err(SignupError::NameCharacters);
     }
+    Ok(name)
+}
+
+pub fn validate_signup(
+    name: &str,
+    display_name: &str,
+    password: &str,
+) -> Result<(String, String), SignupError> {
+    let name = validate_name(name)?;
     validate_password(password, Some(&name))?;
 
     // Fall back to the handle when no display name is given, so a user always
@@ -243,6 +253,40 @@ pub fn validate_signup(
         return Err(SignupError::DisplayNameTooLong);
     }
     Ok((name, display))
+}
+
+/// Derive an account name from whatever an external identity provider calls
+/// someone.
+///
+/// Providers are not bound by our rules. `preferred_username` is commonly an
+/// email address, and may carry capitals, spaces, accents, or characters this
+/// application does not allow in a handle — so this is a *derivation*, not a
+/// validation: unusable characters are dropped, and the caller numbers the
+/// result if it collides with an account that already exists.
+///
+/// An address is cut at the `@`. `alice@example.com` becoming `aliceexample.com`
+/// helps nobody, and the local part is the name the person actually goes by.
+///
+/// Returns `None` when nothing usable survives — an all-emoji display name, or
+/// one that reduces to a single character, which is below the minimum a name
+/// has to meet. The caller supplies a generic fallback rather than this
+/// inventing one.
+pub fn name_from_external(raw: &str) -> Option<String> {
+    let local = raw.split('@').next().unwrap_or(raw);
+    let mut name: String = local
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+
+    name.truncate(32);
+    let name = name.trim_matches(['.', '-', '_']).to_string();
+
+    // Hold the result to the same rule a person signing up meets, rather than
+    // trusting the filter above to have covered it — in particular the
+    // two-character floor, which a provider name of `x` would fail.
+    validate_name(&name).ok()
 }
 
 /// Decide whether a browser-initiated request may open a WebSocket.
@@ -441,6 +485,49 @@ mod tests {
             Err(SignupError::DisplayNameTooLong),
             "a display name that is too long said the opposite for a long time"
         );
+    }
+
+    #[test]
+    fn a_provider_name_is_reduced_to_something_this_application_accepts() {
+        assert_eq!(name_from_external("Alice"), Some("alice".into()));
+        // An address is its local part, not the whole string with the @ removed.
+        assert_eq!(
+            name_from_external("alice.smith@example.com"),
+            Some("alice.smith".into())
+        );
+        assert_eq!(name_from_external(" Bob Jones "), Some("bobjones".into()));
+        assert_eq!(name_from_external("a.b-c_1"), Some("a.b-c_1".into()));
+
+        // Nothing usable survives, so the caller has to supply a fallback
+        // rather than being handed a name the rules would reject.
+        assert_eq!(name_from_external("🎉🎉"), None);
+        assert_eq!(name_from_external(""), None);
+        assert_eq!(name_from_external("..."), None);
+        // One character is below the floor, even though every character is
+        // legal.
+        assert_eq!(name_from_external("x"), None);
+    }
+
+    #[test]
+    fn a_derived_name_always_passes_the_rule_it_was_derived_against() {
+        // The filter and the validator must not disagree; whatever this returns
+        // is about to become an account.
+        for raw in [
+            "Alice",
+            "alice@example.com",
+            "ALICE SMITH",
+            "-alice-",
+            "...alice...",
+            "ab",
+            "99",
+            "José Müller",
+            &"x".repeat(200),
+        ] {
+            if let Some(name) = name_from_external(raw) {
+                validate_name(&name)
+                    .unwrap_or_else(|e| panic!("{raw:?} derived {name:?}, which is invalid: {e}"));
+            }
+        }
     }
 
     #[test]

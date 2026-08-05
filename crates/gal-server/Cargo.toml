@@ -41,10 +41,17 @@ base64 = "0.22"
 sha2 = "0.10"
 dashmap = "6"
 futures = "0.3"
+# Only for the OpenID Connect flow, which talks to a provider over TLS.
+# `rustls-tls-native-roots` rather than the webpki bundle: it trusts the same
+# certificates the rest of the host does, so an internal provider behind a
+# private CA works without a second trust store to maintain — and it keeps a
+# Mozilla CA bundle, whose licence is not on `deny.toml`'s list, out of the
+# tree. rustls rather than the platform library because this project already
+# compiles C for the bundled SQLite and rustls needs no more than that.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 gal-core = { path = "../gal-core", version = "0.2.0" }
 gal-ot = { path = "../gal-ot", version = "0.2.0" }
 
 [dev-dependencies]
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tokio-tungstenite = "0.29"
