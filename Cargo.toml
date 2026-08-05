@@ -10,7 +10,12 @@ license = "MIT"
 authors = ["TensorSpace, Inc."]
 repository = "https://github.com/tensorspace-ai/gal"
 homepage = "https://github.com/tensorspace-ai/gal"
-keywords = ["collaboration", "operational-transformation", "realtime", "websocket", "wave"]
+# crates.io rejects a keyword of 20 characters or more, and enforces it only on
+# upload — `cargo publish --dry-run` never contacts the registry, so this passes
+# every local check and fails the real one. "operational-transformation" is 26
+# and cost a release. The full term still appears in each crate's description,
+# which crates.io also searches.
+keywords = ["collaboration", "concurrent-editing", "realtime", "websocket", "wave"]
 categories = ["web-programming::websocket", "text-editors"]
 
 [workspace.dependencies]
