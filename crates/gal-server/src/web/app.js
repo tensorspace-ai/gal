@@ -209,7 +209,9 @@ function renderAuth(serverInfo) {
         ? el('div', { class: 'auth-provider' }, [
             el('div', { class: 'auth-or', text: 'or' }),
             el('button', {
-              class: 'btn wide',
+              // Outlined, not filled: the password form's own submit is the
+              // primary action here and two solid buttons would compete.
+              class: 'btn ghost wide',
               type: 'button',
               text: `Sign in with ${serverInfo.oidc.label}`,
               // A full navigation, not a fetch. The provider answers with a
