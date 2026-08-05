@@ -72,9 +72,12 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -rf "dist/$name"
 
+      # Prefixed, so the download below can ask for the archives by name. The
+      # `image` job's buildx metadata lands in the same artifact namespace and
+      # must not be mistaken for a release file.
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: gal-${{ matrix.target }}
           path: dist/*
 
   image:
@@ -107,9 +110,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `pattern` is not optional. Without it this downloads *every* artifact
+      # the run produced, which includes the `.dockerbuild` blob that
+      # `docker/build-push-action` uploads as a build summary. That blob is not
+      # a release file, it would land in `dist/` and be published and hashed as
+      # if it were, and on the first release that ever ran here its download
+      # failed after five retries and took the whole job with it.
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: gal-*
           merge-multiple: true
       # One file, so `sha256sum -c SHA256SUMS` verifies the whole release.
       - run: cd dist && sha256sum * > SHA256SUMS
