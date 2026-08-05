@@ -31,6 +31,23 @@ All notable changes to this project are documented here. The format follows
   read: unverified personal data held for no purpose. Values written by older
   builds are left alone; clear them with `UPDATE users SET email = ''`.
 
+### Added — single sign-on
+
+Set `GAL_OIDC_ISSUER` and the three values beside it, and the sign-in screen
+grows a "Sign in with …" button. The endpoints come from the issuer's discovery
+document, so any conforming OpenID Connect provider works and nothing in Gal
+names one. Leave it unset and the server behaves exactly as before.
+
+Accounts are created on first sign-in, taking their username from the
+provider's `preferred_username` and numbering it if it is taken. Identities are
+keyed on the issuer and subject rather than on an email address, so controlling
+an address is not a way to claim an existing account — and there is no way to
+attach a provider to an account that already has a password. Passwords keep
+working alongside it; pair it with `GAL_OPEN_REGISTRATION=0` for a
+provider-only server.
+
+Schema v6 adds `oauth_identities`.
+
 ### Added — mentions
 
 Type `@` to name someone in the wave. The mention is a document attribute

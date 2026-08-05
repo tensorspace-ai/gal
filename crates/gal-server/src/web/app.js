@@ -203,6 +203,22 @@ function renderAuth(serverInfo) {
             },
           })
         : null,
+      // Present only when the server has a provider configured, so an
+      // ordinary deployment renders exactly the form it always did.
+      serverInfo.oidc
+        ? el('div', { class: 'auth-provider' }, [
+            el('div', { class: 'auth-or', text: 'or' }),
+            el('button', {
+              class: 'btn wide',
+              type: 'button',
+              text: `Sign in with ${serverInfo.oidc.label}`,
+              // A full navigation, not a fetch. The provider answers with a
+              // redirect to its own login page, which XHR cannot follow — and
+              // `connect-src 'self'` would not let it reach that page anyway.
+              onClick: () => location.assign(serverInfo.oidc.start),
+            }),
+          ])
+        : null,
     ]);
 
     app.appendChild(el('div', { class: 'auth-screen' }, [form]));

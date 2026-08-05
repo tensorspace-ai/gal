@@ -218,6 +218,31 @@ textarea {
   min-height: 1em;
 }
 
+/* Signing in through an identity provider. Drawn only when the server has one
+   configured, so these rules go unused on most deployments. */
+.auth-provider {
+  display: grid;
+  gap: 10px;
+}
+
+/* "or", with a rule through it. The lines are borders on pseudo-elements
+   rather than a background image, so they follow the theme's own colour in
+   both light and dark. */
+.auth-or {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.auth-or::before,
+.auth-or::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
 /* --- layout --- */
 
 .layout {

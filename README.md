@@ -50,6 +50,12 @@ deploying is copying one file.
 | `GAL_LOG`                  | `gal_server=info,tower_http=warn` | `tracing` filter                                      |
 | `GAL_LOG_JSON`             | `0`         | Set to `1` to emit one JSON object per line instead of the human format |
 | `GAL_METRICS_TOKEN`        | *(none)*    | Bearer token for `GET /metrics`. Unset disables the endpoint; must be at least 16 characters |
+| `GAL_OIDC_ISSUER`          | *(none)*    | Enables single sign-on. Issuer URL of an OpenID Connect provider — see below |
+| `GAL_OIDC_CLIENT_ID`       | *(none)*    | Required when `GAL_OIDC_ISSUER` is set                |
+| `GAL_OIDC_CLIENT_SECRET`   | *(none)*    | Required when `GAL_OIDC_ISSUER` is set                |
+| `GAL_OIDC_REDIRECT_URL`    | *(none)*    | Required when `GAL_OIDC_ISSUER` is set. Must match what the provider has registered, exactly |
+| `GAL_OIDC_SCOPES`          | `openid profile` | Space-separated. Must include `openid`           |
+| `GAL_OIDC_LABEL`           | *(issuer host)* | What the sign-in button calls the provider        |
 
 Boolean variables accept `1`, `true`, `yes`, `on` and their opposites `0`,
 `false`, `no`, `off`. An empty value is false, so `GAL_SECURE_COOKIES=` means
@@ -59,6 +65,46 @@ would otherwise have quietly meant *off*.
 `gal-server --healthcheck` probes a running instance and exits 0 or 1, for
 container health checks. `GET /healthz` does the same over HTTP and touches the
 database, so it fails when the server cannot actually serve.
+
+### Single sign-on
+
+Setting `GAL_OIDC_ISSUER` adds a "Sign in with …" button beside the password
+form. Passwords keep working; pair it with `GAL_OPEN_REGISTRATION=0` if the
+provider should be the only way to get an account.
+
+Any OpenID Connect provider works. The endpoints are read from the issuer's
+`/.well-known/openid-configuration`, and nothing here names a vendor. Register
+Gal as a **confidential** client with an authorization-code grant, then:
+
+```sh
+export GAL_OIDC_ISSUER=https://id.example.com
+export GAL_OIDC_CLIENT_ID=...
+export GAL_OIDC_CLIENT_SECRET=...
+export GAL_OIDC_REDIRECT_URL=https://gal.example.com/api/oauth/callback
+gal-server
+```
+
+The flow is an authorization code with PKCE. The redirect URL has to be the one
+registered with the provider, character for character, or the provider refuses
+the exchange.
+
+Accounts are created on first sign-in. The username comes from the provider's
+`preferred_username`, reduced to the characters a Gal username may contain and
+numbered if it is already taken — `alice`, then `alice2`. Identities are keyed
+on the issuer and the subject, never on an email address: an address a provider
+lets somebody set unverified, or releases and later reassigns, would otherwise
+be a way into an existing account. There is consequently no way to attach a
+provider to an account that already exists; that account keeps its password.
+
+An account created this way has no password, so the password-change form is not
+available to it.
+
+`https` is required unless the issuer is a loopback address — the exception that
+lets you develop against a provider on the same machine. The flow's
+confidentiality rests on TLS: the ID token's signature is not checked, because
+the subject is read directly from the provider's userinfo endpoint over an
+authenticated TLS connection, which OIDC Core §3.1.3.7 permits in place of
+verifying the token.
 
 ## Deploying it
 
