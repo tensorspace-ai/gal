@@ -34,12 +34,12 @@ pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 /// The schema version this build expects.
 ///
-/// Bump it whenever `schema.sql` changes, and add the corresponding step to
+/// Bump it whenever the schema changes, and add the corresponding step to
 /// [`migrate`]. `CREATE TABLE IF NOT EXISTS` is a no-op against an existing
 /// table, so without this a new column would simply never be added: the server
 /// would start cleanly, then fail at query time in ways that look like data loss
 /// to the user.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The version `schema.sql` describes.
 ///
@@ -806,7 +806,8 @@ impl Storage {
                 params![id.as_str()],
             )?;
             tx.execute(
-                "DELETE FROM blip_search WHERE blip_id = ?1",
+                "DELETE FROM blip_search
+                 WHERE rowid = (SELECT id FROM blip_search_keys WHERE blip_id = ?1)",
                 params![id.as_str()],
             )?;
             tx.commit()?;
@@ -1629,6 +1630,26 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tracing::debug!("migrated database schema to v6");
     }
 
+    if version == 6 {
+        let tx = conn.transaction()?;
+        // FTS5 cannot index an UNINDEXED column for equality. Every edit used
+        // to scan the entire search table to find the old entry by blip_id.
+        // Preserve existing FTS rowids, and allocate future ones here: unlike
+        // an implicit rowid on blips, an INTEGER PRIMARY KEY survives VACUUM.
+        tx.execute_batch(
+            "CREATE TABLE blip_search_keys (
+                 id INTEGER PRIMARY KEY,
+                 blip_id TEXT NOT NULL UNIQUE REFERENCES blips(id) ON DELETE CASCADE
+             );
+             INSERT INTO blip_search_keys (id, blip_id)
+                 SELECT rowid, blip_id FROM blip_search;",
+        )?;
+        tx.pragma_update(None, "user_version", 7)?;
+        tx.commit()?;
+        version = 7;
+        tracing::debug!("migrated database schema to v7");
+    }
+
     if version < SCHEMA_VERSION {
         anyhow::bail!(
             "no migration available from schema v{version} to v{SCHEMA_VERSION}; \
@@ -1837,17 +1858,25 @@ fn insert_wavelet(tx: &rusqlite::Transaction<'_>, wavelet: &Wavelet) -> Result<(
     Ok(())
 }
 
-/// Refresh a blip's full-text entry. FTS5 has no upsert, so replace the row.
+/// Refresh a blip's full-text entry by its stable, indexed integer key.
 fn index_blip(tx: &rusqlite::Transaction<'_>, blip: &Blip) -> Result<()> {
     tx.execute(
-        "DELETE FROM blip_search WHERE blip_id = ?1",
+        "INSERT INTO blip_search_keys (blip_id) VALUES (?1)
+         ON CONFLICT(blip_id) DO NOTHING",
         params![blip.id.as_str()],
     )?;
+    let rowid: i64 = tx.query_row(
+        "SELECT id FROM blip_search_keys WHERE blip_id = ?1",
+        params![blip.id.as_str()],
+        |r| r.get(0),
+    )?;
+    tx.execute("DELETE FROM blip_search WHERE rowid = ?1", params![rowid])?;
     tx.execute(
-        "INSERT INTO blip_search (blip_id, wave_id, body) VALUES (?1, ?2, ?3)",
+        "INSERT INTO blip_search (rowid, blip_id, wave_id, body) VALUES (?1, ?2, ?3, ?4)",
         // Indexed as display text, so a file can be found by its name. Nothing
         // reads offsets back out of this index, only snippets.
         params![
+            rowid,
             blip.id.as_str(),
             blip.wave_id.as_str(),
             display_text(&blip.content)
@@ -2980,5 +3009,102 @@ mod tests {
         let alice_inbox = storage.inbox(&alice.id).await.unwrap();
         assert_eq!(alice_inbox.len(), 1);
         assert_eq!(alice_inbox[0].id, wave.id);
+    }
+
+    #[tokio::test]
+    async fn upgrading_search_keys_preserves_results_and_targets_one_blip() {
+        let (storage, dir) = temp_storage().await;
+        let alice = make_user(&storage, "alice").await;
+        let (wave, wavelet) = storage
+            .create_wave(
+                alice.id.clone(),
+                "Indexed".into(),
+                vec![alice.id.clone()],
+                WaveMode::Document,
+            )
+            .await
+            .unwrap();
+        let mut first = Blip::new(
+            wave.id.clone(),
+            wavelet.id.clone(),
+            alice.id.clone(),
+            None,
+            0,
+        );
+        first.content = Delta::document("before");
+        first.revision = 1;
+        storage.insert_blip(first.clone()).await.unwrap();
+        let mut second = Blip::new(
+            wave.id.clone(),
+            wavelet.id.clone(),
+            alice.id.clone(),
+            None,
+            1,
+        );
+        second.content = Delta::document("unrelated");
+        storage.insert_blip(second.clone()).await.unwrap();
+        // Recreate a v6 database with non-contiguous rowids, as repeated edits
+        // in the old index could produce. The migration must not renumber it.
+        let path = dir.path().join("test.db");
+        drop(storage);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE blip_search_keys; PRAGMA user_version = 6;")
+            .unwrap();
+        conn.execute(
+            "UPDATE blip_search SET rowid = 12345 WHERE blip_id = ?1",
+            params![first.id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.search(&alice.id, "before").await.unwrap().len(), 1);
+        first.content = Delta::document("after");
+        first.revision = 2;
+        storage
+            .commit_op(
+                first.clone(),
+                Delta::new().delete(6).insert("after"),
+                alice.id.clone(),
+                now(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(storage
+            .search(&alice.id, "before")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(storage.search(&alice.id, "after").await.unwrap().len(), 1);
+        storage
+            .run(move |conn| {
+                let rowid: i64 = conn.query_row(
+                    "SELECT rowid FROM blip_search WHERE blip_id = ?1",
+                    params![first.id.as_str()],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(rowid, 12345);
+                let plan: String = conn.query_row(
+                    "EXPLAIN QUERY PLAN DELETE FROM blip_search WHERE rowid = ?1",
+                    [rowid],
+                    |r| r.get(3),
+                )?;
+                assert!(
+                    plan.contains("INDEX 0:="),
+                    "expected a rowid lookup, got {plan}"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let first_id = storage.search(&alice.id, "after").await.unwrap()[0]
+            .blip_id
+            .clone();
+        storage.delete_blip(&first_id).await.unwrap();
+        assert!(storage.search(&alice.id, "after").await.unwrap().is_empty());
+        assert_eq!(
+            storage.search(&alice.id, "unrelated").await.unwrap()[0].blip_id,
+            second.id
+        );
     }
 }
