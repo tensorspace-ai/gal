@@ -629,46 +629,19 @@ async fn create_wave(
     ids.retain(|id| id != &session.user.id);
     ids.insert(0, session.user.id.clone());
 
+    let content = seed_content(content)?.unwrap_or_default();
     let title = normalise_title(&title);
-    let (wave, wavelet) = state
+    let (wave, _) = state
         .db
-        .create_wave(
+        .create_wave_with_blip(
             session.user.id.clone(),
             title,
             ids,
             mode.unwrap_or_default(),
+            content,
         )
         .await
         .map_err(internal)?;
-
-    // Seed the first blip so a new wave is immediately writable.
-    let mut blip = Blip::new(
-        wave.id.clone(),
-        wavelet.id.clone(),
-        session.user.id.clone(),
-        None,
-        0,
-    );
-    if let Some(content) = seed_content(content)? {
-        blip.content = content;
-        blip.revision = 1;
-    }
-    state.db.insert_blip(blip.clone()).await.map_err(internal)?;
-    if blip.revision > 0 {
-        // Record the seed text in the op log so playback starts from empty.
-        state
-            .db
-            .commit_op(
-                blip.clone(),
-                blip.content.clone(),
-                session.user.id.clone(),
-                blip.created_at,
-                // Seeded at creation; there is no client op to be idempotent about.
-                None,
-            )
-            .await
-            .map_err(internal)?;
-    }
 
     open_wave(state, session, wave.id.clone()).await?;
     state.schedule_inbox_update(&wave.id);
@@ -727,27 +700,7 @@ async fn create_blip(
         blip.revision = 1;
     }
 
-    state.db.insert_blip(blip.clone()).await.map_err(internal)?;
-    if blip.revision > 0 {
-        if let Err(e) = state
-            .db
-            .commit_op(
-                blip.clone(),
-                blip.content.clone(),
-                session.user.id.clone(),
-                blip.created_at,
-                // Seeded at creation; there is no client op to be idempotent about.
-                None,
-            )
-            .await
-        {
-            // The row exists but its seed op does not, which would make playback
-            // reconstruct the wrong document. Remove it rather than leave the
-            // two disagreeing.
-            let _ = state.db.delete_blip(&blip.id).await;
-            return Err(internal(e));
-        }
-    }
+    state.db.create_blip(blip.clone()).await.map_err(internal)?;
 
     live.blips
         .insert(blip.id.clone(), crate::state::LiveBlip::new(blip.clone()));
@@ -922,23 +875,7 @@ async fn reply_to_comment(
         blip.revision = 1;
     }
 
-    state.db.insert_blip(blip.clone()).await.map_err(internal)?;
-    if blip.revision > 0 {
-        if let Err(e) = state
-            .db
-            .commit_op(
-                blip.clone(),
-                blip.content.clone(),
-                session.user.id.clone(),
-                blip.created_at,
-                None,
-            )
-            .await
-        {
-            let _ = state.db.delete_blip(&blip.id).await;
-            return Err(internal(e));
-        }
-    }
+    state.db.create_blip(blip.clone()).await.map_err(internal)?;
 
     live.blips
         .insert(blip.id.clone(), crate::state::LiveBlip::new(blip.clone()));
@@ -1091,6 +1028,8 @@ async fn delete_blip(
         .map(|b| b.meta.id.clone())
         .collect();
 
+    state.db.delete_blip(&blip_id).await.map_err(internal)?;
+
     live.blips.remove(&blip_id);
     for remark in &remarks {
         live.blips.remove(remark);
@@ -1120,13 +1059,6 @@ async fn delete_blip(
     );
     drop(live);
 
-    for remark in &remarks {
-        state.db.delete_blip(remark).await.map_err(internal)?;
-    }
-    for thread in &threads {
-        state.db.delete_comment(thread).await.map_err(internal)?;
-    }
-    state.db.delete_blip(&blip_id).await.map_err(internal)?;
     state.schedule_inbox_update(&wave_id);
     Ok(())
 }
@@ -1145,6 +1077,11 @@ async fn set_title(
         return Err(not_found());
     }
     live.permit(&session.user.id, Action::Retitle)?;
+    state
+        .db
+        .set_title(&wavelet_id, title.clone())
+        .await
+        .map_err(internal)?;
     if let Some(wavelet) = live.wavelet_mut(&wavelet_id) {
         wavelet.title = title.clone();
     }
@@ -1159,11 +1096,6 @@ async fn set_title(
     );
     drop(live);
 
-    state
-        .db
-        .set_title(&wavelet_id, title)
-        .await
-        .map_err(internal)?;
     state.schedule_inbox_update(&wave_id);
     Ok(())
 }
@@ -1195,6 +1127,7 @@ async fn set_mode(
     if live.wave.mode == mode {
         return Ok(());
     }
+    state.db.set_mode(&wave_id, mode).await.map_err(internal)?;
     live.wave.mode = mode;
 
     // Reaches every participant of the wave, not just one wavelet: the mode
@@ -1212,7 +1145,6 @@ async fn set_mode(
     }
     drop(live);
 
-    state.db.set_mode(&wave_id, mode).await.map_err(internal)?;
     state.schedule_inbox_update(&wave_id);
     Ok(())
 }
@@ -1264,6 +1196,11 @@ async fn add_participant(
     if wavelet.has_participant(&user.id) {
         return Ok(()); // already there; nothing to do
     }
+    state
+        .db
+        .add_participant(&wavelet_id, &user.id)
+        .await
+        .map_err(internal)?;
     wavelet.participants.push(user.id.clone());
     live.user_cache.insert(user.id.clone(), user.public());
     live.broadcast(
@@ -1277,11 +1214,6 @@ async fn add_participant(
     );
     drop(live);
 
-    state
-        .db
-        .add_participant(&wavelet_id, &user.id)
-        .await
-        .map_err(internal)?;
     state.schedule_inbox_update(&wave_id);
     Ok(())
 }
@@ -1325,6 +1257,12 @@ async fn remove_participant(
             "A wave needs at least one participant.",
         )));
     }
+    // Root removal includes private memberships in the same transaction.
+    state
+        .db
+        .remove_participant(&wavelet_id, &user_id)
+        .await
+        .map_err(internal)?;
     wavelet.participants.retain(|p| p != &user_id);
     live.broadcast(
         &wavelet_id,
@@ -1394,18 +1332,6 @@ async fn remove_participant(
     }
     drop(live);
 
-    state
-        .db
-        .remove_participant(&wavelet_id, &user_id)
-        .await
-        .map_err(internal)?;
-    for id in &cascaded {
-        state
-            .db
-            .remove_participant(id, &user_id)
-            .await
-            .map_err(internal)?;
-    }
     state.schedule_inbox_update(&wave_id);
     Ok(())
 }
@@ -1430,13 +1356,17 @@ async fn private_reply(
         )));
     }
 
-    let live = wave.lock().await;
+    let mut live = wave.lock().await;
 
     if !live.may_access(&session.user.id, &wavelet_id) {
         return Err(not_found());
     }
     live.permit(&session.user.id, Action::PrivateReply)?;
-    if !live.blips.contains_key(&anchor) {
+    if !live
+        .blips
+        .get(&anchor)
+        .is_some_and(|b| b.meta.wavelet_id == wavelet_id)
+    {
         return Err(not_found());
     }
     // A private reply may only include people who are already in the parent
@@ -1457,7 +1387,6 @@ async fn private_reply(
         )));
     }
     let title = live.title();
-    drop(live);
 
     ids.retain(|id| id != &session.user.id);
     ids.insert(0, session.user.id.clone());
@@ -1472,26 +1401,19 @@ async fn private_reply(
         created_at: now(),
         last_modified: now(),
     };
-    state
-        .db
-        .create_wavelet(wavelet.clone())
-        .await
-        .map_err(internal)?;
-
-    let seq = {
-        let live = wave.lock().await;
-        live.next_seq(&wavelet.id)
-    };
     let blip = Blip::new(
         wave_id.clone(),
         wavelet.id.clone(),
         session.user.id.clone(),
         None,
-        seq,
+        0,
     );
-    state.db.insert_blip(blip.clone()).await.map_err(internal)?;
+    state
+        .db
+        .create_private_reply(wavelet.clone(), blip.clone())
+        .await
+        .map_err(internal)?;
 
-    let mut live = wave.lock().await;
     live.wavelets.push(wavelet.clone());
     live.blips
         .insert(blip.id.clone(), crate::state::LiveBlip::new(blip.clone()));

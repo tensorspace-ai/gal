@@ -4182,3 +4182,308 @@ async fn registering_an_unrelated_account_does_not_expand_wave_caches() {
     assert_eq!(added.name, "outsider");
     assert_eq!(wave.lock().await.user_cache.len(), 2);
 }
+
+#[tokio::test]
+async fn failed_metadata_writes_leave_the_resident_wave_unchanged() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    server.register("bob").await;
+    server.register("outsider").await;
+    let bob = server.state.db.user_by_name("bob").await.unwrap().unwrap();
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, wavelet_id, blip_id) =
+        create_wave(&mut alice, "Original", vec!["bob".into()]).await;
+    let wave = server.state.open_wave(&wave_id).await.unwrap().unwrap();
+    let before = serde_json::to_value(wave.lock().await.view(
+        &alice.user.id,
+        &Default::default(),
+        Default::default(),
+    ))
+    .unwrap();
+    let cases = [
+        (
+            "BEFORE UPDATE OF title ON wavelets",
+            ClientMessage::SetTitle {
+                wavelet_id: wavelet_id.clone(),
+                title: "Unstored".into(),
+            },
+        ),
+        (
+            "BEFORE UPDATE OF mode ON waves",
+            ClientMessage::SetMode {
+                wave_id: wave_id.clone(),
+                mode: WaveMode::Frozen,
+            },
+        ),
+        (
+            "BEFORE INSERT ON participants",
+            ClientMessage::AddParticipant {
+                wavelet_id: wavelet_id.clone(),
+                name: "outsider".into(),
+            },
+        ),
+        (
+            "BEFORE DELETE ON participants",
+            ClientMessage::RemoveParticipant {
+                wavelet_id,
+                user_id: bob.id,
+            },
+        ),
+        (
+            "BEFORE UPDATE OF deleted ON blips",
+            ClientMessage::DeleteBlip { blip_id },
+        ),
+    ];
+    let conn = rusqlite::Connection::open(&server.state.config.database).unwrap();
+    for (trigger, command) in cases {
+        conn.execute_batch(&format!("CREATE TRIGGER fail_write {trigger} BEGIN SELECT RAISE(FAIL, 'deliberate write failure'); END;")).unwrap();
+        alice.send(command).await;
+        let code = alice
+            .recv_until(|m| match m {
+                ServerMessage::Error { code, .. } => Some(*code),
+                _ => None,
+            })
+            .await;
+        assert_eq!(code, ErrorCode::Internal, "{trigger}");
+        let after = serde_json::to_value(wave.lock().await.view(
+            &alice.user.id,
+            &Default::default(),
+            Default::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            before, after,
+            "resident state changed after {trigger} failed"
+        );
+        conn.execute_batch("DROP TRIGGER fail_write").unwrap();
+    }
+    let stored = server.state.db.wave(&wave_id).await.unwrap().unwrap();
+    assert_eq!(stored.mode, WaveMode::Document);
+    let stored = server.state.db.wavelets_of_wave(&wave_id).await.unwrap();
+    assert_eq!(stored[0].title, "Original");
+    assert_eq!(stored[0].participants.len(), 2);
+    assert_eq!(
+        server.state.db.blips_of_wave(&wave_id).await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_seed_writes_do_not_leave_partial_waves_or_messages() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, wavelet_id, _) = create_wave(&mut alice, "Original", vec![]).await;
+    let conn = rusqlite::Connection::open(&server.state.config.database).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_seed BEFORE INSERT ON ops BEGIN SELECT RAISE(FAIL, 'seed failure'); END;").unwrap();
+    for command in [
+        ClientMessage::CreateBlip {
+            wavelet_id,
+            parent: None,
+            content: Some(Delta::document("unsaved message")),
+        },
+        ClientMessage::CreateWave {
+            title: "unsaved wave".into(),
+            participants: vec![],
+            content: Some(Delta::document("unsaved seed")),
+            mode: None,
+        },
+    ] {
+        alice.send(command).await;
+        assert_eq!(
+            alice
+                .recv_until(|m| match m {
+                    ServerMessage::Error { code, .. } => Some(*code),
+                    _ => None,
+                })
+                .await,
+            ErrorCode::Internal
+        );
+    }
+    assert_eq!(
+        server.state.db.inbox(&alice.user.id).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        server.state.db.blips_of_wave(&wave_id).await.unwrap().len(),
+        1
+    );
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM blips", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "a failed seed left even a soft-deleted row");
+    assert!(server
+        .state
+        .db
+        .search(&alice.user.id, "unsaved")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_private_reply_does_not_leave_a_wavelet_or_membership() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    server.register("bob").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, wavelet_id, anchor) =
+        create_wave(&mut alice, "Original", vec!["bob".into()]).await;
+    let conn = rusqlite::Connection::open(&server.state.config.database).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_blip BEFORE INSERT ON blips BEGIN SELECT RAISE(FAIL, 'blip failure'); END;").unwrap();
+    alice
+        .send(ClientMessage::PrivateReply {
+            wavelet_id,
+            anchor,
+            participants: vec!["bob".into()],
+        })
+        .await;
+    assert_eq!(
+        alice
+            .recv_until(|m| match m {
+                ServerMessage::Error { code, .. } => Some(*code),
+                _ => None,
+            })
+            .await,
+        ErrorCode::Internal
+    );
+    assert_eq!(
+        server
+            .state
+            .db
+            .wavelets_of_wave(&wave_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let memberships: i64 = conn
+        .query_row("SELECT COUNT(*) FROM participants", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(memberships, 2);
+}
+
+#[tokio::test]
+async fn an_op_write_failure_restores_contributors_and_timestamps_too() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+    let (wave_id, _, blip_id) = create_wave(&mut alice, "Original", vec!["bob".into()]).await;
+    bob.open(&wave_id).await;
+    let wave = server.state.open_wave(&wave_id).await.unwrap().unwrap();
+    let before = serde_json::to_value(&wave.lock().await.blips[&blip_id].meta).unwrap();
+    let conn = rusqlite::Connection::open(&server.state.config.database).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fail_op BEFORE INSERT ON ops BEGIN SELECT RAISE(FAIL, 'op failure'); END;",
+    )
+    .unwrap();
+    bob.send(ClientMessage::Submit {
+        blip_id: blip_id.clone(),
+        revision: 0,
+        delta: Delta::new().insert("unsaved"),
+        op_id: Some("failed-op".into()),
+    })
+    .await;
+    assert_eq!(
+        bob.recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            _ => None,
+        })
+        .await,
+        ErrorCode::Resync
+    );
+    let live = wave.lock().await;
+    assert_eq!(
+        before,
+        serde_json::to_value(&live.blips[&blip_id].meta).unwrap()
+    );
+    assert_eq!(live.blips[&blip_id].doc.revision(), 0);
+    drop(live);
+    conn.execute_batch("DROP TRIGGER fail_op").unwrap();
+    bob.send(ClientMessage::Submit {
+        blip_id: blip_id.clone(),
+        revision: 0,
+        delta: Delta::new().insert("saved"),
+        op_id: Some("successful-op".into()),
+    })
+    .await;
+    bob.recv_until(|m| matches!(m, ServerMessage::Ack { revision: 1, .. }).then_some(()))
+        .await;
+    assert_eq!(
+        server.state.db.blips_of_wave(&wave_id).await.unwrap()[0]
+            .content
+            .to_plain_text(),
+        "saved"
+    );
+}
+
+#[tokio::test]
+async fn private_reply_creation_and_eviction_share_the_wave_lock() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    server.register("bob").await;
+    let bob = server.state.db.user_by_name("bob").await.unwrap().unwrap();
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, wavelet_id, anchor) =
+        create_wave(&mut alice, "Ordered", vec!["bob".into()]).await;
+    let mut control = server.connect(&cookie).await;
+    control.open(&wave_id).await;
+    let wave = server.state.open_wave(&wave_id).await.unwrap().unwrap();
+    // Keep the private-reply write pending after its permission check.
+    let conn = rusqlite::Connection::open(&server.state.config.database).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    alice
+        .send(ClientMessage::PrivateReply {
+            wavelet_id: wavelet_id.clone(),
+            anchor,
+            participants: vec!["bob".into()],
+        })
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if wave.try_lock().is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(
+        wave.try_lock().is_err(),
+        "private creation released its permission lock before persisting"
+    );
+    control
+        .send(ClientMessage::RemoveParticipant {
+            wavelet_id,
+            user_id: bob.id.clone(),
+        })
+        .await;
+    conn.execute_batch("COMMIT").unwrap();
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::WaveletAdded { .. }).then_some(()))
+        .await;
+    control
+        .recv_until(|m| matches!(m, ServerMessage::ParticipantRemoved { .. }).then_some(()))
+        .await;
+    assert!(!server
+        .state
+        .db
+        .is_participant(&bob.id, &wave_id)
+        .await
+        .unwrap());
+    assert!(!wave.lock().await.may_view(&bob.id));
+    assert_eq!(
+        server
+            .state
+            .db
+            .wavelets_of_wave(&wave_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}

@@ -399,12 +399,37 @@ impl Storage {
 
     /// Create a wave with its root wavelet and initial participant set, in one
     /// transaction so a wave can never exist without somewhere to talk.
+    #[cfg(test)]
     pub async fn create_wave(
         &self,
         creator: UserId,
         title: String,
         participants: Vec<UserId>,
         mode: WaveMode,
+    ) -> Result<(Wave, Wavelet)> {
+        self.create_wave_inner(creator, title, participants, mode, None)
+            .await
+    }
+
+    pub async fn create_wave_with_blip(
+        &self,
+        creator: UserId,
+        title: String,
+        participants: Vec<UserId>,
+        mode: WaveMode,
+        content: Delta,
+    ) -> Result<(Wave, Wavelet)> {
+        self.create_wave_inner(creator, title, participants, mode, Some(content))
+            .await
+    }
+
+    async fn create_wave_inner(
+        &self,
+        creator: UserId,
+        title: String,
+        participants: Vec<UserId>,
+        mode: WaveMode,
+        content: Option<Delta>,
     ) -> Result<(Wave, Wavelet)> {
         let ts = now();
         let wave = Wave {
@@ -437,6 +462,14 @@ impl Storage {
                 ],
             )?;
             insert_wavelet(&tx, &s)?;
+            if let Some(content) = content {
+                let mut blip = Blip::new(w.id.clone(), s.id.clone(), w.creator.clone(), None, 0);
+                if !content.is_empty() {
+                    blip.content = content;
+                    blip.revision = 1;
+                }
+                insert_seeded_blip(&tx, &blip)?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -445,10 +478,22 @@ impl Storage {
         Ok((wave, wavelet))
     }
 
+    #[cfg(test)]
     pub async fn create_wavelet(&self, wavelet: Wavelet) -> Result<()> {
         self.run(move |conn| {
             let tx = conn.transaction()?;
             insert_wavelet(&tx, &wavelet)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn create_private_reply(&self, wavelet: Wavelet, blip: Blip) -> Result<()> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            insert_wavelet(&tx, &wavelet)?;
+            insert_seeded_blip(&tx, &blip)?;
             tx.commit()?;
             Ok(())
         })
@@ -585,10 +630,20 @@ impl Storage {
     pub async fn remove_participant(&self, wavelet_id: &WaveletId, user_id: &UserId) -> Result<()> {
         let (w, u) = (wavelet_id.clone(), user_id.clone());
         self.run(move |conn| {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM participants WHERE user_id = ?2 AND wavelet_id IN (
+                     SELECT child.id FROM wavelets child JOIN wavelets parent
+                         ON parent.wave_id = child.wave_id
+                     WHERE parent.id = ?1 AND parent.kind = 'conversation'
+                       AND child.kind = 'privateReply')",
+                params![w.as_str(), u.as_str()],
+            )?;
+            tx.execute(
                 "DELETE FROM participants WHERE wavelet_id = ?1 AND user_id = ?2",
                 params![w.as_str(), u.as_str()],
             )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -596,29 +651,22 @@ impl Storage {
 
     // --- blips ----------------------------------------------------------
 
+    #[cfg(test)]
     pub async fn insert_blip(&self, blip: Blip) -> Result<()> {
         self.run(move |conn| {
             let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT INTO blips (id, wavelet_id, wave_id, parent, seq, author, contributors,
-                                    created_at, last_modified, content, revision, deleted, comment)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
-                params![
-                    blip.id.as_str(),
-                    blip.wavelet_id.as_str(),
-                    blip.wave_id.as_str(),
-                    blip.parent.as_ref().map(|p| p.0.clone()),
-                    blip.seq,
-                    blip.author.as_str(),
-                    serde_json::to_string(&blip.contributors)?,
-                    blip.created_at,
-                    blip.last_modified,
-                    serde_json::to_string(&blip.content)?,
-                    blip.revision,
-                    blip.comment.as_ref().map(|c| c.0.clone()),
-                ],
-            )?;
+            insert_blip_row(&tx, &blip)?;
             index_blip(&tx, &blip)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn create_blip(&self, blip: Blip) -> Result<()> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            insert_seeded_blip(&tx, &blip)?;
             tx.commit()?;
             Ok(())
         })
@@ -651,48 +699,7 @@ impl Storage {
                     thread.created_at,
                 ],
             )?;
-            tx.execute(
-                "INSERT INTO blips (id, wavelet_id, wave_id, parent, seq, author, contributors,
-                                    created_at, last_modified, content, revision, deleted, comment)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
-                params![
-                    blip.id.as_str(),
-                    blip.wavelet_id.as_str(),
-                    blip.wave_id.as_str(),
-                    blip.parent.as_ref().map(|p| p.0.clone()),
-                    blip.seq,
-                    blip.author.as_str(),
-                    serde_json::to_string(&blip.contributors)?,
-                    blip.created_at,
-                    blip.last_modified,
-                    serde_json::to_string(&blip.content)?,
-                    blip.revision,
-                    blip.comment.as_ref().map(|c| c.0.clone()),
-                ],
-            )?;
-            // Seeded content is recorded in the op log here rather than through
-            // a following `commit_op`, so playback starts this remark from empty
-            // like every other document and cannot be left disagreeing with the
-            // row above it.
-            if blip.revision > 0 {
-                tx.execute(
-                    "INSERT INTO ops (blip_id, revision, wave_id, author, timestamp, delta, op_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-                    params![
-                        blip.id.as_str(),
-                        blip.revision,
-                        blip.wave_id.as_str(),
-                        blip.author.as_str(),
-                        blip.created_at,
-                        serde_json::to_string(&blip.content)?,
-                    ],
-                )?;
-            }
-            tx.execute(
-                "UPDATE wavelets SET last_modified = ?2 WHERE id = ?1",
-                params![blip.wavelet_id.as_str(), blip.last_modified],
-            )?;
-            index_blip(&tx, &blip)?;
+            insert_seeded_blip(&tx, &blip)?;
             tx.commit()?;
             Ok(())
         })
@@ -719,15 +726,6 @@ impl Storage {
     /// Only ever reached by deleting the blip it annotates — a comment has no
     /// deletion of its own. Its remarks are soft-deleted separately, like any
     /// other blip, so the op log they contributed to playback stays intact.
-    pub async fn delete_comment(&self, comment_id: &CommentId) -> Result<()> {
-        let id = comment_id.clone();
-        self.run(move |conn| {
-            conn.execute("DELETE FROM comments WHERE id = ?1", params![id.as_str()])?;
-            Ok(())
-        })
-        .await
-    }
-
     /// Close a thread, or reopen it. Nothing else about it changes.
     pub async fn set_comment_resolved(
         &self,
@@ -821,6 +819,21 @@ impl Storage {
         let id = blip_id.clone();
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM blip_search WHERE rowid IN (
+                     SELECT k.id FROM blip_search_keys k JOIN blips b ON b.id = k.blip_id
+                     WHERE b.comment IN (SELECT id FROM comments WHERE blip_id = ?1))",
+                params![id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE blips SET deleted = 1
+                 WHERE comment IN (SELECT id FROM comments WHERE blip_id = ?1)",
+                params![id.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM comments WHERE blip_id = ?1",
+                params![id.as_str()],
+            )?;
             tx.execute(
                 "UPDATE blips SET deleted = 1 WHERE id = ?1",
                 params![id.as_str()],
@@ -1886,6 +1899,56 @@ fn insert_wavelet(tx: &rusqlite::Transaction<'_>, wavelet: &Wavelet) -> Result<(
             params![wavelet.id.as_str(), user.as_str(), wavelet.created_at],
         )?;
     }
+    Ok(())
+}
+
+fn insert_blip_row(tx: &rusqlite::Transaction<'_>, blip: &Blip) -> Result<()> {
+    tx.execute(
+        "INSERT INTO blips (id, wavelet_id, wave_id, parent, seq, author, contributors,
+                                    created_at, last_modified, content, revision, deleted, comment)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
+        params![
+            blip.id.as_str(),
+            blip.wavelet_id.as_str(),
+            blip.wave_id.as_str(),
+            blip.parent.as_ref().map(|p| p.0.clone()),
+            blip.seq,
+            blip.author.as_str(),
+            serde_json::to_string(&blip.contributors)?,
+            blip.created_at,
+            blip.last_modified,
+            serde_json::to_string(&blip.content)?,
+            blip.revision,
+            blip.comment.as_ref().map(|c| c.0.clone()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The initial snapshot, its playback seed and its search entry land together.
+fn insert_seeded_blip(tx: &rusqlite::Transaction<'_>, blip: &Blip) -> Result<()> {
+    insert_blip_row(tx, blip)?;
+    // Playback starts from empty; writing the seed separately could leave
+    // history disagreeing with an already-committed snapshot.
+    if blip.revision > 0 {
+        tx.execute(
+            "INSERT INTO ops (blip_id, revision, wave_id, author, timestamp, delta, op_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                blip.id.as_str(),
+                blip.revision,
+                blip.wave_id.as_str(),
+                blip.author.as_str(),
+                blip.created_at,
+                serde_json::to_string(&blip.content)?,
+            ],
+        )?;
+    }
+    tx.execute(
+        "UPDATE wavelets SET last_modified = ?2 WHERE id = ?1",
+        params![blip.wavelet_id.as_str(), blip.last_modified],
+    )?;
+    index_blip(tx, blip)?;
     Ok(())
 }
 
@@ -3230,5 +3293,66 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(storage.user_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_annotated_blip_rolls_back_the_whole_thread_on_failure() {
+        let (storage, _dir) = temp_storage().await;
+        let alice = make_user(&storage, "alice").await;
+        let (wave, wavelet) = storage
+            .create_wave_with_blip(
+                alice.id.clone(),
+                "Annotated".into(),
+                vec![alice.id.clone()],
+                WaveMode::Notepad,
+                Delta::document("anchor"),
+            )
+            .await
+            .unwrap();
+        let parent = storage.blips_of_wave(&wave.id).await.unwrap()[0].id.clone();
+        let thread = CommentThread {
+            id: CommentId::new(),
+            wavelet_id: wavelet.id.clone(),
+            blip_id: parent.clone(),
+            author: alice.id.clone(),
+            created_at: now(),
+            resolved_by: None,
+            resolved_at: None,
+        };
+        let mut remark = Blip::new(
+            wave.id.clone(),
+            wavelet.id.clone(),
+            alice.id.clone(),
+            Some(parent.clone()),
+            1,
+        );
+        remark.comment = Some(thread.id.clone());
+        remark.content = Delta::document("remark");
+        remark.revision = 1;
+        storage.create_comment(thread, remark).await.unwrap();
+        storage.run(|conn| {
+            conn.execute_batch("CREATE TRIGGER fail_parent BEFORE UPDATE OF deleted ON blips WHEN OLD.comment IS NULL BEGIN SELECT RAISE(FAIL, 'parent failure'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        assert!(storage.delete_blip(&parent).await.is_err());
+        assert_eq!(storage.comments_of_wave(&wave.id).await.unwrap().len(), 1);
+        assert_eq!(storage.blips_of_wave(&wave.id).await.unwrap().len(), 2);
+        assert_eq!(storage.search(&alice.id, "anchor").await.unwrap().len(), 1);
+        assert_eq!(storage.search(&alice.id, "remark").await.unwrap().len(), 1);
+        storage
+            .run(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_parent")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        storage.delete_blip(&parent).await.unwrap();
+        assert!(storage.comments_of_wave(&wave.id).await.unwrap().is_empty());
+        assert!(storage.blips_of_wave(&wave.id).await.unwrap().is_empty());
+        assert!(storage
+            .search(&alice.id, "remark")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

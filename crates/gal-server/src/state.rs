@@ -963,6 +963,8 @@ impl AppState {
             )));
         }
 
+        let previous_contributors = blip.meta.contributors.clone();
+        let previous_modified = blip.meta.last_modified;
         blip.sync();
         blip.meta.record_contributor(author);
         let meta = blip.meta.clone();
@@ -991,6 +993,8 @@ impl AppState {
             if let Some(blip) = live.blips.get_mut(blip_id) {
                 blip.doc.rollback_last();
                 blip.sync();
+                blip.meta.contributors = previous_contributors;
+                blip.meta.last_modified = previous_modified;
             }
             return Err(Box::new(ServerMessage::resync(
                 blip_id.clone(),
