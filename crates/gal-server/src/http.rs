@@ -290,9 +290,10 @@ async fn issue_session(state: &Arc<AppState>, user: &gal_core::model::User) -> R
 }
 
 async fn logout(State(state): State<Arc<AppState>>, identity: Identity) -> Response {
-    if let Err(e) = state.db.delete_session(identity.token_hash).await {
+    if let Err(e) = state.db.delete_session(identity.token_hash.clone()).await {
         return server_error(e);
     }
+    state.disconnect_session(&identity.user.id, &identity.token_hash);
     let mut headers = HeaderMap::new();
     if let Ok(value) = auth::clear_cookie(state.config.secure_cookies).parse() {
         headers.insert(header::SET_COOKIE, value);
@@ -312,6 +313,7 @@ async fn sign_out_everywhere(State(state): State<Arc<AppState>>, identity: Ident
         .await
     {
         Ok(revoked) => {
+            state.disconnect_other_sessions(&identity.user.id, &identity.token_hash);
             tracing::info!(user = %identity.user.id, revoked, "signed out other sessions");
             Json(serde_json::json!({ "revoked": revoked })).into_response()
         }
@@ -378,7 +380,10 @@ async fn change_password(
         .change_password(&identity.user.id, hash, identity.token_hash.clone())
         .await
     {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            state.disconnect_other_sessions(&identity.user.id, &identity.token_hash);
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
         Err(e) => server_error(e),
     }
 }

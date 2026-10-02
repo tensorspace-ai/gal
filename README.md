@@ -517,7 +517,9 @@ The interesting parts:
   the hash so it costs no CPU either.
 - **Sessions can be revoked without changing your password** — "Sessions" in
   the sidebar ends every other browser and device. Previously the only way to
-  sign out a lost laptop was to change your password.
+  sign out a lost laptop was to change your password. Logout, password changes,
+  and session revocation close affected WebSockets too; an open socket also
+  closes when its session expires.
 - **No email address is collected.** One used to be accepted at registration
   and written to the database, where nothing ever read it: unverified personal
   data held for no purpose, with no way to delete it. The client never sent one.
@@ -581,8 +583,8 @@ Disclosed rather than hidden, because some of these matter for how you deploy it
   every other session without changing it, but there is no email-based
   recovery — Gal sends no mail and holds no address — so a forgotten password
   still needs an operator to intervene in the database.
-- **One factor, and no single sign-on.** Username and password is the only way
-  in. No TOTP, no passkeys, no OIDC or SAML.
+- **No local second factor.** Local sign-in has no TOTP or passkeys. An OpenID
+  Connect provider can supply its own authentication policy; SAML is not supported.
 - **No account deletion or data export.**
 - **No moderation surface.** No way to suspend an account or audit participant
   changes.

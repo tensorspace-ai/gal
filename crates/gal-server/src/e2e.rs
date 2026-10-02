@@ -4487,3 +4487,96 @@ async fn private_reply_creation_and_eviction_share_the_wave_lock() {
         2
     );
 }
+
+#[tokio::test]
+async fn session_revocation_closes_existing_sockets_and_preserves_other_sessions() {
+    for action in ["logout", "sessions/revoke", "password"] {
+        let server = start_server().await;
+        let first = server.register("alice").await;
+        let bob_cookie = server.register("bob").await;
+        let http = reqwest::Client::new();
+        let response = http
+            .post(format!("{}/api/login", server.base))
+            .json(&serde_json::json!({ "name": "alice", "password": "correct horse battery" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let second = response
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let mut first_tab = server.connect(&first).await;
+        let mut first_other_tab = server.connect(&first).await;
+        let mut second_tab = server.connect(&second).await;
+        let mut bob = server.connect(&bob_cookie).await;
+        let mut request = http
+            .post(format!("{}/api/{action}", server.base))
+            .header("cookie", &first);
+        if action == "password" {
+            request = request.json(&serde_json::json!({ "currentPassword": "correct horse battery", "newPassword": "new correct horse battery" }));
+        }
+        assert!(request.send().await.unwrap().status().is_success());
+        let remaining = if action == "logout" { 1 } else { 2 };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.state.connections_for(&first_tab.user.id) != remaining {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let survivor = if action == "logout" {
+            &mut second_tab
+        } else {
+            &mut first_tab
+        };
+        survivor.send(ClientMessage::Ping).await;
+        survivor
+            .recv_until(|m| matches!(m, ServerMessage::Pong).then_some(()))
+            .await;
+        bob.send(ClientMessage::Ping).await;
+        bob.recv_until(|m| matches!(m, ServerMessage::Pong).then_some(()))
+            .await;
+        assert_eq!(server.state.connections_for(&bob.user.id), 1);
+        let mut closed = if action == "logout" {
+            vec![&mut first_tab, &mut first_other_tab]
+        } else {
+            vec![&mut second_tab]
+        };
+        for client in &mut closed {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.socket.next())
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(frame, None | Some(Ok(Message::Close(_))) | Some(Err(_))),
+                "revoked socket remained usable: {frame:?}"
+            );
+        }
+        drop(first_other_tab);
+    }
+}
+
+#[tokio::test]
+async fn an_open_socket_closes_when_its_session_expires() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let conn = rusqlite::Connection::open(&server.state.config.database).unwrap();
+    conn.execute("UPDATE sessions SET expires_at = ?1", [now() + 500])
+        .unwrap();
+    let alice = server.connect(&cookie).await;
+    assert_eq!(server.state.connections_for(&alice.user.id), 1);
+    assert_eq!(
+        server
+            .state
+            .drain_connections(std::time::Duration::from_secs(5))
+            .await,
+        0
+    );
+}

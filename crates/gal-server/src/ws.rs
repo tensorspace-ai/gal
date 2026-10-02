@@ -81,7 +81,7 @@ pub async fn handler(
 
     upgrade
         .max_message_size(MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| connection(socket, state, identity.user))
+        .on_upgrade(move |socket| connection(socket, state, identity))
 }
 
 /// Per-connection state that only the reader task touches.
@@ -95,6 +95,7 @@ struct Session {
     /// only when its outbound queue overflowed, meaning it has missed messages
     /// and must resynchronise from scratch.
     kill: Arc<Notify>,
+    token_hash: String,
 }
 
 impl Session {
@@ -105,7 +106,9 @@ impl Session {
     }
 }
 
-async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
+async fn connection(socket: WebSocket, state: Arc<AppState>, identity: Identity) {
+    let user = identity.user;
+    let token_hash = identity.token_hash;
     let (mut sink, mut stream) = socket.split();
 
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(OUTBOUND_CAPACITY);
@@ -115,6 +118,7 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         tx.clone(),
         kill.clone(),
         MAX_CONNECTIONS_PER_USER,
+        token_hash.clone(),
     ) else {
         tracing::warn!(
             user = %user.id,
@@ -172,6 +176,7 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         subscribed: HashSet::new(),
         tx,
         kill: kill.clone(),
+        token_hash,
     };
 
     read_commands(&mut stream, &state, &mut session, &ping_tx).await;
@@ -181,13 +186,13 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         leave_wave(&state, &mut session, &wave_id).await;
     }
     state.unregister_conn(conn_id);
-    state.metrics.connection_closed();
-    tracing::debug!(conn = conn_id, user = %user.id, "websocket closed");
     // Give queued replies a chance to leave (including a failed greeting),
     // but do not let a stalled peer keep the writer alive indefinitely.
     drop(session);
     let _ = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
     writer.abort();
+    state.metrics.connection_closed();
+    tracing::debug!(conn = conn_id, user = %user.id, "websocket closed");
 }
 
 async fn read_commands(
@@ -202,12 +207,34 @@ async fn read_commands(
     let user = session.user.clone();
     let conn_id = session.conn_id;
     let kill = session.kill.clone();
+    let expires_at = match state.db.session_expiry(session.token_hash.clone()).await {
+        Ok(Some(expiry)) => expiry,
+        Ok(None) => {
+            session.send(ServerMessage::error(
+                ErrorCode::Forbidden,
+                "Your session has ended. Sign in again.",
+            ));
+            return;
+        }
+        Err(error) => {
+            session.send(*internal(error));
+            return;
+        }
+    };
+    let expires_in = Duration::from_millis(expires_at.saturating_sub(now()).max(0) as u64);
+    let expires = tokio::time::Instant::now() + expires_in;
     // Greet with the user's identity and inbox.
     //
     // An empty inbox on a database error reads to the user as "my conversations
     // are gone" — the exact failure `migrate` refuses to start rather than
     // cause. Say the inbox could not be loaded instead, and let them retry.
-    let inbox = match state.db.inbox(&user.id).await {
+    let loaded = tokio::select! {
+        biased;
+        _ = kill.notified() => return,
+        _ = tokio::time::sleep_until(expires) => return,
+        loaded = state.db.inbox(&user.id) => loaded,
+    };
+    let inbox = match loaded {
         Ok(inbox) => inbox,
         Err(err) => {
             tracing::error!(user = %user.id, error = %err, "loading inbox for welcome");
@@ -236,6 +263,7 @@ async fn read_commands(
             // A client that overflowed its queue has already missed messages;
             // closing is what makes it reconnect and resynchronise.
             _ = kill.notified() => break,
+            _ = tokio::time::sleep_until(expires) => break,
             // The server is stopping. Closing is the whole notice: the client
             // reconnects with backoff and replays what it had not sent, which
             // is the same path an outage already takes.

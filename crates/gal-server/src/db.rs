@@ -319,6 +319,21 @@ impl Storage {
         .await
     }
 
+    /// Recheck after registering an upgraded socket, so a concurrent logout
+    /// cannot miss a connection that authenticated before its token was revoked.
+    pub async fn session_expiry(&self, token_hash: String) -> Result<Option<Timestamp>> {
+        self.run(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT expires_at FROM sessions WHERE token_hash = ?1 AND expires_at > ?2",
+                    params![token_hash, now()],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
     /// Replace a user's password hash and revoke every session except the one
     /// making the change.
     ///

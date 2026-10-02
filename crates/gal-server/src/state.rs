@@ -466,6 +466,7 @@ pub struct ConnHandle {
     pub user_id: UserId,
     pub tx: mpsc::Sender<ServerMessage>,
     pub kill: Arc<Notify>,
+    pub token_hash: String,
 }
 
 impl ConnHandle {
@@ -686,7 +687,13 @@ impl AppState {
     pub async fn drain_connections(&self, grace: std::time::Duration) -> usize {
         let deadline = std::time::Instant::now() + grace;
         loop {
-            let open = self.conns.len();
+            // A reader releases its registration before its writer finishes
+            // flushing. Count the writer too before declaring shutdown drained.
+            let open = self
+                .metrics
+                .ws_connections_active
+                .load(Ordering::Relaxed)
+                .max(0) as usize;
             if open == 0 || std::time::Instant::now() >= deadline {
                 return open;
             }
@@ -707,6 +714,7 @@ impl AppState {
         tx: mpsc::Sender<ServerMessage>,
         kill: Arc<Notify>,
         limit: usize,
+        token_hash: String,
     ) -> Option<ConnId> {
         // Checking and claiming a slot share the same entry lock. Separate
         // calls let a burst of upgrades all observe the same free slot.
@@ -715,7 +723,15 @@ impl AppState {
             return None;
         }
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        self.conns.insert(id, ConnHandle { user_id, tx, kill });
+        self.conns.insert(
+            id,
+            ConnHandle {
+                user_id,
+                tx,
+                kill,
+                token_hash,
+            },
+        );
         connections.insert(id);
         Some(id)
     }
@@ -727,6 +743,32 @@ impl AppState {
             }
             self.user_conns
                 .remove_if(&handle.user_id, |_, set| set.is_empty());
+        }
+    }
+
+    pub fn disconnect_session(&self, user_id: &UserId, token_hash: &str) {
+        let Some(conn_ids) = self.user_conns.get(user_id).map(|s| s.clone()) else {
+            return;
+        };
+        for conn_id in conn_ids {
+            if let Some(handle) = self.conns.get(&conn_id) {
+                if handle.token_hash == token_hash {
+                    handle.kill.notify_one();
+                }
+            }
+        }
+    }
+
+    pub fn disconnect_other_sessions(&self, user_id: &UserId, keep: &str) {
+        let Some(conn_ids) = self.user_conns.get(user_id).map(|s| s.clone()) else {
+            return;
+        };
+        for conn_id in conn_ids {
+            if let Some(handle) = self.conns.get(&conn_id) {
+                if handle.token_hash != keep {
+                    handle.kill.notify_one();
+                }
+            }
         }
     }
 
