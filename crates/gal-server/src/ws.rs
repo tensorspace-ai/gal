@@ -1497,13 +1497,15 @@ async fn private_reply(
         .insert(blip.id.clone(), crate::state::LiveBlip::new(blip.clone()));
 
     let empty = Default::default();
-    let users = live.user_cache.clone();
     let view = WaveletView {
         id: wavelet.id.clone(),
         wave_id: wave_id.clone(),
         kind: wavelet.kind,
         title: wavelet.title.clone(),
-        participants: ids.iter().filter_map(|id| users.get(id).cloned()).collect(),
+        participants: ids
+            .iter()
+            .filter_map(|id| live.user_cache.get(id).cloned())
+            .collect(),
         anchor_blip: wavelet.anchor_blip.clone(),
         created_at: wavelet.created_at,
         last_modified: wavelet.last_modified,

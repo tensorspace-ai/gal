@@ -4156,3 +4156,29 @@ async fn concurrent_upgrades_share_one_connection_allowance() {
     assert_eq!(welcomed, 24);
     assert_eq!(refused, 24);
 }
+
+#[tokio::test]
+async fn registering_an_unrelated_account_does_not_expand_wave_caches() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, wavelet_id, _) = create_wave(&mut alice, "Scoped profiles", vec![]).await;
+    let wave = server.state.open_wave(&wave_id).await.unwrap().unwrap();
+    assert_eq!(wave.lock().await.user_cache.len(), 1);
+    server.register("outsider").await;
+    assert_eq!(wave.lock().await.user_cache.len(), 1);
+    alice
+        .send(ClientMessage::AddParticipant {
+            wavelet_id,
+            name: "outsider".into(),
+        })
+        .await;
+    let added = alice
+        .recv_until(|m| match m {
+            ServerMessage::ParticipantAdded { user, .. } => Some(user.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(added.name, "outsider");
+    assert_eq!(wave.lock().await.user_cache.len(), 2);
+}

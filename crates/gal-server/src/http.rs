@@ -210,7 +210,6 @@ async fn register(
         Err(_) => return bad_request("That username is already taken."),
     };
 
-    state.cache_user(user.public()).await;
     issue_session(&state, &user).await
 }
 

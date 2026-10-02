@@ -5,7 +5,11 @@
 //! writer holds the lock, and a busy timeout absorbs the brief contention when
 //! two waves commit at once.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+
+use tokio::sync::Semaphore;
 
 use anyhow::{Context, Result};
 use gal_core::model::*;
@@ -17,6 +21,8 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, Tra
 
 pub type SqlitePool = Pool<SqliteConnectionManager>;
 
+const DB_CONNECTIONS: u32 = 16;
+
 /// How much one account may still upload, and over what window.
 #[derive(Clone, Copy, Debug)]
 pub struct UploadQuota {
@@ -27,6 +33,7 @@ pub struct UploadQuota {
 #[derive(Clone)]
 pub struct Storage {
     pool: SqlitePool,
+    permits: Arc<Semaphore>,
 }
 
 /// How long a login stays valid.
@@ -63,7 +70,7 @@ impl Storage {
             )
         });
         let pool = Pool::builder()
-            .max_size(16)
+            .max_size(DB_CONNECTIONS)
             // r2d2 defaults to 30s, which turns "the path is unwritable" into
             // half a minute of silence followed by a misleading timeout error.
             .connection_timeout(std::time::Duration::from_secs(3))
@@ -72,7 +79,10 @@ impl Storage {
 
         let mut conn = pool.get().context("could not open the database")?;
         migrate(&mut conn)?;
-        Ok(Storage { pool })
+        Ok(Storage {
+            pool,
+            permits: Arc::new(Semaphore::new(DB_CONNECTIONS as usize)),
+        })
     }
 
     /// Run a blocking database closure on the thread pool.
@@ -81,8 +91,15 @@ impl Storage {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
+        // Wait asynchronously before claiming a blocking worker. Otherwise
+        // pool contention creates threads whose only work is waiting for one
+        // of sixteen connections, crowding out password hashing and file I/O.
+        let permit = self.permits.clone().acquire_owned().await?;
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
+            // Kept inside the closure even if its caller is cancelled: a
+            // blocking task keeps running until it returns its connection.
+            let _permit = permit;
             let mut conn = pool.get().context("no database connection available")?;
             f(&mut conn)
         })
@@ -224,28 +241,31 @@ impl Storage {
         let id = user_id.clone();
         self.run(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT u.* FROM users u
+                "SELECT DISTINCT u.id, u.name, u.display_name, u.color FROM users u
                  JOIN participants p ON p.user_id = u.id
                  WHERE p.wavelet_id IN (
                      SELECT wavelet_id FROM participants WHERE user_id = ?1)
                  ORDER BY u.display_name",
             )?;
-            let rows =
-                stmt.query_map(params![id.as_str()], |r| row_to_user(r).map(|u| u.public()))?;
+            let rows = stmt.query_map(params![id.as_str()], row_to_public_user)?;
             let users = rows.collect::<Result<Vec<_>, _>>()?;
             Ok(users)
         })
         .await
     }
 
-    /// Every user. Internal use only — never expose this to a client, because a
-    /// full member directory is exactly what an abuser needs to spam or target
-    /// everyone on the server.
-    pub async fn all_users(&self) -> Result<Vec<PublicUser>> {
-        self.run(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM users ORDER BY display_name")?;
-            let rows = stmt.query_map([], |r| row_to_user(r).map(|u| u.public()))?;
-            let users = rows.collect::<Result<Vec<_>, _>>()?;
+    /// Profiles used to render this wave's membership and presence.
+    pub async fn users_of_wave(&self, wave_id: &WaveId) -> Result<Vec<PublicUser>> {
+        let id = wave_id.clone();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT u.id, u.name, u.display_name, u.color FROM wavelets w
+                 JOIN participants p ON p.wavelet_id = w.id
+                 JOIN users u ON u.id = p.user_id WHERE w.wave_id = ?1",
+            )?;
+            let users = stmt
+                .query_map(params![id.as_str()], row_to_public_user)?
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(users)
         })
         .await
@@ -820,13 +840,15 @@ impl Storage {
 
     /// Every wave the user participates in, as inbox rows.
     ///
-    /// Built from four bulk queries rather than one per wave, so inbox load
-    /// stays flat as the number of waves grows.
+    /// Five bulk queries, with constant-time lookups into the result rows.
+    /// Work scales with the caller's waves and memberships, not all accounts.
     pub async fn inbox(&self, user_id: &UserId) -> Result<Vec<WaveSummary>> {
         let uid = user_id.clone();
-        let users = self.all_users().await?;
 
         self.run(move |conn| {
+            // One snapshot for the roster, snippets, unread counts and flags.
+            let tx = conn.transaction()?;
+            let conn = &tx;
             let me = uid.as_str().to_string();
 
             // 1. Root wavelet of every wave the user can see.
@@ -855,14 +877,17 @@ impl Storage {
                 })?
                 .collect::<Result<_, _>>()?;
 
-            let index = |summaries: &mut Vec<WaveSummary>, id: &str| -> Option<usize> {
-                summaries.iter().position(|s| s.id.as_str() == id)
-            };
+            let index: HashMap<String, usize> = summaries
+                .iter()
+                .enumerate()
+                .map(|(i, summary)| (summary.id.as_str().to_string(), i))
+                .collect();
 
             // 2. Participants of each root wavelet.
             let mut stmt = conn.prepare(
-                "SELECT s.wave_id, p.user_id FROM wavelets s
+                "SELECT s.wave_id, u.id, u.name, u.display_name, u.color FROM wavelets s
                  JOIN participants p ON p.wavelet_id = s.id
+                 JOIN users u ON u.id = p.user_id
                  WHERE s.kind = 'conversation'
                    AND s.wave_id IN (
                        SELECT s2.wave_id FROM wavelets s2
@@ -871,14 +896,12 @@ impl Storage {
                  ORDER BY p.added_at",
             )?;
             let rows = stmt.query_map(params![me], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                Ok((r.get::<_, String>(0)?, row_to_public_user(r)?))
             })?;
             for row in rows {
-                let (wave_id, user_id) = row?;
-                if let Some(i) = index(&mut summaries, &wave_id) {
-                    if let Some(u) = users.iter().find(|u| u.id.as_str() == user_id) {
-                        summaries[i].participants.push(u.clone());
-                    }
+                let (wave_id, user) = row?;
+                if let Some(&i) = index.get(&wave_id) {
+                    summaries[i].participants.push(user);
                 }
             }
 
@@ -910,7 +933,7 @@ impl Storage {
             })?;
             for row in rows {
                 let (wave_id, count, author, content, last) = row?;
-                if let Some(i) = index(&mut summaries, &wave_id) {
+                if let Some(&i) = index.get(&wave_id) {
                     summaries[i].blip_count = count as usize;
                     summaries[i].snippet_author = Some(UserId(author));
                     summaries[i].last_modified = summaries[i].last_modified.max(last);
@@ -935,7 +958,7 @@ impl Storage {
             })?;
             for row in rows {
                 let (wave_id, count) = row?;
-                if let Some(i) = index(&mut summaries, &wave_id) {
+                if let Some(&i) = index.get(&wave_id) {
                     summaries[i].unread_count = count as usize;
                 }
             }
@@ -952,7 +975,7 @@ impl Storage {
             })?;
             for row in rows {
                 let (wave_id, archived, muted) = row?;
-                if let Some(i) = index(&mut summaries, &wave_id) {
+                if let Some(&i) = index.get(&wave_id) {
                     summaries[i].flags = WaveFlags {
                         archived: archived != 0,
                         muted: muted != 0,
@@ -978,9 +1001,11 @@ impl Storage {
         wave_id: &WaveId,
     ) -> Result<Option<WaveSummary>> {
         let (uid, wid) = (user_id.clone(), wave_id.clone());
-        let users = self.all_users().await?;
 
         self.run(move |conn| {
+            // One snapshot for the roster, snippets, unread counts and flags.
+            let tx = conn.transaction()?;
+            let conn = &tx;
             let (me, wave) = (uid.as_str(), wid.as_str());
 
             // Visibility and the row itself in one query: no root wavelet the
@@ -1013,17 +1038,14 @@ impl Storage {
             };
 
             let mut stmt = conn.prepare(
-                "SELECT p.user_id FROM wavelets s
+                "SELECT u.id, u.name, u.display_name, u.color FROM wavelets s
                  JOIN participants p ON p.wavelet_id = s.id
+                 JOIN users u ON u.id = p.user_id
                  WHERE s.wave_id = ?1 AND s.kind = 'conversation' ORDER BY p.added_at",
             )?;
-            let rows = stmt.query_map(params![wave], |r| r.get::<_, String>(0))?;
-            for row in rows {
-                let id = row?;
-                if let Some(u) = users.iter().find(|u| u.id.as_str() == id) {
-                    summary.participants.push(u.clone());
-                }
-            }
+            summary.participants = stmt
+                .query_map(params![wave], row_to_public_user)?
+                .collect::<Result<Vec<_>, _>>()?;
 
             if let Some((count, author, content, last)) = conn
                 .query_row(
@@ -1758,6 +1780,15 @@ fn row_to_user(row: &Row<'_>) -> rusqlite::Result<User> {
         password_hash: row.get("password_hash")?,
         color: row.get::<_, i64>("color")? as u16,
         created_at: row.get("created_at")?,
+    })
+}
+
+fn row_to_public_user(row: &Row<'_>) -> rusqlite::Result<PublicUser> {
+    Ok(PublicUser {
+        id: UserId(row.get("id")?),
+        name: row.get("name")?,
+        display_name: row.get("display_name")?,
+        color: row.get::<_, i64>("color")? as u16,
     })
 }
 
@@ -3106,5 +3137,98 @@ mod tests {
             storage.search(&alice.id, "unrelated").await.unwrap()[0].blip_id,
             second.id
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_summaries_agree_with_the_bulk_inbox() {
+        let (storage, _dir) = temp_storage().await;
+        let alice = make_user(&storage, "alice").await;
+        let bob = make_user(&storage, "bob").await;
+        let outsider = make_user(&storage, "outsider").await;
+        for i in 0..32 {
+            let (wave, wavelet) = storage
+                .create_wave(
+                    alice.id.clone(),
+                    format!("Wave {i}"),
+                    vec![alice.id.clone(), bob.id.clone()],
+                    WaveMode::Document,
+                )
+                .await
+                .unwrap();
+            let mut blip = Blip::new(
+                wave.id.clone(),
+                wavelet.id.clone(),
+                alice.id.clone(),
+                None,
+                0,
+            );
+            blip.content = Delta::document(format!("Content {i}"));
+            blip.revision = 1;
+            storage.insert_blip(blip).await.unwrap();
+            storage
+                .set_flags(
+                    &bob.id,
+                    &wave.id,
+                    WaveFlags {
+                        archived: i % 2 == 0,
+                        muted: i % 3 == 0,
+                    },
+                )
+                .await
+                .unwrap();
+            if i % 4 == 0 {
+                storage.mark_wave_read(&bob.id, &wave.id).await.unwrap();
+            }
+            let profiles = storage.users_of_wave(&wave.id).await.unwrap();
+            assert_eq!(profiles.len(), 2);
+            assert!(!profiles.iter().any(|u| u.id == outsider.id));
+        }
+        let inbox = storage.inbox(&bob.id).await.unwrap();
+        assert_eq!(inbox.len(), 32);
+        for row in inbox {
+            let single = storage
+                .wave_summary(&bob.id, &row.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(row).unwrap(),
+                serde_json::to_value(single).unwrap()
+            );
+        }
+        assert!(storage.inbox(&outsider.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_database_caller_does_not_free_a_running_workers_slot() {
+        let (storage, _dir) = temp_storage().await;
+        let worker = storage.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            worker
+                .run(move |_| {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv()?;
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            storage.permits.available_permits(),
+            DB_CONNECTIONS as usize - 1
+        );
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while storage.permits.available_permits() != DB_CONNECTIONS as usize {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(storage.user_count().await.unwrap(), 0);
     }
 }

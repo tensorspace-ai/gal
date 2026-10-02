@@ -331,9 +331,6 @@ pub async fn callback(
     let user = match outcome {
         Ok(OauthLogin::Existing(user)) => user,
         Ok(OauthLogin::Created(user)) => {
-            // Same as registration: make the account visible to waves that are
-            // already resident, or it renders as an unknown id until a restart.
-            state.cache_user(user.public()).await;
             tracing::info!(name = %user.name, "created an account from a provider sign-in");
             user
         }

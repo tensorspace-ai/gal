@@ -763,7 +763,7 @@ impl AppState {
         let wavelets = self.db.wavelets_of_wave(wave_id).await?;
         let blips = self.db.blips_of_wave(wave_id).await?;
         let comments = self.db.comments_of_wave(wave_id).await?;
-        let all_users = self.db.all_users().await?;
+        let users = self.db.users_of_wave(wave_id).await?;
 
         let mut live = LiveWave {
             wave,
@@ -778,7 +778,7 @@ impl AppState {
             evicted: false,
             metrics: self.metrics.clone(),
         };
-        live.user_cache = all_users.into_iter().map(|u| (u.id.clone(), u)).collect();
+        live.user_cache = users.into_iter().map(|u| (u.id.clone(), u)).collect();
 
         let arc = Arc::new(Mutex::new(live));
         self.waves.insert(wave_id.clone(), arc.clone());
@@ -841,18 +841,6 @@ impl AppState {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Refresh the cached profile of a user in every resident wave, so a newly
-    /// registered account renders correctly in waves already in memory.
-    pub async fn cache_user(&self, user: PublicUser) {
-        let waves: Vec<_> = self.waves.iter().map(|e| e.value().clone()).collect();
-        for wave in waves {
-            wave.lock()
-                .await
-                .user_cache
-                .insert(user.id.clone(), user.clone());
-        }
-    }
-
     // --- op application -------------------------------------------------
 
     /// Apply a client op to a blip and fan the result out.
@@ -895,11 +883,6 @@ impl AppState {
         if let Some(op_id) = op_id.as_deref() {
             match self.db.revision_for_op(blip_id, op_id).await {
                 Ok(Some(revision)) => {
-                    let content = live
-                        .blips
-                        .get(blip_id)
-                        .map(|b| b.doc.content().clone())
-                        .unwrap_or_default();
                     live.send_to(
                         conn_id,
                         ServerMessage::Ack {
@@ -910,7 +893,6 @@ impl AppState {
                             op_id: Some(op_id.to_string()),
                         },
                     );
-                    let _ = content;
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -1075,8 +1057,8 @@ impl AppState {
         // Read the participant set from storage rather than via `open_wave`.
         // Going through residency here would re-load a wave that nobody is
         // watching, and nothing would ever evict it again — an unbounded leak,
-        // since each resident wave pins every blip's history plus a copy of the
-        // user directory.
+        // since each resident wave pins every blip's history plus its participant
+        // profiles.
         let participants = match self.db.wave_participants(wave_id).await {
             Ok(p) => p,
             Err(e) => {
