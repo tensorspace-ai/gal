@@ -1142,9 +1142,11 @@ async fn shutting_down_closes_the_sockets_instead_of_dropping_them() {
     );
 
     // And the edit that was acknowledged before the shutdown is still there.
-    let mut after = server.connect(&cookie).await;
-    after.open(&wave_id).await;
-    assert_eq!(after.text(&blip), "committed before the deploy");
+    let stored = server.state.db.blips_of_wave(&wave_id).await.unwrap();
+    assert_eq!(
+        stored[0].content.to_plain_text(),
+        "committed before the deploy"
+    );
 }
 
 #[tokio::test]
@@ -4012,4 +4014,145 @@ async fn the_login_screen_is_told_whether_a_provider_exists() {
         .await
         .unwrap();
     assert_eq!(started.status(), 404);
+}
+
+#[tokio::test]
+async fn a_disconnect_while_a_command_is_busy_is_not_lost() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave_id, wavelet_id, _) = create_wave(&mut alice, "Busy", vec![]).await;
+    let wave = server.state.open_wave(&wave_id).await.unwrap().unwrap();
+    let mut live = wave.lock().await;
+    // Hold the lock so the reader is inside dispatch, not waiting on kill.
+    alice
+        .send(ClientMessage::SetTitle {
+            wavelet_id,
+            title: "Blocked".into(),
+        })
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !server.state.metrics.ws_commands.contains_key("setTitle") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let conn_id = *live.subscribers.keys().next().unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    live.subscribers.get_mut(&conn_id).unwrap().tx = tx;
+    live.send_to(conn_id, ServerMessage::Pong);
+    live.send_to(conn_id, ServerMessage::Pong);
+    assert!(live.subscribers.is_empty());
+    drop(live);
+    assert_eq!(
+        server
+            .state
+            .drain_connections(std::time::Duration::from_secs(5))
+            .await,
+        0
+    );
+    assert_eq!(
+        server
+            .state
+            .metrics
+            .ws_slow_client_disconnects
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_failed_greeting_releases_the_connection_slot() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let user = server
+        .state
+        .db
+        .user_by_name("alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let conn = rusqlite::Connection::open(&server.state.config.database).unwrap();
+    conn.execute_batch("DROP TABLE blips").unwrap();
+    let mut alice = server.connect_raw(&cookie).await;
+    let code = alice
+        .recv_until(|m| match m {
+            ServerMessage::Error { code, .. } => Some(*code),
+            _ => None,
+        })
+        .await;
+    assert_eq!(code, ErrorCode::Internal);
+    assert_eq!(
+        server
+            .state
+            .drain_connections(std::time::Duration::from_secs(5))
+            .await,
+        0
+    );
+    assert_eq!(server.state.connections_for(&user.id), 0);
+    assert_eq!(
+        server
+            .state
+            .metrics
+            .ws_connections_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_finishing_after_shutdown_closes_too() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    server.state.begin_shutdown();
+    let _alice = server.connect(&cookie).await;
+    assert_eq!(
+        server
+            .state
+            .drain_connections(std::time::Duration::from_secs(5))
+            .await,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_upgrades_share_one_connection_allowance() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut tasks = Vec::new();
+    for _ in 0..48 {
+        let mut request = (server.base.replace("http://", "ws://") + "/ws")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        tasks.push(tokio::spawn(async move {
+            let (mut socket, _) = connect_async(request).await.unwrap();
+            let frame = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = frame else {
+                panic!("expected response")
+            };
+            let message: ServerMessage = serde_json::from_str(&text).unwrap();
+            (socket, message)
+        }));
+    }
+    let mut held = Vec::new();
+    let mut welcomed = 0;
+    let mut refused = 0;
+    for task in tasks {
+        let (socket, message) = task.await.unwrap();
+        match message {
+            ServerMessage::Welcome { .. } => welcomed += 1,
+            ServerMessage::Error {
+                code: ErrorCode::TooManyRequests,
+                ..
+            } => refused += 1,
+            other => panic!("unexpected upgrade response: {other:?}"),
+        }
+        held.push(socket);
+    }
+    assert_eq!(welcomed, 24);
+    assert_eq!(refused, 24);
 }

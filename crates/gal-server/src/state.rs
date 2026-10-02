@@ -262,9 +262,9 @@ impl LiveWave {
     pub fn disconnect(&mut self, conn_ids: &[ConnId]) {
         for conn_id in conn_ids {
             if let Some(sub) = self.subscribers.remove(conn_id) {
-                // Wakes the connection task, which closes the socket. The client
-                // reconnects and re-opens, which is a full resynchronisation.
-                sub.kill.notify_waiters();
+                // Store a permit even if the reader is busy in a command. There
+                // is one reader; notify_waiters would lose this signal then.
+                sub.kill.notify_one();
                 // Counted and logged because it is otherwise perfectly silent:
                 // the user sees a reconnect, the operator sees nothing, and a
                 // server that is quietly resynchronising everybody looks
@@ -465,6 +465,15 @@ pub fn blip_view(blip: &Blip, read_marks: &HashMap<BlipId, u64>) -> BlipView {
 pub struct ConnHandle {
     pub user_id: UserId,
     pub tx: mpsc::Sender<ServerMessage>,
+    pub kill: Arc<Notify>,
+}
+
+impl ConnHandle {
+    pub fn send(&self, message: ServerMessage) {
+        if self.tx.try_send(message).is_err() {
+            self.kill.notify_one();
+        }
+    }
 }
 
 /// Bucket key for sign-in failures. Prefixed so it can never collide with the
@@ -661,7 +670,7 @@ impl AppState {
 
     /// Tell every connection to finish and close.
     pub fn begin_shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 
     /// Wait for the open sockets to go away, up to `grace`.
@@ -692,17 +701,23 @@ impl AppState {
         self.user_conns.get(user_id).map(|s| s.len()).unwrap_or(0)
     }
 
-    pub fn register_conn(&self, user_id: UserId, tx: mpsc::Sender<ServerMessage>) -> ConnId {
+    pub fn register_conn(
+        &self,
+        user_id: UserId,
+        tx: mpsc::Sender<ServerMessage>,
+        kill: Arc<Notify>,
+        limit: usize,
+    ) -> Option<ConnId> {
+        // Checking and claiming a slot share the same entry lock. Separate
+        // calls let a burst of upgrades all observe the same free slot.
+        let mut connections = self.user_conns.entry(user_id.clone()).or_default();
+        if connections.len() >= limit {
+            return None;
+        }
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        self.conns.insert(
-            id,
-            ConnHandle {
-                user_id: user_id.clone(),
-                tx,
-            },
-        );
-        self.user_conns.entry(user_id).or_default().insert(id);
-        id
+        self.conns.insert(id, ConnHandle { user_id, tx, kill });
+        connections.insert(id);
+        Some(id)
     }
 
     pub fn unregister_conn(&self, conn_id: ConnId) {
@@ -722,7 +737,7 @@ impl AppState {
         };
         for conn_id in conn_ids {
             if let Some(handle) = self.conns.get(&conn_id) {
-                let _ = handle.tx.try_send(message.clone());
+                handle.send(message.clone());
             }
         }
     }

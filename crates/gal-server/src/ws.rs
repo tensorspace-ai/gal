@@ -15,7 +15,6 @@ use futures::{FutureExt, SinkExt, StreamExt};
 use gal_core::model::*;
 use gal_core::protocol::*;
 use gal_ot::{Delta, Insert, OpKind};
-use std::sync::Arc as StdArc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Notify};
 
@@ -95,13 +94,28 @@ struct Session {
     /// Fired by the server when this connection must be torn down — currently
     /// only when its outbound queue overflowed, meaning it has missed messages
     /// and must resynchronise from scratch.
-    kill: StdArc<Notify>,
+    kill: Arc<Notify>,
+}
+
+impl Session {
+    fn send(&self, message: ServerMessage) {
+        if self.tx.try_send(message).is_err() {
+            self.kill.notify_one();
+        }
+    }
 }
 
 async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
     let (mut sink, mut stream) = socket.split();
 
-    if state.connections_for(&user.id) >= MAX_CONNECTIONS_PER_USER {
+    let (tx, mut rx) = mpsc::channel::<ServerMessage>(OUTBOUND_CAPACITY);
+    let kill = Arc::new(Notify::new());
+    let Some(conn_id) = state.register_conn(
+        user.id.clone(),
+        tx.clone(),
+        kill.clone(),
+        MAX_CONNECTIONS_PER_USER,
+    ) else {
         tracing::warn!(
             user = %user.id,
             open = state.connections_for(&user.id),
@@ -118,10 +132,7 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         }
         let _ = sink.close().await;
         return;
-    }
-
-    let (tx, mut rx) = mpsc::channel::<ServerMessage>(OUTBOUND_CAPACITY);
-    let conn_id = state.register_conn(user.id.clone(), tx.clone());
+    };
     state.metrics.connection_opened();
     tracing::debug!(conn = conn_id, user = %user.id, "websocket opened");
 
@@ -130,7 +141,8 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
     let (ping_tx, mut ping_rx) = mpsc::channel::<()>(1);
 
     // Writer task: the only place that touches the socket's send half.
-    let writer = tokio::spawn(async move {
+    let writer_kill = kill.clone();
+    let mut writer = tokio::spawn(async move {
         loop {
             tokio::select! {
                 message = rx.recv() => {
@@ -150,10 +162,10 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
                 }
             }
         }
+        writer_kill.notify_one();
         let _ = sink.close().await;
     });
 
-    let kill = StdArc::new(Notify::new());
     let mut session = Session {
         conn_id,
         user: user.clone(),
@@ -162,6 +174,34 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         kill: kill.clone(),
     };
 
+    read_commands(&mut stream, &state, &mut session, &ping_tx).await;
+
+    // Clean up: leave every wave, then drop the connection.
+    for wave_id in session.subscribed.clone() {
+        leave_wave(&state, &mut session, &wave_id).await;
+    }
+    state.unregister_conn(conn_id);
+    state.metrics.connection_closed();
+    tracing::debug!(conn = conn_id, user = %user.id, "websocket closed");
+    // Give queued replies a chance to leave (including a failed greeting),
+    // but do not let a stalled peer keep the writer alive indefinitely.
+    drop(session);
+    let _ = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
+    writer.abort();
+}
+
+async fn read_commands(
+    stream: &mut futures::stream::SplitStream<WebSocket>,
+    state: &Arc<AppState>,
+    session: &mut Session,
+    ping_tx: &mpsc::Sender<()>,
+) {
+    // Subscribe before loading the inbox, and inspect the current value too:
+    // shutdown may already have happened when this upgrade finishes.
+    let mut shutdown = state.shutdown_signal();
+    let user = session.user.clone();
+    let conn_id = session.conn_id;
+    let kill = session.kill.clone();
     // Greet with the user's identity and inbox.
     //
     // An empty inbox on a database error reads to the user as "my conversations
@@ -171,24 +211,26 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
         Ok(inbox) => inbox,
         Err(err) => {
             tracing::error!(user = %user.id, error = %err, "loading inbox for welcome");
-            let _ = session.tx.try_send(ServerMessage::error(
+            session.send(ServerMessage::error(
                 ErrorCode::Internal,
                 "could not load your inbox; reconnect to try again",
             ));
             return;
         }
     };
-    let _ = session.tx.try_send(ServerMessage::Welcome {
+    session.send(ServerMessage::Welcome {
         user: user.public(),
         inbox,
     });
 
-    let mut shutdown = state.shutdown_signal();
     let mut keepalive = tokio::time::interval(KEEPALIVE);
     keepalive.tick().await; // the first tick is immediate
     let mut last_heard = Instant::now();
 
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         let incoming = tokio::select! {
             biased;
             // A client that overflowed its queue has already missed messages;
@@ -237,7 +279,7 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
                 state.metrics.command(name);
 
                 if !state.check_command_rate(&session.user.id, &command) {
-                    let _ = session.tx.try_send(over_allowance(&command));
+                    session.send(over_allowance(&command));
                     continue;
                 }
                 // A panic in here is a bug, and it used to take the whole
@@ -245,13 +287,13 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
                 // in one wave an outage for every other connection on the box,
                 // which is also why the JoinError arms around the blocking pool
                 // were unreachable. Contain it to this connection instead.
-                let outcome = std::panic::AssertUnwindSafe(dispatch(&state, &mut session, command))
+                let outcome = std::panic::AssertUnwindSafe(dispatch(state, session, command))
                     .catch_unwind()
                     .await;
                 match outcome {
                     Ok(Ok(())) => {}
                     Ok(Err(reply)) => {
-                        let _ = session.tx.try_send(*reply);
+                        session.send(*reply);
                     }
                     Err(payload) => {
                         state
@@ -272,7 +314,7 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
                         for wave_id in session.subscribed.clone() {
                             state.evict_after_panic(&wave_id).await;
                         }
-                        let _ = session.tx.try_send(ServerMessage::error(
+                        session.send(ServerMessage::error(
                             ErrorCode::Internal,
                             "Something went wrong handling that. Reconnecting.",
                         ));
@@ -285,22 +327,13 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
                     .metrics
                     .ws_frames_unparseable
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let _ = session.tx.try_send(ServerMessage::error(
+                session.send(ServerMessage::error(
                     ErrorCode::BadRequest,
                     format!("Could not understand that message: {e}"),
                 ));
             }
         }
     }
-
-    // Clean up: leave every wave, then drop the connection.
-    for wave_id in session.subscribed.clone() {
-        leave_wave(&state, &mut session, &wave_id).await;
-    }
-    state.unregister_conn(conn_id);
-    state.metrics.connection_closed();
-    tracing::debug!(conn = conn_id, user = %user.id, "websocket closed");
-    writer.abort();
 }
 
 /// How to say "too fast" for a command that has been refused.
@@ -349,7 +382,7 @@ async fn dispatch(
 
     match command {
         ClientMessage::Ping => {
-            let _ = session.tx.try_send(ServerMessage::Pong);
+            session.send(ServerMessage::Pong);
             Ok(())
         }
 
@@ -486,9 +519,7 @@ async fn dispatch(
                 .playback(&session.user.id, &wave_id)
                 .await
                 .map_err(internal)?;
-            let _ = session
-                .tx
-                .try_send(ServerMessage::Playback { wave_id, frames });
+            session.send(ServerMessage::Playback { wave_id, frames });
             Ok(())
         }
 
@@ -498,9 +529,7 @@ async fn dispatch(
                 .search(&session.user.id, &query)
                 .await
                 .map_err(internal)?;
-            let _ = session
-                .tx
-                .try_send(ServerMessage::SearchResults { query, hits });
+            session.send(ServerMessage::SearchResults { query, hits });
             Ok(())
         }
     }
@@ -1619,7 +1648,7 @@ fn broadcast_presence(live: &mut LiveWave, wave_id: &WaveId) {
 /// Push one refreshed inbox row to the requesting connection.
 async fn send_inbox_row(state: &Arc<AppState>, session: &Session, wave_id: &WaveId) {
     if let Ok(Some(summary)) = state.db.wave_summary(&session.user.id, wave_id).await {
-        let _ = session.tx.try_send(ServerMessage::InboxUpdated { summary });
+        session.send(ServerMessage::InboxUpdated { summary });
     }
 }
 
