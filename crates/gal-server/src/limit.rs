@@ -23,8 +23,15 @@ struct Bucket {
     last: Instant,
 }
 
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+struct Buckets {
+    entries: HashMap<String, Bucket>,
+    last_cleanup: Instant,
+}
+
 pub struct RateLimiter {
-    buckets: Mutex<HashMap<String, Bucket>>,
+    buckets: Mutex<Buckets>,
     capacity: f64,
     refill_per_sec: f64,
     /// Stop tracking a key once it has been idle this long.
@@ -35,10 +42,15 @@ impl RateLimiter {
     /// `capacity` requests in a burst, refilling at `per_sec`.
     pub fn new(capacity: f64, per_sec: f64) -> Self {
         RateLimiter {
-            buckets: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(Buckets {
+                entries: HashMap::new(),
+                last_cleanup: Instant::now(),
+            }),
             capacity,
             refill_per_sec: per_sec,
-            idle_eviction: Duration::from_secs(600),
+            // Forgetting a bucket before it would have fully refilled grants
+            // tokens early. The account limiter needs twenty minutes, not ten.
+            idle_eviction: Duration::from_secs_f64((capacity / per_sec).max(600.0)),
         }
     }
 
@@ -72,7 +84,6 @@ impl RateLimiter {
     }
 
     fn take(&self, key: &str, cost: f64, consume: bool) -> bool {
-        let now = Instant::now();
         let mut buckets = match self.buckets.lock() {
             Ok(b) => b,
             // A poisoned lock must not take the server down; fail open rather
@@ -80,14 +91,20 @@ impl RateLimiter {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        // Opportunistic cleanup so the map cannot grow without bound from a
-        // stream of distinct source addresses.
-        if buckets.len() > 4096 {
+        let now = Instant::now();
+        // A large *active* map stays large after pruning. Scanning it on every
+        // command serialised all users behind O(accounts) work on the reactor.
+        if buckets.entries.len() > 4096
+            && now.duration_since(buckets.last_cleanup) >= CLEANUP_INTERVAL
+        {
             let idle = self.idle_eviction;
-            buckets.retain(|_, b| now.duration_since(b.last) < idle);
+            buckets
+                .entries
+                .retain(|_, b| now.duration_since(b.last) < idle);
+            buckets.last_cleanup = now;
         }
 
-        let bucket = buckets.entry(key.to_string()).or_insert(Bucket {
+        let bucket = buckets.entries.entry(key.to_string()).or_insert(Bucket {
             tokens: self.capacity,
             last: now,
         });
@@ -171,5 +188,83 @@ mod tests {
         assert_eq!(client_key(peer, Some("1.2.3.4, 10.0.0.9"), true), "1.2.3.4");
         assert_eq!(client_key(peer, None, true), "10.0.0.1");
         assert_eq!(client_key(peer, Some("   "), true), "10.0.0.1");
+    }
+
+    #[test]
+    fn pruning_does_not_refill_an_account_before_its_tokens_are_due() {
+        let limiter = RateLimiter::new(10.0, 1.0 / 120.0);
+        let now = Instant::now();
+        {
+            let mut buckets = limiter.buckets.lock().unwrap();
+            for i in 0..5000 {
+                buckets.entries.insert(
+                    format!("other-{i}"),
+                    Bucket {
+                        tokens: 10.0,
+                        last: now,
+                    },
+                );
+            }
+            buckets.entries.insert(
+                "account:alice".into(),
+                Bucket {
+                    tokens: 0.0,
+                    last: now - Duration::from_secs(650),
+                },
+            );
+            buckets.last_cleanup = now - CLEANUP_INTERVAL;
+        }
+        assert!(limiter.check("account:alice"));
+        let buckets = limiter.buckets.lock().unwrap();
+        let remaining = buckets.entries["account:alice"].tokens;
+        assert!(
+            (4.4..4.5).contains(&remaining),
+            "pruning refilled the account early: {remaining}"
+        );
+    }
+
+    #[test]
+    fn a_large_active_map_is_pruned_once_per_interval() {
+        let limiter = RateLimiter::new(5.0, 1.0);
+        let now = Instant::now();
+        {
+            let mut buckets = limiter.buckets.lock().unwrap();
+            for i in 0..5000 {
+                buckets.entries.insert(
+                    format!("key-{i}"),
+                    Bucket {
+                        tokens: 5.0,
+                        last: now,
+                    },
+                );
+            }
+            buckets.last_cleanup = now - CLEANUP_INTERVAL;
+        }
+        assert!(limiter.check("key-0"));
+        {
+            let mut buckets = limiter.buckets.lock().unwrap();
+            buckets.entries.get_mut("key-1").unwrap().last = now - Duration::from_secs(601);
+        }
+        assert!(limiter.check("key-0"));
+        assert!(
+            limiter
+                .buckets
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key("key-1"),
+            "a second call rescanned the active map"
+        );
+        limiter.buckets.lock().unwrap().last_cleanup = now - CLEANUP_INTERVAL;
+        assert!(limiter.check("key-0"));
+        assert!(
+            !limiter
+                .buckets
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key("key-1"),
+            "expired keys were never pruned"
+        );
     }
 }
