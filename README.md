@@ -514,7 +514,9 @@ The interesting parts:
   of them, or one with a list of addresses, all guessing at the same account.
   Ten failures, then one more every two minutes; only failures are charged, so
   signing in normally never touches it, and a locked account is refused before
-  the hash so it costs no CPU either.
+  the hash so it costs no CPU either. At most four password jobs run together;
+  further requests wait asynchronously, and queued sign-ins recheck the account
+  limit before hashing.
 - **Sessions can be revoked without changing your password** — "Sessions" in
   the sidebar ends every other browser and device. Previously the only way to
   sign out a lost laptop was to change your password. Logout, password changes,

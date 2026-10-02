@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use gal_core::model::*;
 use gal_core::protocol::*;
 use gal_ot::{Delta, OtError, ServerDoc};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 
 use crate::config::Config;
 use crate::db::Storage;
@@ -35,6 +35,10 @@ pub type ConnId = u64;
 /// an unread count. Recomputing that per keystroke for every non-viewing
 /// participant would dominate the server's work, so updates are batched.
 const INBOX_DEBOUNCE_MS: u64 = 600;
+
+/// Argon2 uses about 19 MiB per job. Per-address limits alone cannot bound
+/// simultaneous jobs from many addresses or keep them out of the DB workers.
+pub(crate) const MAX_PASSWORD_JOBS: usize = 4;
 
 /// Largest document a single blip may hold, in UTF-16 code units.
 ///
@@ -503,6 +507,7 @@ pub struct AppState {
     next_conn_id: AtomicU64,
     /// Login and registration. Tight, because each attempt costs an Argon2 hash.
     auth_limiter: RateLimiter,
+    password_slots: Arc<Semaphore>,
     /// Username lookup, which is an existence oracle by nature.
     lookup_limiter: RateLimiter,
     /// Failed sign-ins, keyed by the *account* rather than the caller.
@@ -546,6 +551,7 @@ impl AppState {
             // A person signing in mistypes a few times; nobody legitimately
             // makes ten attempts a second.
             auth_limiter: RateLimiter::new(10.0, 0.5),
+            password_slots: Arc::new(Semaphore::new(MAX_PASSWORD_JOBS)),
             lookup_limiter: RateLimiter::new(30.0, 2.0),
             // Only *failures* are charged, so somebody signing in normally
             // never touches it however often they do it. Ten wrong guesses,
@@ -561,6 +567,27 @@ impl AppState {
             #[cfg(test)]
             panic_next_command: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Wait off the blocking pool until there is room for another hash. The
+    /// permit belongs to the worker, so cancelling an HTTP request cannot let
+    /// more jobs start while its old hash is still running.
+    pub async fn password_work<T, F>(&self, work: F) -> Result<T, tokio::task::JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let permit = self
+            .password_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("password semaphore is never closed");
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
     }
 
     // --- rate limiting --------------------------------------------------

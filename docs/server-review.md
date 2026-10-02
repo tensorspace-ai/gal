@@ -1,4 +1,4 @@
-# Server review — 2026-10-02
+# Server review — 2026-10-02–03
 
 The review focused on request authentication, SQLite queries and transactions,
 wave residency, operation persistence, membership changes, outbound WebSocket
@@ -20,6 +20,7 @@ units on `main`; nothing was pushed.
 | Failed edit persistence restored the document but retained the new contributor and modification timestamp. | Restore those metadata fields too. A real client test injects an op-log failure and then confirms a subsequent edit commits at the correct revision. |
 | Revoking a session did not revoke its already-open WebSocket, and an open socket could outlive its session expiry. | Track token hashes on connection handles, close affected sockets after successful logout/revocation/password changes, recheck after registration, and enforce expiry with a timer. Tests check actual closed sockets, unaffected sessions and users, and expiry. A command already in progress finishes before the reader closes, preserving the durable-write ordering. |
 | Once a rate-limit map exceeded 4,096 entries, every request scanned it under a reactor-thread mutex. The ten-minute eviction also refilled a slow account bucket before its twenty-minute refill period ended. | Prune at most once per minute and retain buckets for at least their full refill period. Deterministic tests cover a large active map and a partially refilled account. |
+| Per-address limits did not bound simultaneous Argon2 work across addresses. Queued sign-ins could start hashing after other attempts had locked the account. | Admit at most four password jobs before spawning blocking workers, with the permit held until the worker finishes even if its caller is cancelled. Recheck account throttling after admission. A real HTTP/WebSocket test occupies the entire budget, verifies that login waits while socket traffic continues, and locks the queued account before releasing the workers. |
 
 ## Validation and performance
 

@@ -4580,3 +4580,68 @@ async fn an_open_socket_closes_when_its_session_expires() {
         0
     );
 }
+
+#[tokio::test]
+async fn queued_password_work_does_not_block_live_sockets_or_bypass_account_lockout() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let mut finishers = Vec::new();
+    let mut held = Vec::new();
+    // Occupy the entire password budget with running workers, as slow hashes
+    // would. Requests should wait as async tasks, not spawn more workers.
+    for _ in 0..crate::state::MAX_PASSWORD_JOBS {
+        let state = server.state.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        held.push(tokio::spawn(async move {
+            state
+                .password_work(move || {
+                    let _ = started_tx.send(());
+                    let _ = finish_rx.recv();
+                })
+                .await
+                .unwrap();
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        finishers.push(finish_tx);
+    }
+    let base = server.base.clone();
+    let login = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{base}/api/login"))
+            .json(&serde_json::json!({ "name": "alice", "password": "correct horse battery" }))
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!login.is_finished(), "a hash bypassed the global budget");
+    alice.send(ClientMessage::Ping).await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Pong).then_some(()))
+        .await;
+    // Other attempts locked this account while the request was queued. Even a
+    // correct password must get the same refusal until the account refills.
+    for _ in 0..10 {
+        server.state.note_failed_signin("alice");
+    }
+    for finisher in finishers {
+        finisher.send(()).unwrap();
+    }
+    for task in held {
+        task.await.unwrap();
+    }
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), login)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        400,
+        "the queued login skipped the account recheck"
+    );
+}

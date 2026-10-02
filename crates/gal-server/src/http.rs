@@ -194,7 +194,10 @@ async fn register(
     // Running it inline would park a reactor thread, so a handful of concurrent
     // signups could stall every other request on the server, WebSockets included.
     let password = body.password.clone();
-    let hash = match tokio::task::spawn_blocking(move || auth::hash_password(&password)).await {
+    let hash = match state
+        .password_work(move || auth::hash_password(&password))
+        .await
+    {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => return server_error(e),
         Err(e) => return server_error(anyhow::anyhow!("password hashing panicked: {e}")),
@@ -244,11 +247,24 @@ async fn login(
         .map(|u| u.password_hash.clone())
         .unwrap_or_else(|| DUMMY_HASH.to_string());
     let password = body.password.clone();
-    let ok =
-        match tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash)).await {
-            Ok(ok) => ok,
-            Err(e) => return server_error(anyhow::anyhow!("password verification panicked: {e}")),
-        };
+    let account = body.name.clone();
+    let checking = state.clone();
+    let ok = match state
+        .password_work(move || {
+            // The account may have been locked by another attempt while this one
+            // waited for a hash slot. Do not spend CPU on a refusal already known.
+            if checking.account_is_throttled(&account) {
+                None
+            } else {
+                Some(auth::verify_password(&password, &hash))
+            }
+        })
+        .await
+    {
+        Ok(Some(ok)) => ok,
+        Ok(None) => return bad_request("Incorrect username or password."),
+        Err(e) => return server_error(anyhow::anyhow!("password verification panicked: {e}")),
+    };
 
     match (ok, stored) {
         (true, Some(user)) => issue_session(&state, &user).await,
@@ -359,17 +375,22 @@ async fn change_password(
 
     let stored = identity.user.password_hash.clone();
     let current = body.current_password.clone();
-    let ok =
-        match tokio::task::spawn_blocking(move || auth::verify_password(&current, &stored)).await {
-            Ok(ok) => ok,
-            Err(e) => return server_error(anyhow::anyhow!("password verification panicked: {e}")),
-        };
+    let ok = match state
+        .password_work(move || auth::verify_password(&current, &stored))
+        .await
+    {
+        Ok(ok) => ok,
+        Err(e) => return server_error(anyhow::anyhow!("password verification panicked: {e}")),
+    };
     if !ok {
         return bad_request("Current password is incorrect.");
     }
 
     let new_password = body.new_password.clone();
-    let hash = match tokio::task::spawn_blocking(move || auth::hash_password(&new_password)).await {
+    let hash = match state
+        .password_work(move || auth::hash_password(&new_password))
+        .await
+    {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => return server_error(e),
         Err(e) => return server_error(anyhow::anyhow!("password hashing panicked: {e}")),
