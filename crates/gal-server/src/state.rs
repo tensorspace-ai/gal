@@ -137,11 +137,7 @@ impl LiveWave {
     /// matching on the mode at each call site. That is deliberate: the rules are
     /// then in a single place that can be tested exhaustively, and a handler
     /// added later cannot quietly skip them.
-    // The error *is* the reply sent to the client, which is the convention every
-    // handler in this crate follows. Boxing it here to save stack would force an
-    // unbox at each of the six call sites for no benefit.
-    #[allow(clippy::result_large_err)]
-    pub fn permit(&self, user: &UserId, action: Action) -> Result<(), ServerMessage> {
+    pub fn permit(&self, user: &UserId, action: Action) -> Result<(), Box<ServerMessage>> {
         let mode = self.wave.mode;
         let is_creator = self.wave.creator == *user;
 
@@ -162,7 +158,7 @@ impl LiveWave {
             return Ok(());
         }
 
-        Err(ServerMessage::error(
+        Err(Box::new(ServerMessage::error(
             ErrorCode::Forbidden,
             match (mode, action) {
                 (_, Action::SetMode) => {
@@ -194,7 +190,7 @@ impl LiveWave {
                 }
                 _ => format!("That is not allowed in {} mode.", mode.label()),
             },
-        ))
+        )))
     }
 
     /// The next ordering position for a new blip in this wavelet.
@@ -854,7 +850,7 @@ impl AppState {
         conn_id: ConnId,
         author: &UserId,
         submission: OpSubmission,
-    ) -> std::result::Result<(), ServerMessage> {
+    ) -> std::result::Result<(), Box<ServerMessage>> {
         let OpSubmission {
             blip_id,
             revision: client_revision,
@@ -863,13 +859,19 @@ impl AppState {
         } = submission;
         let blip_id = &blip_id;
         let Some(blip) = live.blips.get(blip_id) else {
-            return Err(ServerMessage::error(ErrorCode::NotFound, "No such blip."));
+            return Err(Box::new(ServerMessage::error(
+                ErrorCode::NotFound,
+                "No such blip.",
+            )));
         };
         let wavelet_id = blip.meta.wavelet_id.clone();
         if !live.may_access(author, &wavelet_id) {
             // Same response as a missing blip: distinguishing them would reveal
             // that a private reply exists.
-            return Err(ServerMessage::error(ErrorCode::NotFound, "No such blip."));
+            return Err(Box::new(ServerMessage::error(
+                ErrorCode::NotFound,
+                "No such blip.",
+            )));
         }
 
         // A reconnecting client replays work it never saw acknowledged. Without
@@ -918,7 +920,7 @@ impl AppState {
             if let ServerMessage::Error {
                 blip_id: ref mut target,
                 ..
-            } = refusal
+            } = *refusal
             {
                 *target = Some(blip_id.clone());
             }
@@ -929,13 +931,16 @@ impl AppState {
         let committed = match blip.doc.apply(client_revision, &delta, author.as_str()) {
             Ok(rev) => rev,
             Err(OtError::RevisionTooOld { .. }) | Err(OtError::RevisionInFuture { .. }) => {
-                return Err(ServerMessage::resync(
+                return Err(Box::new(ServerMessage::resync(
                     blip_id.clone(),
                     "Your edit was too far out of date; reloading this wave.",
-                ));
+                )));
             }
             Err(e) => {
-                return Err(ServerMessage::resync(blip_id.clone(), e.to_string()));
+                return Err(Box::new(ServerMessage::resync(
+                    blip_id.clone(),
+                    e.to_string(),
+                )));
             }
         };
 
@@ -955,10 +960,10 @@ impl AppState {
             // receives.
             blip.doc.rollback_last();
             blip.sync();
-            return Err(ServerMessage::resync(
+            return Err(Box::new(ServerMessage::resync(
                 blip_id.clone(),
                 "This message has reached its maximum size.",
-            ));
+            )));
         }
 
         blip.sync();
@@ -990,10 +995,10 @@ impl AppState {
                 blip.doc.rollback_last();
                 blip.sync();
             }
-            return Err(ServerMessage::resync(
+            return Err(Box::new(ServerMessage::resync(
                 blip_id.clone(),
                 "The server could not save your edit; reloading this wave.",
-            ));
+            )));
         }
 
         self.metrics.ops_applied.fetch_add(1, Ordering::Relaxed);

@@ -251,7 +251,7 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, user: User) {
                 match outcome {
                     Ok(Ok(())) => {}
                     Ok(Err(reply)) => {
-                        let _ = session.tx.try_send(reply);
+                        let _ = session.tx.try_send(*reply);
                     }
                     Err(payload) => {
                         state
@@ -338,7 +338,7 @@ async fn dispatch(
     state: &Arc<AppState>,
     session: &mut Session,
     command: ClientMessage,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     #[cfg(test)]
     if state
         .panic_next_command
@@ -378,7 +378,7 @@ async fn dispatch(
             // afterwards piles up behind it.
             if let Err(refusal) = check_embeds(&delta).and_then(|_| check_attributes(&delta)) {
                 state.metrics.ops_refused.fetch_add(1, Ordering::Relaxed);
-                return Err(name_blip(*refusal, &blip_id));
+                return Err(Box::new(name_blip(*refusal, &blip_id)));
             }
             let (_, wave) = find_blip(state, session, &blip_id).await?;
             let mut live = wave.lock().await;
@@ -512,7 +512,7 @@ async fn open_wave(
     state: &Arc<AppState>,
     session: &mut Session,
     wave_id: WaveId,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     // Fetch per-user state before taking the wave lock, so a disk read never
     // blocks other participants' edits.
     let read_marks = state.read_marks(&session.user.id, &wave_id).await;
@@ -584,17 +584,17 @@ async fn create_wave(
     participants: Vec<String>,
     content: Option<Delta>,
     mode: Option<WaveMode>,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let (mut ids, missing) = state
         .db
         .resolve_names(participants)
         .await
         .map_err(internal)?;
     if !missing.is_empty() {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             format!("No such user: {}", missing.join(", ")),
-        ));
+        )));
     }
     // The creator is always a participant, and never duplicated.
     ids.retain(|id| id != &session.user.id);
@@ -620,7 +620,7 @@ async fn create_wave(
         None,
         0,
     );
-    if let Some(content) = seed_content(content).map_err(|e| *e)? {
+    if let Some(content) = seed_content(content)? {
         blip.content = content;
         blip.revision = 1;
     }
@@ -652,7 +652,7 @@ async fn create_blip(
     wavelet_id: WaveletId,
     parent: Option<BlipId>,
     content: Option<Delta>,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let (wave_id, wave) = find_wavelet(state, session, &wavelet_id).await?;
 
     // The lock is held for the whole operation, including the writes. Releasing
@@ -679,10 +679,10 @@ async fn create_blip(
             .get(parent_id)
             .is_some_and(|b| b.meta.wavelet_id == wavelet_id);
         if !ok {
-            return Err(ServerMessage::error(
+            return Err(Box::new(ServerMessage::error(
                 ErrorCode::BadRequest,
                 "Cannot reply to that blip.",
-            ));
+            )));
         }
     }
 
@@ -693,7 +693,7 @@ async fn create_blip(
         parent,
         live.next_seq(&wavelet_id),
     );
-    if let Some(content) = seed_content(content).map_err(|e| *e)? {
+    if let Some(content) = seed_content(content)? {
         blip.content = content;
         blip.revision = 1;
     }
@@ -754,17 +754,17 @@ async fn create_comment(
     blip_id: BlipId,
     comment_id: CommentId,
     content: Option<Delta>,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     // A client mints this id, so it is checked before it reaches storage, the
     // wire, or anyone's DOM.
     if !comment_id.is_well_formed() {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             "That is not a usable comment id.",
-        ));
+        )));
     }
     let (wave_id, wave) = find_wavelet(state, session, &wavelet_id).await?;
-    let content = seed_content(content).map_err(|e| *e)?;
+    let content = seed_content(content)?;
 
     // Held across the writes, as in `create_blip`: releasing it between the
     // checks and the insert would let two clients claim the same id, and would
@@ -776,10 +776,10 @@ async fn create_comment(
     live.permit(&session.user.id, Action::Comment)?;
 
     if live.comments.contains_key(&comment_id) {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             "That comment already exists.",
-        ));
+        )));
     }
     let Some(target) = live.blips.get(&blip_id) else {
         return Err(not_found());
@@ -790,10 +790,10 @@ async fn create_comment(
     // Comments annotate the page, not each other. Allowing a thread on a remark
     // would give a comment its own comments and no sensible place to draw them.
     if target.meta.comment.is_some() {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             "You cannot comment on a comment.",
-        ));
+        )));
     }
 
     let thread = CommentThread {
@@ -859,9 +859,9 @@ async fn reply_to_comment(
     session: &mut Session,
     comment_id: CommentId,
     content: Option<Delta>,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let (wave_id, wave) = find_comment(state, session, &comment_id).await?;
-    let content = seed_content(content).map_err(|e| *e)?;
+    let content = seed_content(content)?;
 
     let mut live = wave.lock().await;
     let Some(thread) = live.comments.get(&comment_id).cloned() else {
@@ -874,10 +874,10 @@ async fn reply_to_comment(
     // A resolved thread is drawn collapsed, so a remark added to one would be
     // written and then not shown. Reopening is one click and says what happened.
     if thread.resolved() {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             "This comment is resolved. Reopen it to reply.",
-        ));
+        )));
     }
 
     let mut blip = Blip::new(
@@ -941,7 +941,7 @@ async fn resolve_comment(
     session: &mut Session,
     comment_id: CommentId,
     resolved: bool,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let (wave_id, wave) = find_comment(state, session, &comment_id).await?;
 
     let mut live = wave.lock().await;
@@ -995,7 +995,7 @@ async fn delete_blip(
     state: &Arc<AppState>,
     session: &mut Session,
     blip_id: BlipId,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let (wave_id, wave) = find_blip(state, session, &blip_id).await?;
     let mut live = wave.lock().await;
 
@@ -1013,16 +1013,16 @@ async fn delete_blip(
     // Resolving retracts a comment and keeps the record; deleting the message it
     // is about takes the whole thread with it, below.
     if blip.meta.comment.is_some() {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::Forbidden,
             "A comment is not deleted on its own. Resolve the thread instead.",
-        ));
+        )));
     }
     if blip.meta.author != session.user.id {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::Forbidden,
             "Only the author can delete a message.",
-        ));
+        )));
     }
     live.permit(&session.user.id, Action::Delete)?;
     // Keep the thread intact: a blip with replies would orphan them. Remarks are
@@ -1034,10 +1034,10 @@ async fn delete_blip(
         .values()
         .any(|b| b.meta.parent.as_ref() == Some(&blip_id) && b.meta.comment.is_none())
     {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             "Delete the replies to this message first.",
-        ));
+        )));
     }
 
     // Comments go with the text they were about. A thread that outlived the
@@ -1107,7 +1107,7 @@ async fn set_title(
     session: &mut Session,
     wavelet_id: WaveletId,
     title: String,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let (wave_id, wave) = find_wavelet(state, session, &wavelet_id).await?;
     let title = normalise_title(&title);
 
@@ -1148,7 +1148,7 @@ async fn set_mode(
     session: &mut Session,
     wave_id: WaveId,
     mode: WaveMode,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     if !session.subscribed.contains(&wave_id) {
         return Err(not_found());
     }
@@ -1193,13 +1193,13 @@ async fn add_participant(
     session: &mut Session,
     wavelet_id: WaveletId,
     name: String,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let (wave_id, wave) = find_wavelet(state, session, &wavelet_id).await?;
     let Some(user) = state.db.user_by_name(&name).await.map_err(internal)? else {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             format!("No user called {name}."),
-        ));
+        )));
     };
 
     let mut live = wave.lock().await;
@@ -1219,13 +1219,13 @@ async fn add_participant(
             .iter()
             .any(|w| w.kind == WaveletKind::Conversation && w.has_participant(&user.id));
         if !in_wave {
-            return Err(ServerMessage::error(
+            return Err(Box::new(ServerMessage::error(
                 ErrorCode::Forbidden,
                 format!(
                     "{} is not in this wave yet — add them to the wave first.",
                     user.display_name
                 ),
-            ));
+            )));
         }
     }
 
@@ -1262,7 +1262,7 @@ async fn remove_participant(
     session: &mut Session,
     wavelet_id: WaveletId,
     user_id: UserId,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let (wave_id, wave) = find_wavelet(state, session, &wavelet_id).await?;
 
     let mut live = wave.lock().await;
@@ -1276,10 +1276,10 @@ async fn remove_participant(
     let is_self = user_id == session.user.id;
     let is_creator = live.wave.creator == session.user.id;
     if !is_self && !is_creator {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::Forbidden,
             "Only the person who started this wave can remove someone else.              You can always remove yourself.",
-        ));
+        )));
     }
 
     let kind = live.wavelet(&wavelet_id).map(|w| w.kind);
@@ -1291,10 +1291,10 @@ async fn remove_participant(
     }
     // Never strand a wavelet with no one in it.
     if wavelet.participants.len() <= 1 {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             "A wave needs at least one participant.",
-        ));
+        )));
     }
     wavelet.participants.retain(|p| p != &user_id);
     live.broadcast(
@@ -1387,7 +1387,7 @@ async fn private_reply(
     wavelet_id: WaveletId,
     anchor: BlipId,
     participants: Vec<String>,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let (wave_id, wave) = find_wavelet(state, session, &wavelet_id).await?;
     let (mut ids, missing) = state
         .db
@@ -1395,10 +1395,10 @@ async fn private_reply(
         .await
         .map_err(internal)?;
     if !missing.is_empty() {
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::BadRequest,
             format!("No such user: {}", missing.join(", ")),
-        ));
+        )));
     }
 
     let live = wave.lock().await;
@@ -1422,10 +1422,10 @@ async fn private_reply(
             .get(outsider)
             .map(|u| u.display_name.clone())
             .unwrap_or_else(|| outsider.to_string());
-        return Err(ServerMessage::error(
+        return Err(Box::new(ServerMessage::error(
             ErrorCode::Forbidden,
             format!("{name} is not in this wave yet — add them to the wave first."),
-        ));
+        )));
     }
     let title = live.title();
     drop(live);
@@ -1503,7 +1503,7 @@ async fn cursor(
     blip_id: BlipId,
     index: usize,
     length: usize,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     if !session.subscribed.contains(&wave_id) {
         return Ok(()); // stale message from a wave we just closed
     }
@@ -1545,7 +1545,7 @@ async fn find_wavelet(
     state: &Arc<AppState>,
     session: &Session,
     wavelet_id: &WaveletId,
-) -> Result<(WaveId, Arc<Mutex<LiveWave>>), ServerMessage> {
+) -> Result<(WaveId, Arc<Mutex<LiveWave>>), Box<ServerMessage>> {
     for wave_id in &session.subscribed {
         if let Ok(Some(wave)) = state.open_wave(wave_id).await {
             if wave.lock().await.wavelet(wavelet_id).is_some() {
@@ -1561,7 +1561,7 @@ async fn find_blip(
     state: &Arc<AppState>,
     session: &Session,
     blip_id: &BlipId,
-) -> Result<(WaveId, Arc<Mutex<LiveWave>>), ServerMessage> {
+) -> Result<(WaveId, Arc<Mutex<LiveWave>>), Box<ServerMessage>> {
     for wave_id in &session.subscribed {
         if let Ok(Some(wave)) = state.open_wave(wave_id).await {
             if wave.lock().await.blips.contains_key(blip_id) {
@@ -1577,7 +1577,7 @@ async fn find_comment(
     state: &Arc<AppState>,
     session: &Session,
     comment_id: &CommentId,
-) -> Result<(WaveId, Arc<Mutex<LiveWave>>), ServerMessage> {
+) -> Result<(WaveId, Arc<Mutex<LiveWave>>), Box<ServerMessage>> {
     for wave_id in &session.subscribed {
         if let Ok(Some(wave)) = state.open_wave(wave_id).await {
             if wave.lock().await.comments.contains_key(comment_id) {
@@ -1771,7 +1771,7 @@ async fn require_participant(
     state: &Arc<AppState>,
     session: &Session,
     wave_id: &WaveId,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     match state.db.is_participant(&session.user.id, wave_id).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(not_found()),
@@ -1790,13 +1790,19 @@ fn normalise_title(title: &str) -> String {
     cleaned.chars().take(200).collect()
 }
 
-fn not_found() -> ServerMessage {
-    ServerMessage::error(ErrorCode::NotFound, "That wave is not available.")
+fn not_found() -> Box<ServerMessage> {
+    Box::new(ServerMessage::error(
+        ErrorCode::NotFound,
+        "That wave is not available.",
+    ))
 }
 
-fn internal(e: anyhow::Error) -> ServerMessage {
+fn internal(e: anyhow::Error) -> Box<ServerMessage> {
     tracing::error!(error = %e, "request failed");
-    ServerMessage::error(ErrorCode::Internal, "Something went wrong on the server.")
+    Box::new(ServerMessage::error(
+        ErrorCode::Internal,
+        "Something went wrong on the server.",
+    ))
 }
 
 #[cfg(test)]
