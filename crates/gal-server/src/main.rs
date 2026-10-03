@@ -1,5 +1,6 @@
 //! Gal — an Apache Wave-style collaboration server.
 
+mod agent;
 mod auth;
 mod config;
 mod db;

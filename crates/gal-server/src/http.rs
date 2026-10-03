@@ -887,6 +887,7 @@ fn security_headers(config: &crate::config::Config) -> Vec<(header::HeaderName, 
 
 pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
+        .merge(crate::agent::router())
         .route("/api/register", post(register))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))

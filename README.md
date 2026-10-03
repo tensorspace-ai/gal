@@ -352,6 +352,44 @@ upgrading.
   gone — exactly once, even if the original op had actually been applied. There is
   a browser test that does exactly this.
 
+## Agents and bots
+
+Agents can read a single wavelet through a bearer-token HTTP interface. A token
+acts as its issuing account, is scoped to one wavelet, and cannot be used for
+browser sessions, account management, attachments, or WebSocket access. Use a
+separate account if the agent should have its own author identity.
+
+With a normal login session, create a credential using
+`POST /api/agent-tokens`:
+
+```json
+{"waveletId":"s-…","label":"research assistant","scope":"read","expiresInSeconds":3600}
+```
+
+The response contains `credential` metadata and a `token` secret, returned only
+once. `GET /api/agent-tokens` lists your active credentials without their secrets;
+`DELETE /api/agent-tokens/{id}` revokes one. Credentials last at most 30 days.
+Changing your password or signing out every other session revokes all your agent
+credentials too. Ordinary logout ends only that browser session.
+
+Use `Authorization: Bearer <token>` for `GET /api/agent/context`. It returns the
+scoped wavelet's title and mode plus plain-text blips with ids, author ids,
+revisions, parent ids, and comment-thread ids and resolved state. It reads
+committed documents, not the snapshot from when a browser last opened the wave.
+Private replies outside the token's wavelet are never included, even if the
+issuing account belongs to them. Removed membership or an expired/revoked
+credential returns 401.
+
+Context is bounded: `limit` defaults to 50 blips (maximum 100), and `textUnits`
+defaults to 16000 UTF-16 units across the page (maximum 64000, minimum 2).
+`truncated` marks a shortened blip; it preserves whole Unicode characters.
+Attachment embeds appear as their filenames, not their bytes. Follow a non-null
+`nextCursor` using `?after=<cursor>` to read subsequent blips. A shortened blip's
+omitted text is not returned on the next page; request a larger budget to read
+more of that blip. Pagination is ordered by message sequence and id, not an
+immutable snapshot or an event feed: revisit earlier pages to observe edits.
+These reads share the account's command allowance; 429 includes `Retry-After`.
+
 ## How it works
 
 ```

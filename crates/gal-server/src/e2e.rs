@@ -4645,3 +4645,370 @@ async fn queued_password_work_does_not_block_live_sockets_or_bypass_account_lock
         "the queued login skipped the account recheck"
     );
 }
+
+async fn mint_agent_token(
+    server: &TestServer,
+    cookie: &str,
+    wavelet: &WaveletId,
+    scope: &str,
+) -> serde_json::Value {
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/agent-tokens", server.base))
+        .header("cookie", cookie)
+        .json(&serde_json::json!({ "waveletId": wavelet, "label": "research", "scope": scope, "expiresInSeconds": 3600 }))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 201);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    response.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn agent_context_is_bounded_scoped_and_tracks_committed_edits() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave, wavelet, blip) = create_wave(&mut alice, "Agent context", vec![]).await;
+    alice
+        .send(ClientMessage::Submit {
+            blip_id: blip.clone(),
+            revision: 0,
+            delta: Delta::document("A😀B"),
+            op_id: Some("context-seed".into()),
+        })
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::Ack { .. }).then_some(()))
+        .await;
+    alice
+        .send(ClientMessage::PrivateReply {
+            wavelet_id: wavelet.clone(),
+            anchor: blip.clone(),
+            participants: vec![],
+        })
+        .await;
+    let private = alice
+        .recv_until(|m| match m {
+            ServerMessage::WaveletAdded { wavelet, .. } => Some(wavelet.id.clone()),
+            _ => None,
+        })
+        .await;
+    alice
+        .send(ClientMessage::CreateBlip {
+            wavelet_id: private.clone(),
+            parent: None,
+            content: Some(Delta::document("private secret")),
+        })
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::BlipAdded { .. }).then_some(()))
+        .await;
+    alice
+        .send(ClientMessage::CreateBlip {
+            wavelet_id: wavelet.clone(),
+            parent: Some(blip.clone()),
+            content: Some(Delta::document("second message")),
+        })
+        .await;
+    let second = alice
+        .recv_until(|m| match m {
+            ServerMessage::BlipAdded { blip, .. } => Some(blip.id.clone()),
+            _ => None,
+        })
+        .await;
+    let minted = mint_agent_token(&server, &cookie, &wavelet, "read").await;
+    let token = minted["token"].as_str().unwrap();
+    let http = reqwest::Client::new();
+    let url = format!("{}/api/agent/context", server.base);
+    let response = http
+        .get(&url)
+        .bearer_auth(token)
+        .query(&[("textUnits", "2")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let page: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(page["waveId"], wave.as_str());
+    assert_eq!(page["waveletId"], wavelet.as_str());
+    assert_eq!(page["blips"].as_array().unwrap().len(), 1);
+    assert_eq!(page["blips"][0]["text"], "A"); // Never half an emoji.
+    assert_eq!(page["blips"][0]["truncated"], true);
+    assert_eq!(page["blips"][0]["revision"], 1);
+    let next: serde_json::Value = http
+        .get(&url)
+        .bearer_auth(token)
+        .query(&[("after", page["nextCursor"].as_str().unwrap())])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(next["blips"][0]["id"], second.as_str());
+    assert_eq!(next["nextCursor"], serde_json::Value::Null);
+    let all: serde_json::Value = http
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all["blips"].as_array().unwrap().len(), 2);
+    assert!(!all.to_string().contains("private secret"));
+    // These credentials cannot become an unrestricted browser session.
+    assert_eq!(
+        http.get(format!("{}/api/me", server.base))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let ws_url = server.base.replace("http://", "ws://") + "/ws";
+    let mut request = ws_url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    assert!(
+        matches!(connect_async(request).await, Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status() == 401)
+    );
+}
+
+#[tokio::test]
+async fn agent_credentials_cannot_outlive_membership_expiry_or_revocation() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let (wave, wavelet, _) = create_wave(&mut alice, "Shared", vec!["bob".into()]).await;
+    let bob = server.connect(&bob_cookie).await;
+    let minted = mint_agent_token(&server, &bob_cookie, &wavelet, "read").await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/api/agent/context", server.base);
+    let token = minted["token"].as_str().unwrap();
+    assert_eq!(
+        http.get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    // A different account cannot list or revoke Bob's credentials.
+    let list: serde_json::Value = http
+        .get(format!("{}/api/agent-tokens", server.base))
+        .header("cookie", &alice_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["credentials"], serde_json::json!([]));
+    let revoke_url = format!(
+        "{}/api/agent-tokens/{}",
+        server.base,
+        minted["credential"]["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        http.delete(&revoke_url)
+            .header("cookie", &alice_cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    alice
+        .send(ClientMessage::RemoveParticipant {
+            wavelet_id: wavelet.clone(),
+            user_id: bob.user.id,
+        })
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::ParticipantRemoved { .. }).then_some(()))
+        .await;
+    assert_eq!(
+        http.get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(http.post(format!("{}/api/agent-tokens", server.base)).header("cookie", &bob_cookie)
+        .json(&serde_json::json!({ "waveletId": wavelet, "label": "lost", "scope": "read", "expiresInSeconds": 60 }))
+        .send().await.unwrap().status(), 404);
+    let minted = mint_agent_token(&server, &alice_cookie, &wavelet, "read").await;
+    let token = minted["token"].as_str().unwrap();
+    assert_eq!(
+        http.delete(format!(
+            "{}/api/agent-tokens/{}",
+            server.base,
+            minted["credential"]["id"].as_str().unwrap()
+        ))
+        .header("cookie", &alice_cookie)
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        204
+    );
+    assert_eq!(
+        http.get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let minted = mint_agent_token(&server, &alice_cookie, &wavelet, "read").await;
+    rusqlite::Connection::open(server.state.config.database.clone())
+        .unwrap()
+        .execute("UPDATE agent_tokens SET expires_at = 0", [])
+        .unwrap();
+    assert_eq!(
+        http.get(&url)
+            .bearer_auth(minted["token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        wave,
+        minted["credential"]["waveId"].as_str().unwrap().into()
+    );
+}
+
+#[tokio::test]
+async fn account_wide_signout_also_revokes_agent_credentials() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (_, wavelet, _) = create_wave(&mut alice, "Credentials", vec![]).await;
+    let minted = mint_agent_token(&server, &cookie, &wavelet, "read").await;
+    let http = reqwest::Client::new();
+    assert_eq!(
+        http.post(format!("{}/api/sessions/revoke", server.base))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        http.get(format!("{}/api/agent/context", server.base))
+            .bearer_auth(minted["token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let listed: serde_json::Value = http
+        .get(format!("{}/api/agent-tokens", server.base))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["credentials"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn agent_requests_reject_invalid_bounds_and_do_not_accept_session_credentials() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (_, wavelet, _) = create_wave(&mut alice, "Validation", vec![]).await;
+    let minted = mint_agent_token(&server, &cookie, &wavelet, "read").await;
+    let http = reqwest::Client::new();
+    for query in [
+        "limit=0",
+        "limit=101",
+        "textUnits=1",
+        "textUnits=64001",
+        "after=wrong",
+        "waveletId=s-other",
+    ] {
+        assert_eq!(
+            http.get(format!("{}/api/agent/context?{query}", server.base))
+                .bearer_auth(minted["token"].as_str().unwrap())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    let url = format!("{}/api/agent/context", server.base);
+    assert_eq!(
+        http.get(&url)
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        http.get(&url)
+            .bearer_auth(cookie.split('=').nth(1).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    for expiry in [0, 2592001] {
+        assert_eq!(http.post(format!("{}/api/agent-tokens", server.base)).header("cookie", &cookie)
+            .json(&serde_json::json!({ "waveletId": wavelet, "label": "test", "scope": "read", "expiresInSeconds": expiry }))
+            .send().await.unwrap().status(), 400);
+    }
+    let list: serde_json::Value = http
+        .get(format!("{}/api/agent-tokens", server.base))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!list.to_string().contains(minted["token"].as_str().unwrap()));
+    // Neither a password change nor sign-out should leave unattended access alive.
+    let current = auth_token(&cookie);
+    server
+        .state
+        .db
+        .change_password(
+            &alice.user.id,
+            "unused-test-hash".into(),
+            crate::auth::hash_token(current),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        http.get(&url)
+            .bearer_auth(minted["token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+}
+
+fn auth_token(cookie: &str) -> &str {
+    cookie.split_once('=').unwrap().1
+}

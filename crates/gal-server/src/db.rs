@@ -46,7 +46,7 @@ pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// table, so without this a new column would simply never be added: the server
 /// would start cleanly, then fail at query time in ways that look like data loss
 /// to the user.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The version `schema.sql` describes.
 ///
@@ -276,6 +276,138 @@ impl Storage {
             .await
     }
 
+    // --- agent credentials ---------------------------------------------
+
+    pub async fn wave_for_participant(
+        &self,
+        user: &UserId,
+        wavelet: &WaveletId,
+    ) -> Result<Option<WaveId>> {
+        let (user, wavelet) = (user.clone(), wavelet.clone());
+        self.run(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT s.wave_id FROM wavelets s JOIN participants p ON p.wavelet_id = s.id
+                 WHERE s.id = ?1 AND p.user_id = ?2",
+                    params![wavelet.as_str(), user.as_str()],
+                    |r| Ok(WaveId(r.get(0)?)),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    pub async fn create_agent_token(
+        &self,
+        token: crate::agent::AgentToken,
+        token_hash: String,
+    ) -> Result<bool> {
+        self.run(move |conn| {
+            // The membership check and insert are one statement: an invitation
+            // revoked during token creation must not leave a usable credential.
+            Ok(conn.execute(
+                "INSERT INTO agent_tokens
+                 (id, token_hash, user_id, wavelet_id, label, scope, created_at, expires_at)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+                 WHERE EXISTS (SELECT 1 FROM participants WHERE user_id = ?3 AND wavelet_id = ?4)",
+                params![
+                    token.id,
+                    token_hash,
+                    token.user_id.as_str(),
+                    token.wavelet_id.as_str(),
+                    token.label,
+                    token.scope.as_str(),
+                    token.created_at,
+                    token.expires_at
+                ],
+            )? == 1)
+        })
+        .await
+    }
+
+    pub async fn agent_token(
+        &self,
+        token_hash: String,
+    ) -> Result<Option<crate::agent::AgentToken>> {
+        self.run(move |conn| valid_agent_token(conn, &token_hash))
+            .await
+    }
+
+    pub async fn agent_tokens(&self, user: UserId) -> Result<Vec<crate::agent::AgentToken>> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT t.*, s.wave_id FROM agent_tokens t JOIN wavelets s ON s.id = t.wavelet_id
+                 WHERE t.user_id = ?1 AND t.expires_at > ?2 ORDER BY t.created_at, t.id",
+            )?;
+            let tokens = stmt
+                .query_map(params![user.as_str(), now()], row_to_agent_token)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(tokens)
+        })
+        .await
+    }
+
+    pub async fn revoke_agent_token(&self, user: UserId, id: String) -> Result<bool> {
+        self.run(move |conn| {
+            Ok(conn.execute(
+                "DELETE FROM agent_tokens WHERE user_id = ?1 AND id = ?2",
+                params![user.as_str(), id],
+            )? == 1)
+        })
+        .await
+    }
+
+    pub async fn agent_context(
+        &self,
+        token_hash: String,
+        after: (i64, String),
+        limit: usize,
+        text_units: usize,
+    ) -> Result<Option<crate::agent::AgentContext>> {
+        self.run(move |conn| {
+            // Read authorization and content from the same snapshot, including
+            // revocation and membership changes since the HTTP extractor ran.
+            let tx = conn.transaction()?;
+            let Some(token) = valid_agent_token(&tx, &token_hash)? else { return Ok(None) };
+            let (title, mode): (String, String) = tx.query_row(
+                "SELECT s.title, w.mode FROM wavelets s JOIN waves w ON w.id = s.wave_id WHERE s.id = ?1",
+                params![token.wavelet_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let mut stmt = tx.prepare(
+                "SELECT id, wavelet_id, wave_id, parent, seq, author, contributors,
+                        created_at, last_modified, content, revision, deleted, comment
+                 FROM blips WHERE wavelet_id = ?1 AND deleted = 0
+                   AND (seq, id) > (?2, ?3) ORDER BY seq, id LIMIT ?4",
+            )?;
+            let candidates = stmt.query_map(
+                params![token.wavelet_id.as_str(), after.0, after.1, limit + 1], row_to_blip,
+            )?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut blips = Vec::new();
+            let mut remaining = text_units;
+            for blip in &candidates {
+                if blips.len() == limit || remaining < 2 { break }
+                let text = display_text(&blip.content);
+                let (text, used, truncated) = crate::agent::bounded_text(&text, remaining);
+                remaining -= used;
+                let comment_resolved = if let Some(id) = &blip.comment {
+                    tx.query_row("SELECT resolved_at IS NOT NULL FROM comments WHERE id = ?1",
+                        params![id.as_str()], |r| r.get::<_, bool>(0)).optional()?
+                } else { None };
+                blips.push(crate::agent::ContextBlip {
+                    id: blip.id.clone(), parent: blip.parent.clone(), author: blip.author.clone(),
+                    revision: blip.revision, seq: blip.seq, comment_id: blip.comment.clone(),
+                    comment_resolved, text, truncated,
+                });
+            }
+            let next_cursor = if blips.len() < candidates.len() {
+                blips.last().map(|b| format!("{}:{}", b.seq, b.id))
+            } else { None };
+            Ok(Some(crate::agent::AgentContext {
+                wave_id: token.wave_id, wavelet_id: token.wavelet_id, title, mode, blips, next_cursor,
+            }))
+        }).await
+    }
+
     // --- sessions -------------------------------------------------------
 
     pub async fn create_session(&self, user_id: &UserId, token_hash: String) -> Result<()> {
@@ -356,6 +488,10 @@ impl Storage {
                 "DELETE FROM sessions WHERE user_id = ?1 AND token_hash != ?2",
                 params![id.as_str(), keep_token_hash],
             )?;
+            tx.execute(
+                "DELETE FROM agent_tokens WHERE user_id = ?1",
+                params![id.as_str()],
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -375,10 +511,16 @@ impl Storage {
     ) -> Result<usize> {
         let id = user_id.clone();
         self.run(move |conn| {
-            let gone = conn.execute(
+            let tx = conn.transaction()?;
+            let gone = tx.execute(
                 "DELETE FROM sessions WHERE user_id = ?1 AND token_hash != ?2",
                 params![id.as_str(), keep_token_hash],
             )?;
+            tx.execute(
+                "DELETE FROM agent_tokens WHERE user_id = ?1",
+                params![id.as_str()],
+            )?;
+            tx.commit()?;
             Ok(gone)
         })
         .await
@@ -1700,6 +1842,27 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tracing::debug!("migrated database schema to v7");
     }
 
+    if version == 7 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE agent_tokens (
+                 id TEXT PRIMARY KEY,
+                 token_hash TEXT NOT NULL UNIQUE,
+                 user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 wavelet_id TEXT NOT NULL REFERENCES wavelets(id) ON DELETE CASCADE,
+                 label TEXT NOT NULL,
+                 scope TEXT NOT NULL CHECK(scope IN ('read', 'reply')),
+                 created_at INTEGER NOT NULL,
+                 expires_at INTEGER NOT NULL
+             );
+             CREATE INDEX agent_tokens_user ON agent_tokens(user_id);",
+        )?;
+        tx.pragma_update(None, "user_version", 8)?;
+        tx.commit()?;
+        version = 8;
+        tracing::debug!("migrated database schema to v8");
+    }
+
     if version < SCHEMA_VERSION {
         anyhow::bail!(
             "no migration available from schema v{version} to v{SCHEMA_VERSION}; \
@@ -1808,6 +1971,38 @@ fn row_to_user(row: &Row<'_>) -> rusqlite::Result<User> {
         password_hash: row.get("password_hash")?,
         color: row.get::<_, i64>("color")? as u16,
         created_at: row.get("created_at")?,
+    })
+}
+
+fn valid_agent_token(conn: &Connection, hash: &str) -> Result<Option<crate::agent::AgentToken>> {
+    Ok(conn
+        .query_row(
+            "SELECT t.*, s.wave_id FROM agent_tokens t
+         JOIN wavelets s ON s.id = t.wavelet_id
+         JOIN participants p ON p.wavelet_id = t.wavelet_id AND p.user_id = t.user_id
+         WHERE t.token_hash = ?1 AND t.expires_at > ?2",
+            params![hash, now()],
+            row_to_agent_token,
+        )
+        .optional()?)
+}
+
+fn row_to_agent_token(row: &Row<'_>) -> rusqlite::Result<crate::agent::AgentToken> {
+    let scope: String = row.get("scope")?;
+    let scope = match scope.as_str() {
+        "read" => crate::agent::AgentScope::Read,
+        "reply" => crate::agent::AgentScope::Reply,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(crate::agent::AgentToken {
+        id: row.get("id")?,
+        user_id: UserId(row.get("user_id")?),
+        wavelet_id: WaveletId(row.get("wavelet_id")?),
+        wave_id: WaveId(row.get("wave_id")?),
+        label: row.get("label")?,
+        scope,
+        created_at: row.get("created_at")?,
+        expires_at: row.get("expires_at")?,
     })
 }
 
@@ -2387,7 +2582,15 @@ mod tests {
         let _ = Storage::open(&upgraded).unwrap();
 
         assert_eq!(schema_version(&fresh), schema_version(&upgraded));
-        for (table, column) in [("ops", "op_id"), ("blips", "deleted")] {
+        for (table, column) in [
+            ("ops", "op_id"),
+            ("blips", "deleted"),
+            ("agent_tokens", "wavelet_id"),
+        ] {
+            assert!(
+                has_column(&fresh, table, column),
+                "missing {table}.{column}"
+            );
             assert_eq!(
                 has_column(&fresh, table, column),
                 has_column(&upgraded, table, column),
@@ -3157,8 +3360,10 @@ mod tests {
         let path = dir.path().join("test.db");
         drop(storage);
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP TABLE blip_search_keys; PRAGMA user_version = 6;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE agent_tokens; DROP TABLE blip_search_keys; PRAGMA user_version = 6;",
+        )
+        .unwrap();
         conn.execute(
             "UPDATE blip_search SET rowid = 12345 WHERE blip_id = ?1",
             params![first.id.as_str()],
