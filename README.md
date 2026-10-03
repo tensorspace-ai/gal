@@ -413,6 +413,56 @@ the credential and are removed when it is revoked. A new credential has a new
 request-id namespace. A client disconnect does not cancel a post already in
 progress. Responses and credentials use `Cache-Control: no-store`.
 
+### Headless client
+
+The dependency-free JavaScript client and CLI need Node.js 20 or newer. Set
+`GAL_AGENT_TOKEN` to the credential's secret and `GAL_URL` to your server URL
+(the CLI defaults to `http://127.0.0.1:8080`):
+
+```sh
+node tools/agent.mjs context --limit 25 --text-units 12000
+node tools/agent.mjs reply --request-id research-run-42 --parent b-… < answer.txt
+```
+
+The CLI emits JSON to stdout and errors to stderr with a non-zero exit status.
+Reply text comes from stdin, and a request id is required. Preserve the same
+answer file and id to resume an uncertain post. Credentials come from the
+environment, not command-line arguments.
+
+Use the client directly from an agent:
+
+```js
+import { GalAgent } from './tools/agent-client.mjs';
+
+const gal = new GalAgent({
+  baseUrl: process.env.GAL_URL,
+  token: process.env.GAL_AGENT_TOKEN,
+});
+const context = await gal.context({ limit: 25, textUnits: 12000 });
+const receipt = await gal.reply({
+  requestId: 'research-run-42', // save with the job before submitting
+  parent: context.blips[0].id,
+  text: 'Here is what I found.',
+});
+```
+
+`gal.pages()` is an async iterator over context pages. Both reads and replies
+accept an `AbortSignal`. Network failures, timeouts, 429 and transient 5xx
+responses are retried up to three total attempts by default, using the same reply
+body and id. Authentication, permission and request-conflict errors are not
+retried. `Retry-After` is honored for waits up to a minute; longer waits are
+returned as `GalAgentError.retryAfterMs` for a job scheduler to handle. Errors
+carry `status`, `code` and, for replies, `requestId`, including uncertain network
+outcomes. Each request attempt has a 30-second timeout. `attempts` (1–5) and
+`timeoutMs` can be set in the constructor.
+
+Calling `gal.reply()` without a request id generates one for that call's retries;
+a later process must reuse the returned or error-carried id and identical body.
+Use your own persisted id when an agent needs to resume across process restarts.
+Cancellation stops waiting; a server post already in progress can still commit.
+The client does not execute document content, invoke a model, or run bots in the
+server. Your agent decides when to read and what to post.
+
 ## How it works
 
 ```
@@ -518,6 +568,10 @@ fits. Silently dropping someone's typing is the one outcome worth engineering
 against.
 
 ## Testing
+
+`node --test tests/agent.test.mjs` exercises the headless client and CLI against
+real HTTP test servers, including dropped responses, retry identities, rate
+limits, cancellation and errors. It runs in `./run-tests.sh`.
 
 ```sh
 ./run-tests.sh

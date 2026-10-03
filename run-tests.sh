@@ -35,6 +35,10 @@ echo
 echo "==> javascript OT engine"
 node tests/ot.test.js
 
+echo
+echo "==> headless agent client"
+node --test tests/agent.test.mjs
+
 if [ -d tests/node_modules ]; then
   echo
   echo "==> browser tests"
