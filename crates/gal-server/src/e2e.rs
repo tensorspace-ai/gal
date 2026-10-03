@@ -5012,3 +5012,261 @@ async fn agent_requests_reject_invalid_bounds_and_do_not_accept_session_credenti
 fn auth_token(cookie: &str) -> &str {
     cookie.split_once('=').unwrap().1
 }
+
+async fn post_agent_reply(
+    server: &TestServer,
+    token: &str,
+    body: &serde_json::Value,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/api/agent/replies", server.base))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn agent_replies_are_delivered_once_and_replayed_after_freezing_and_restart() {
+    let mut server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave, wavelet, parent) = create_wave(&mut alice, "Reliable replies", vec![]).await;
+    let minted = mint_agent_token(&server, &cookie, &wavelet, "reply").await;
+    let token = minted["token"].as_str().unwrap();
+    let body =
+        serde_json::json!({ "requestId": "run-1", "parent": parent, "text": "An agent reply 😀" });
+    let (first, second) = tokio::join!(
+        post_agent_reply(&server, token, &body),
+        post_agent_reply(&server, token, &body)
+    );
+    assert!([first.status().as_u16(), second.status().as_u16()].contains(&201));
+    assert!([first.status().as_u16(), second.status().as_u16()].contains(&200));
+    let receipt: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(receipt, second.json::<serde_json::Value>().await.unwrap());
+    let posted = alice
+        .recv_until(|m| match m {
+            ServerMessage::BlipAdded { blip, .. } => Some(blip.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(posted.id.as_str(), receipt["blipId"].as_str().unwrap());
+    assert_eq!(posted.content, Delta::document("An agent reply 😀"));
+    assert_eq!(posted.parent, Some(parent.clone()));
+    assert_eq!(posted.author, alice.user.id);
+    let stored = server.state.db.blips_of_wave(&wave).await.unwrap();
+    assert_eq!(stored.len(), 2);
+    let history = server
+        .state
+        .db
+        .playback(&alice.user.id, &wave)
+        .await
+        .unwrap();
+    assert!(history
+        .iter()
+        .any(|frame| frame.blip_id == posted.id && frame.created));
+    assert_eq!(
+        server
+            .state
+            .db
+            .search(&alice.user.id, "agent")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let conflict = post_agent_reply(
+        &server,
+        token,
+        &serde_json::json!({ "requestId": "run-1", "parent": parent, "text": "different" }),
+    )
+    .await;
+    assert_eq!(conflict.status(), 409);
+    assert_eq!(
+        conflict.json::<serde_json::Value>().await.unwrap()["code"],
+        "requestConflict"
+    );
+    alice
+        .send(ClientMessage::SetMode {
+            wave_id: wave.clone(),
+            mode: WaveMode::Frozen,
+        })
+        .await;
+    alice
+        .recv_until(|m| matches!(m, ServerMessage::ModeChanged { .. }).then_some(()))
+        .await;
+    assert_eq!(post_agent_reply(&server, token, &body).await.status(), 200);
+    assert_eq!(
+        post_agent_reply(
+            &server,
+            token,
+            &serde_json::json!({ "requestId": "run-2", "text": "new message" })
+        )
+        .await
+        .status(),
+        403
+    );
+    // Restart against the same database, with no in-memory wave or receipt cache.
+    server.handle.abort();
+    let state = AppState::new(
+        Storage::open(&server.state.config.database).unwrap(),
+        server.state.config.clone(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    server.base = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::http::router(state.clone());
+    server.handle = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    server.state = state;
+    let replay = post_agent_reply(&server, token, &body).await;
+    assert_eq!(replay.status(), 200);
+    assert_eq!(receipt, replay.json::<serde_json::Value>().await.unwrap());
+    assert_eq!(server.state.db.blips_of_wave(&wave).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn agent_replies_obey_scope_wavelet_and_all_wave_modes() {
+    let server = start_server().await;
+    let alice_cookie = server.register("alice").await;
+    let bob_cookie = server.register("bob").await;
+    let mut alice = server.connect(&alice_cookie).await;
+    let mut bob = server.connect(&bob_cookie).await;
+    for mode in WaveMode::ALL {
+        let (wave, wavelet, parent) =
+            create_wave_in(&mut alice, mode.as_str(), vec!["bob".into()], Some(mode)).await;
+        let minted = mint_agent_token(&server, &bob_cookie, &wavelet, "reply").await;
+        let token = minted["token"].as_str().unwrap();
+        let new_message = post_agent_reply(
+            &server,
+            token,
+            &serde_json::json!({ "requestId": "post", "text": "bot post" }),
+        )
+        .await;
+        assert_eq!(
+            new_message.status().as_u16(),
+            if mode.allows_new_message(false) {
+                201
+            } else {
+                403
+            }
+        );
+        let reply = post_agent_reply(
+            &server,
+            token,
+            &serde_json::json!({ "requestId": "reply", "parent": parent, "text": "bot reply" }),
+        )
+        .await;
+        assert_eq!(
+            reply.status().as_u16(),
+            if mode.allows_replies() { 201 } else { 403 }
+        );
+        if mode == WaveMode::Document {
+            let read_only = mint_agent_token(&server, &bob_cookie, &wavelet, "read").await;
+            assert_eq!(
+                post_agent_reply(
+                    &server,
+                    read_only["token"].as_str().unwrap(),
+                    &serde_json::json!({ "requestId": "no-write", "text": "no" })
+                )
+                .await
+                .status(),
+                403
+            );
+            alice
+                .send(ClientMessage::PrivateReply {
+                    wavelet_id: wavelet.clone(),
+                    anchor: parent,
+                    participants: vec![],
+                })
+                .await;
+            let private = alice
+                .recv_until(|m| match m {
+                    ServerMessage::WaveletAdded { wavelet, .. } => Some(wavelet.clone()),
+                    _ => None,
+                })
+                .await;
+            assert_eq!(post_agent_reply(&server, token, &serde_json::json!({ "requestId": "cross-private", "parent": private.blips[0].id, "text": "no" })).await.status(), 400);
+            // The same boundary holds even when the issuer can read both wavelets.
+            let alice_token = mint_agent_token(&server, &alice_cookie, &wavelet, "reply").await;
+            assert_eq!(post_agent_reply(&server, alice_token["token"].as_str().unwrap(), &serde_json::json!({ "requestId": "cross-scope", "parent": private.blips[0].id, "text": "no" })).await.status(), 400);
+        }
+        // Keep Bob's subscribed state aligned with invitations before another wave.
+        bob.send(ClientMessage::Open { wave_id: wave }).await;
+        bob.recv_until(|m| matches!(m, ServerMessage::WaveState { .. }).then_some(()))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn a_failed_agent_receipt_write_rolls_back_the_message_and_can_be_retried() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave, wavelet, _) = create_wave(&mut alice, "Atomic agent reply", vec![]).await;
+    let minted = mint_agent_token(&server, &cookie, &wavelet, "reply").await;
+    let token = minted["token"].as_str().unwrap();
+    let conn = rusqlite::Connection::open(&server.state.config.database).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_agent_receipt BEFORE INSERT ON agent_replies BEGIN SELECT RAISE(ABORT, 'simulated receipt failure'); END;").unwrap();
+    let body =
+        serde_json::json!({ "requestId": "retry-after-failure", "text": "transactional reply" });
+    assert_eq!(post_agent_reply(&server, token, &body).await.status(), 500);
+    assert_eq!(server.state.db.blips_of_wave(&wave).await.unwrap().len(), 1);
+    let resident = server.state.open_wave(&wave).await.unwrap().unwrap();
+    assert_eq!(resident.lock().await.blips.len(), 1);
+    assert!(server
+        .state
+        .db
+        .search(&alice.user.id, "transactional")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(server
+        .state
+        .db
+        .playback(&alice.user.id, &wave)
+        .await
+        .unwrap()
+        .is_empty());
+    conn.execute_batch("DROP TRIGGER fail_agent_receipt;")
+        .unwrap();
+    assert_eq!(post_agent_reply(&server, token, &body).await.status(), 201);
+    assert_eq!(post_agent_reply(&server, token, &body).await.status(), 200);
+    assert_eq!(server.state.db.blips_of_wave(&wave).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn an_agent_credential_revoked_while_waiting_for_the_wave_lock_cannot_post() {
+    let server = start_server().await;
+    let cookie = server.register("alice").await;
+    let mut alice = server.connect(&cookie).await;
+    let (wave, wavelet, _) = create_wave(&mut alice, "Revocation race", vec![]).await;
+    let minted = mint_agent_token(&server, &cookie, &wavelet, "reply").await;
+    let resident = server.state.open_wave(&wave).await.unwrap().unwrap();
+    let lock = resident.lock().await;
+    let url = format!("{}/api/agent/replies", server.base);
+    let token = minted["token"].as_str().unwrap().to_string();
+    let pending = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "requestId": "revoked-run", "text": "must not land" }))
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    server
+        .state
+        .db
+        .revoke_agent_token(
+            alice.user.id.clone(),
+            minted["credential"]["id"].as_str().unwrap().into(),
+        )
+        .await
+        .unwrap();
+    drop(lock);
+    assert_eq!(pending.await.unwrap().status(), 401);
+    assert_eq!(server.state.db.blips_of_wave(&wave).await.unwrap().len(), 1);
+}

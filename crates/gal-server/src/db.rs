@@ -46,7 +46,7 @@ pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// table, so without this a new column would simply never be added: the server
 /// would start cleanly, then fail at query time in ways that look like data loss
 /// to the user.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// The version `schema.sql` describes.
 ///
@@ -406,6 +406,74 @@ impl Storage {
                 wave_id: token.wave_id, wavelet_id: token.wavelet_id, title, mode, blips, next_cursor,
             }))
         }).await
+    }
+
+    pub async fn agent_reply_receipt(
+        &self,
+        token: &crate::agent::AgentToken,
+        request_id: String,
+    ) -> Result<Option<crate::agent::StoredReply>> {
+        let token = token.clone();
+        self.run(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT request_hash, blip_id, revision FROM agent_replies
+                 WHERE token_id = ?1 AND request_id = ?2",
+                    params![token.id, request_id],
+                    |r| {
+                        Ok(crate::agent::StoredReply {
+                            request_hash: r.get(0)?,
+                            receipt: crate::agent::ReplyReceipt {
+                                request_id: request_id.clone(),
+                                wave_id: token.wave_id.clone(),
+                                wavelet_id: token.wavelet_id.clone(),
+                                blip_id: BlipId(r.get(1)?),
+                                revision: r.get(2)?,
+                            },
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    pub async fn create_agent_reply(
+        &self,
+        token_hash: String,
+        request_id: String,
+        request_hash: String,
+        blip: Blip,
+    ) -> Result<bool> {
+        self.run(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Recheck inside the write transaction: revocation while waiting
+            // for the wave lock must not leave a message from a dead credential.
+            let Some(token) = valid_agent_token(&tx, &token_hash)? else {
+                return Ok(false);
+            };
+            if token.scope != crate::agent::AgentScope::Reply
+                || token.wavelet_id != blip.wavelet_id
+                || token.user_id != blip.author
+            {
+                return Ok(false);
+            }
+            insert_seeded_blip(&tx, &blip)?;
+            tx.execute(
+                "INSERT INTO agent_replies (token_id, request_id, request_hash, blip_id, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    token.id,
+                    request_id,
+                    request_hash,
+                    blip.id.as_str(),
+                    blip.revision
+                ],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
     }
 
     // --- sessions -------------------------------------------------------
@@ -1863,6 +1931,24 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tracing::debug!("migrated database schema to v8");
     }
 
+    if version == 8 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE agent_replies (
+                 token_id TEXT NOT NULL REFERENCES agent_tokens(id) ON DELETE CASCADE,
+                 request_id TEXT NOT NULL,
+                 request_hash TEXT NOT NULL,
+                 blip_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 PRIMARY KEY (token_id, request_id)
+             );",
+        )?;
+        tx.pragma_update(None, "user_version", 9)?;
+        tx.commit()?;
+        version = 9;
+        tracing::debug!("migrated database schema to v9");
+    }
+
     if version < SCHEMA_VERSION {
         anyhow::bail!(
             "no migration available from schema v{version} to v{SCHEMA_VERSION}; \
@@ -2586,6 +2672,7 @@ mod tests {
             ("ops", "op_id"),
             ("blips", "deleted"),
             ("agent_tokens", "wavelet_id"),
+            ("agent_replies", "request_hash"),
         ] {
             assert!(
                 has_column(&fresh, table, column),
@@ -3361,7 +3448,7 @@ mod tests {
         drop(storage);
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP TABLE agent_tokens; DROP TABLE blip_search_keys; PRAGMA user_version = 6;",
+            "DROP TABLE agent_replies; DROP TABLE agent_tokens; DROP TABLE blip_search_keys; PRAGMA user_version = 6;",
         )
         .unwrap();
         conn.execute(

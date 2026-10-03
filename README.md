@@ -354,7 +354,7 @@ upgrading.
 
 ## Agents and bots
 
-Agents can read a single wavelet through a bearer-token HTTP interface. A token
+Agents can read and post in a single wavelet through a bearer-token HTTP interface. A token
 acts as its issuing account, is scoped to one wavelet, and cannot be used for
 browser sessions, account management, attachments, or WebSocket access. Use a
 separate account if the agent should have its own author identity.
@@ -389,6 +389,29 @@ omitted text is not returned on the next page; request a larger budget to read
 more of that blip. Pagination is ordered by message sequence and id, not an
 immutable snapshot or an event feed: revisit earlier pages to observe edits.
 These reads share the account's command allowance; 429 includes `Retry-After`.
+
+A `reply` credential includes reading and allows plain-text posts through
+`POST /api/agent/replies`:
+
+```json
+{"requestId":"research-run-42","parent":"b-…","text":"Here is what I found."}
+```
+
+Omit `parent` for a top-level message. Every post goes through the same wave-mode
+and same-wavelet parent checks as the browser. The response is a receipt with
+`requestId`, `waveId`, `waveletId`, `blipId` and the initial `revision`: 201 for a
+new post, 200 for an identical retry. Reusing a request id for different text or
+a different parent returns 409 (`requestConflict`). Read-only credentials return
+403. A token cannot edit or delete existing documents or manage participants.
+
+Keep the same request id and body when retrying an uncertain response, including
+after restarting your agent. Receipts are persisted in the same transaction as
+the message, its history seed and search entry. They remain valid across server
+restarts, later edits or deletion of the message, and a change to Frozen mode;
+revocation, expiry and current membership are still checked. Receipts belong to
+the credential and are removed when it is revoked. A new credential has a new
+request-id namespace. A client disconnect does not cancel a post already in
+progress. Responses and credentials use `Cache-Control: no-store`.
 
 ## How it works
 

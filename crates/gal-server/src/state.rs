@@ -197,6 +197,68 @@ impl LiveWave {
         )))
     }
 
+    /// Validate and allocate a message while holding the wave lock. Both the
+    /// browser and headless API use this, so modes and parents cannot diverge.
+    pub fn prepare_blip(
+        &self,
+        user: &UserId,
+        wavelet_id: WaveletId,
+        parent: Option<BlipId>,
+        content: Option<Delta>,
+    ) -> Result<Blip, Box<ServerMessage>> {
+        if !self.may_access(user, &wavelet_id) {
+            return Err(Box::new(ServerMessage::error(
+                ErrorCode::NotFound,
+                "That wavelet is not available.",
+            )));
+        }
+        self.permit(
+            user,
+            if parent.is_some() {
+                Action::Reply
+            } else {
+                Action::NewMessage
+            },
+        )?;
+        if let Some(parent_id) = &parent {
+            if !self
+                .blips
+                .get(parent_id)
+                .is_some_and(|b| b.meta.wavelet_id == wavelet_id)
+            {
+                return Err(Box::new(ServerMessage::error(
+                    ErrorCode::BadRequest,
+                    "Cannot reply to that blip.",
+                )));
+            }
+        }
+        let content = crate::ws::seed_content(content)?;
+        let seq = self.next_seq(&wavelet_id);
+        let mut blip = Blip::new(self.wave.id.clone(), wavelet_id, user.clone(), parent, seq);
+        if let Some(content) = content {
+            blip.content = content;
+            blip.revision = 1;
+        }
+        Ok(blip)
+    }
+
+    /// Publish only after the seed, search entry and any retry receipt commit.
+    pub fn publish_blip(&mut self, blip: Blip) {
+        self.blips
+            .insert(blip.id.clone(), LiveBlip::new(blip.clone()));
+        if let Some(wavelet) = self.wavelet_mut(&blip.wavelet_id) {
+            wavelet.last_modified = blip.last_modified;
+        }
+        self.broadcast(
+            &blip.wavelet_id,
+            None,
+            ServerMessage::BlipAdded {
+                wave_id: blip.wave_id.clone(),
+                blip: blip_view(&blip, &Default::default()),
+            },
+        );
+    }
+
     /// The next ordering position for a new blip in this wavelet.
     ///
     /// Derived from resident state rather than a query, so it can be allocated

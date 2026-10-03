@@ -31,6 +31,7 @@ pub struct Metrics {
     /// this file.
     pub ws_slow_client_disconnects: AtomicU64,
     pub ws_command_panics: AtomicU64,
+    pub agent_reply_panics: AtomicU64,
     pub ws_frames_unparseable: AtomicU64,
     pub ops_applied: AtomicU64,
     /// An op the server would not take: refused by mode, over a document limit,
@@ -155,6 +156,12 @@ impl Metrics {
             "gal_ws_command_panics_total",
             "Commands that panicked. Always a bug.",
             load(&self.ws_command_panics),
+        );
+        counter(
+            &mut out,
+            "gal_agent_reply_panics_total",
+            "Agent reply tasks that panicked. Always a bug.",
+            load(&self.agent_reply_panics),
         );
         counter(
             &mut out,

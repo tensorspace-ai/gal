@@ -691,60 +691,9 @@ async fn create_blip(
     // could land in the gap and be applied to a blip that had already passed its
     // checks.
     let mut live = wave.lock().await;
-    if !live.may_access(&session.user.id, &wavelet_id) {
-        return Err(not_found());
-    }
-    live.permit(
-        &session.user.id,
-        if parent.is_some() {
-            Action::Reply
-        } else {
-            Action::NewMessage
-        },
-    )?;
-    // A reply must attach to a blip in the same wavelet.
-    if let Some(parent_id) = &parent {
-        let ok = live
-            .blips
-            .get(parent_id)
-            .is_some_and(|b| b.meta.wavelet_id == wavelet_id);
-        if !ok {
-            return Err(Box::new(ServerMessage::error(
-                ErrorCode::BadRequest,
-                "Cannot reply to that blip.",
-            )));
-        }
-    }
-
-    let mut blip = Blip::new(
-        wave_id.clone(),
-        wavelet_id.clone(),
-        session.user.id.clone(),
-        parent,
-        live.next_seq(&wavelet_id),
-    );
-    if let Some(content) = seed_content(content)? {
-        blip.content = content;
-        blip.revision = 1;
-    }
-
+    let blip = live.prepare_blip(&session.user.id, wavelet_id, parent, content)?;
     state.db.create_blip(blip.clone()).await.map_err(internal)?;
-
-    live.blips
-        .insert(blip.id.clone(), crate::state::LiveBlip::new(blip.clone()));
-    if let Some(wavelet) = live.wavelet_mut(&wavelet_id) {
-        wavelet.last_modified = blip.last_modified;
-    }
-    // Everyone including the author: the author needs the id to focus it.
-    let empty = Default::default();
-    live.broadcast(
-        &wavelet_id,
-        None,
-        ServerMessage::BlipAdded {
-            wave_id: wave_id.clone(),
-            blip: blip_view(&blip, &empty),
-        },
-    );
+    live.publish_blip(blip);
     drop(live);
 
     state.schedule_inbox_update(&wave_id);
@@ -1610,7 +1559,7 @@ async fn send_inbox_row(state: &Arc<AppState>, session: &Session, wave_id: &Wave
 /// `ServerDoc`, and the failure was previously swallowed into an empty document
 /// whose revision disagreed with the stored metadata — permanently bricking the
 /// blip, since every later edit was then rejected as out of date.
-fn seed_content(content: Option<Delta>) -> Result<Option<Delta>, Box<ServerMessage>> {
+pub(crate) fn seed_content(content: Option<Delta>) -> Result<Option<Delta>, Box<ServerMessage>> {
     let Some(content) = content.filter(|c| !c.is_empty()) else {
         return Ok(None);
     };
