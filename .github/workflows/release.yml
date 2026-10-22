@@ -26,7 +26,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: version
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
@@ -50,7 +50,7 @@ jobs:
           - { os: macos-15, target: aarch64-apple-darwin }
           - { os: macos-15, target: x86_64-apple-darwin }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -75,7 +75,7 @@ jobs:
       # Prefixed, so the download below can ask for the archives by name. The
       # `image` job's buildx metadata lands in the same artifact namespace and
       # must not be mistaken for a release file.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gal-${{ matrix.target }}
           path: dist/*
@@ -85,16 +85,16 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       # The Dockerfile is otherwise built by nothing, so it can rot unnoticed
       # between releases.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -109,21 +109,21 @@ jobs:
     needs: [check, build, image]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # `pattern` is not optional. Without it this downloads *every* artifact
       # the run produced, which includes the `.dockerbuild` blob that
       # `docker/build-push-action` uploads as a build summary. That blob is not
       # a release file, it would land in `dist/` and be published and hashed as
       # if it were, and on the first release that ever ran here its download
       # failed after five retries and took the whole job with it.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: gal-*
           merge-multiple: true
       # One file, so `sha256sum -c SHA256SUMS` verifies the whole release.
       - run: cd dist && sha256sum * > SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           body_path: CHANGELOG.md
@@ -139,7 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: crates-io
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # One invocation rather than three. Cargo publishes in dependency order
       # itself and waits for each crate to appear in the index before building
